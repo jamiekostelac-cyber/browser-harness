@@ -481,9 +481,8 @@ def _write_private_json(path: Path, data: dict) -> None:
 
 
 def _chmod_private(path: Path, *, directory=False) -> None:
-    mode = stat.S_IRWXU if directory else stat.S_IRUSR | stat.S_IWUSR
     try:
-        os.chmod(path, mode)
+        paths.harden_private_path(path, directory=directory)
     except OSError:
         pass
 
