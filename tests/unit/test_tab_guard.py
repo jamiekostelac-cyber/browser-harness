@@ -1312,6 +1312,7 @@ def _guarded_dispatch_request(d, method, params, *, command_session=None):
         "tab_guard_target_id": d._session_targets[session],
         "tab_guard_session_id": session,
         "tab_guard_document_generation": state["generation"],
+        "tab_guard_url": state["document_url"],
     }
 
 
@@ -1332,6 +1333,26 @@ def test_daemon_rejects_dispatch_snapshots_stale_after_navigation(daemon_bridge,
     assert "stale" in response["error"]
     assert not any(call[0] == ("Target.sendMessageToTarget" if nested else "Runtime.evaluate")
                    for call in calls)
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_dispatch_rejects_stale_url_snapshot_after_same_document_navigation(daemon_bridge, nested):
+    d, calls = daemon_bridge
+    method = "Target.sendMessageToTarget" if nested else "Runtime.evaluate"
+    params = ({
+        "sessionId": "SESSION-MINE",
+        "message": json.dumps({"id": 919, "method": "Runtime.evaluate",
+                                "params": {"expression": "1"}}),
+    } if nested else {"expression": "1"})
+    request = _guarded_dispatch_request(d, method, params)
+    d._record_event("Page.navigatedWithinDocument", {
+        "frameId": "FRAME-MINE", "url": "https://owned.example/#next",
+    }, "SESSION-MINE")
+
+    response = asyncio.run(d.handle(request))
+
+    assert response == {"error": "tab guard authorization is stale or invalid"}
+    assert not any(call[0] == method for call in calls)
 
 
 @pytest.mark.parametrize("nested", [False, True])
@@ -1613,6 +1634,91 @@ def test_set_session_reply_is_discarded_after_reset_during_domain_setup(daemon_b
     reset, result = asyncio.run(run())
     assert reset["tab_guard"] == "ok"
     assert result["tab_guard"] == "refused"
+
+
+def test_set_session_latches_policy_before_target_lookup_and_keeps_it_after_reset(
+        daemon_bridge, monkeypatch):
+    d, calls = daemon_bridge
+    d._guard_policy_active = False
+    target_lookup_entered, release_lookup = asyncio.Event(), asyncio.Event()
+    setup_entered, release_setup = asyncio.Event(), asyncio.Event()
+
+    async def blocked_info(method, params=None, session_id=None):
+        calls.append((method, params, session_id))
+        if method == "Target.getTargetInfo":
+            target_lookup_entered.set()
+            await release_lookup.wait()
+            return {"targetInfo": {"targetId": "MINE", "url": "https://owned.example/"}}
+        return {}
+
+    async def blocked_enables(_session):
+        setup_entered.set()
+        await release_setup.wait()
+
+    d.cdp.send_raw = blocked_info
+    monkeypatch.setattr(d, "_enable_default_domains", blocked_enables)
+    request = {
+        "meta": "set_session", "session_id": "SESSION-MINE", "target_id": "MINE",
+        "tab_guard": {"tabs": ["MINE"], "sessions": ["SESSION-MINE"]},
+        "tab_guard_run": RUN_ID, "tab_guard_epoch": d._authorization_epoch,
+    }
+
+    async def run():
+        pending = asyncio.create_task(d.handle(request))
+        await target_lookup_entered.wait()
+        assert d._guard_policy_active is True
+        metadata = await d.handle({"meta": "connection_status"})
+        unguarded_cdp = await d.handle({"method": "Runtime.evaluate", "params": {"expression": "1"}})
+        release_lookup.set()
+        await setup_entered.wait()
+        reset = await d.handle({"meta": "tab_guard_reset", "tab_guard_run": RUN_ID,
+                                "tab_guard_epoch": d._authorization_epoch})
+        release_setup.set()
+        return metadata, unguarded_cdp, reset, await pending
+
+    metadata, unguarded_cdp, reset, result = asyncio.run(run())
+
+    assert metadata == {"tab_guard": "refused"}
+    assert unguarded_cdp == {"error": "tab guard authorization is stale or invalid"}
+    assert reset["tab_guard"] == "ok"
+    assert result["tab_guard"] == "refused"
+    assert d._guard_policy_active is True
+    assert not any(call[0] == "Runtime.evaluate" for call in calls)
+
+
+def test_guarded_bootstrap_latches_policy_before_transport_yields(daemon_bridge):
+    d, calls = daemon_bridge
+    d._guard_policy_active = False
+    d._guarded_run_id = None
+    concurrent_results = []
+
+    async def observe_during_create(method, params=None, session_id=None):
+        calls.append((method, params, session_id))
+        concurrent_results.append(await d.handle({"meta": "connection_status"}))
+        concurrent_results.append(await d.handle({
+            "method": "Runtime.evaluate", "params": {"expression": "1"},
+        }))
+        return {"browserContextId": "CTX"}
+
+    d.cdp.send_raw = observe_during_create
+    request = {
+        "method": "Target.createBrowserContext", "params": {}, "session_id": None,
+        "tab_guard": {"tabs": [], "sessions": [], "contexts": []},
+        "tab_guard_run": RUN_ID, "tab_guard_epoch": d._authorization_epoch,
+    }
+
+    result = asyncio.run(d.handle(request))
+
+    assert concurrent_results == [
+        {"tab_guard": "refused"},
+        {"error": "tab guard authorization is stale or invalid"},
+    ]
+    assert result == {"result": {"browserContextId": "CTX"}}
+    reset = asyncio.run(d.handle({"meta": "tab_guard_reset", "tab_guard_run": RUN_ID,
+                                  "tab_guard_epoch": d._authorization_epoch}))
+    assert reset["tab_guard"] == "ok"
+    assert d._guard_policy_active is True
+    assert not any(call[0] == "Runtime.evaluate" for call in calls)
 
 
 @pytest.mark.parametrize("payload", [

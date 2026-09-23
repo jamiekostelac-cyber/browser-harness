@@ -1399,6 +1399,10 @@ class Daemon:
                         return {"tab_guard": "refused", "target_id": req.get("target_id")}
                     registration_generation = state.get("generation")
                     registration_url = state.get("document_url")
+                    # Once an owned switch is accepted, every concurrent
+                    # request must be subject to the guard, including while
+                    # the live target check below is waiting on CDP.
+                    self._guard_policy_active = True
                     try:
                         info = (await self.cdp.send_raw(
                             "Target.getTargetInfo", {"targetId": req["target_id"]}
@@ -1641,8 +1645,7 @@ class Daemon:
         if self._guarded_run_id is None:
             if method not in bootstrap or identity["epoch"] != self._authorization_epoch:
                 return None
-            self._guarded_run_id = identity["run_id"]
-        if (identity["run_id"] != self._guarded_run_id
+        elif (identity["run_id"] != self._guarded_run_id
                 or identity["epoch"] != self._authorization_epoch):
             return None
         if method.startswith("Target."):
@@ -1673,6 +1676,10 @@ class Daemon:
                     and not _guard_url_allowed(nested_params.get("url"))):
                 return None
         if method in {"Target.createBrowserContext", "Target.getTargets"}:
+            # Bootstrap is accepted. Latch policy before handle() awaits the
+            # CDP operation, so concurrent guardless requests fail closed.
+            self._guarded_run_id = identity["run_id"]
+            self._guard_policy_active = True
             return {**identity, "target_id": None, "session_id": None, "generation": None}
         if method == "Target.createTarget":
             context_id = params.get("browserContextId")
@@ -1680,6 +1687,9 @@ class Daemon:
                     or context_id not in set(owned.get("contexts", []))
                     or context_id not in self._guarded_contexts):
                 return None
+            # createTarget bootstrap is accepted; latch before CDP dispatch.
+            self._guarded_run_id = identity["run_id"]
+            self._guard_policy_active = True
             return {**identity, "target_id": None, "session_id": None, "generation": None}
         if identity["target_id"] != target_id:
             return None
@@ -1706,6 +1716,7 @@ class Daemon:
             if (identity["session_id"] != sid or sid not in self._guarded_sessions
                     or not isinstance(state, dict)
                     or identity["generation"] != state.get("generation")
+                    or identity["document_url"] != state.get("document_url")
                     or not state.get("allowed")):
                 return None
             identity["document_url"] = state.get("document_url")
@@ -1723,6 +1734,7 @@ class Daemon:
             if (not mapped or identity["session_id"] != mapped
                     or not isinstance(mapped_state, dict)
                     or identity["generation"] != mapped_state.get("generation")
+                    or identity["document_url"] != mapped_state.get("document_url")
                     or not mapped_state.get("allowed")):
                 return None
             identity["session_id"] = mapped
