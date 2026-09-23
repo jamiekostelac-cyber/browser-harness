@@ -274,8 +274,7 @@ def test_callback_server_marks_complete_before_client_disconnects():
             raise AssertionError("flush should not be reached")
 
     handler.wfile = DisconnectedClient()
-    with pytest.raises(ConnectionResetError):
-        handler.do_GET()
+    handler.do_GET()
 
     server.server_close()
 
