@@ -238,8 +238,25 @@ def _read_acl_principals(path: Path, *, directory: bool, approved_sid: str) -> s
     return _parse_acl_snapshot(_read_sddl(path).encode("utf-8"), approved_sid=approved_sid)
 
 
-def _validate_acl_tree(path: Path, *, directory: bool, approved_sid: str) -> None:
-    """Validate every object before a recursive ACL update can touch the tree."""
+def _object_identity(path: Path) -> tuple[int, int, int, int]:
+    """Return the filesystem identity fields available without following links."""
+    info = path.lstat()
+    return (
+        info.st_dev,
+        info.st_ino,
+        stat.S_IFMT(info.st_mode),
+        getattr(info, "st_file_attributes", 0),
+    )
+
+
+def _validate_acl_tree(
+    path: Path,
+    *,
+    directory: bool,
+    approved_sid: str,
+    expected_identities: dict[Path, tuple[int, int, int, int] | None] | None = None,
+) -> dict[Path, tuple[int, int, int, int] | None]:
+    """Validate all objects and, on readback, ensure the tree still names them."""
     objects = [path]
     if directory:
         pending = [path]
@@ -257,10 +274,18 @@ def _validate_acl_tree(path: Path, *, directory: bool, approved_sid: str) -> Non
                     pending.append(child)
 
     # Finish the path/reparse-point pass before invoking ACL readers for any object.
+    identities: dict[Path, tuple[int, int, int, int] | None] = {}
     for item in objects:
         _reject_reparse_path(item)
+        try:
+            identities[item] = _object_identity(item)
+        except FileNotFoundError:
+            identities[item] = None
+    if expected_identities is not None and identities != expected_identities:
+        raise PermissionError(f"filesystem objects changed while hardening {path}")
     for item in objects:
         _parse_acl_snapshot(_read_sddl(item).encode("utf-8"), approved_sid=approved_sid)
+    return identities
 
 
 def _restore_acl(path: Path, backup_path: Path, *, directory: bool) -> None:
@@ -274,7 +299,9 @@ def _harden_windows_acl(path: Path, *, directory: bool, resolve_sid=None) -> Non
     _reject_reparse_path(path)
     principal = _windows_principal(resolve_sid)
     approved = {principal.lstrip("*").upper()}
-    _validate_acl_tree(path, directory=directory, approved_sid=next(iter(approved)))
+    original_identities = _validate_acl_tree(
+        path, directory=directory, approved_sid=next(iter(approved))
+    )
 
     recursive = ("/T",) if directory else ()
     inheritance = "(OI)(CI)" if directory else ""
@@ -302,6 +329,12 @@ def _harden_windows_acl(path: Path, *, directory: bool, resolve_sid=None) -> Non
             if remaining != approved:
                 names = ", ".join(sorted(remaining - approved)) or "the approved SID is missing"
                 raise PermissionError(f"ACL readback failed for {path}: {names}")
+            _validate_acl_tree(
+                path,
+                directory=directory,
+                approved_sid=next(iter(approved)),
+                expected_identities=original_identities,
+            )
         except Exception:
             _restore_acl(path, backup_path, directory=directory)
             raise

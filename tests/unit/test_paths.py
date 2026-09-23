@@ -382,3 +382,136 @@ def test_recursive_hardening_rejects_child_junction_before_acl_reads_or_mutation
 
     assert acl_reads == []
     assert calls == []
+
+
+@pytest.mark.parametrize(
+    "post_sddl, message",
+    [
+        (f"O:{FOREIGN_SID}G:{APPROVED_SID}D:P(A;;FA;;;{APPROVED_SID})", "owner"),
+        (
+            f"O:{APPROVED_SID}G:{APPROVED_SID}D:P(A;;FA;;;{FOREIGN_SID})",
+            "unapproved principal",
+        ),
+        (
+            f"O:{APPROVED_SID}G:{APPROVED_SID}D:P(A;;120089;;;{APPROVED_SID})",
+            "Full Control",
+        ),
+        (
+            f"O:{APPROVED_SID}G:{APPROVED_SID}D:P"
+            f"(A;IO;FA;;;{APPROVED_SID})",
+            "non-applicable",
+        ),
+        (
+            f"O:{APPROVED_SID}G:{APPROVED_SID}D:P"
+            f"(D;;FA;;;{APPROVED_SID})(A;;FA;;;{APPROVED_SID})",
+            "deny ACE",
+        ),
+        (
+            f"O:{APPROVED_SID}G:{APPROVED_SID}D:P"
+            f"(XA;;FA;;;{APPROVED_SID};(@User.x==1))",
+            "conditional or unsupported",
+        ),
+        (
+            f"O:{APPROVED_SID}G:{APPROVED_SID}D:(A;;FA;;;{APPROVED_SID})",
+            "protected DACL",
+        ),
+    ],
+)
+def test_recursive_hardening_revalidates_every_child_after_mutation(
+    monkeypatch, tmp_path, post_sddl, message
+):
+    _set_windows_identity(monkeypatch)
+    target = tmp_path / "private"
+    target.mkdir()
+    child = target / "credential.json"
+    child.write_text("secret", encoding="utf-8")
+    valid = f"O:{APPROVED_SID}G:{APPROVED_SID}D:P(A;;FA;;;{APPROVED_SID})"
+    reads = []
+    calls = []
+    mutated = False
+
+    def read_sddl(item):
+        reads.append(item)
+        if item == child and mutated:
+            return post_sddl
+        return valid
+
+    def fake_run(args, **kwargs):
+        nonlocal mutated
+        calls.append(args)
+        if "/grant:r" in args:
+            mutated = True
+        if "/save" in args:
+            Path(args[args.index("/save") + 1]).write_bytes(
+                f"D:(A;;FA;;;{APPROVED_SID})".encode()
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(paths, "_read_sddl", read_sddl)
+    monkeypatch.setattr(paths.subprocess, "run", fake_run)
+
+    with pytest.raises(PermissionError, match=message):
+        paths.harden_private_path(target, directory=True)
+
+    assert reads.count(child) == 2
+    assert any("/restore" in call for call in calls)
+
+
+def test_recursive_hardening_rolls_back_when_child_is_replaced_during_mutation(
+    monkeypatch, tmp_path
+):
+    _set_windows_identity(monkeypatch)
+    target = tmp_path / "private"
+    target.mkdir()
+    child = target / "credential.json"
+    child.write_text("original", encoding="utf-8")
+    replacement = target / "replacement"
+    replacement.write_text("replacement", encoding="utf-8")
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        if "/save" in args:
+            Path(args[args.index("/save") + 1]).write_bytes(
+                f"D:(A;;FA;;;{APPROVED_SID})".encode()
+            )
+        if "/grant:r" in args:
+            replacement.replace(child)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(paths.subprocess, "run", fake_run)
+
+    with pytest.raises(PermissionError, match="filesystem objects changed"):
+        paths.harden_private_path(target, directory=True)
+
+    assert child.read_text(encoding="utf-8") == "replacement"
+    assert any("/restore" in call for call in calls)
+
+
+def test_recursive_hardening_rejects_child_reparse_point_created_during_mutation(
+    monkeypatch, tmp_path
+):
+    _set_windows_identity(monkeypatch)
+    target = tmp_path / "private"
+    target.mkdir()
+    child = target / "credential.json"
+    child.write_text("original", encoding="utf-8")
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        if "/save" in args:
+            Path(args[args.index("/save") + 1]).write_bytes(
+                f"D:(A;;FA;;;{APPROVED_SID})".encode()
+            )
+        if "/grant:r" in args:
+            child.unlink()
+            child.symlink_to(tmp_path / "outside")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(paths.subprocess, "run", fake_run)
+
+    with pytest.raises(PermissionError, match="reparse point"):
+        paths.harden_private_path(target, directory=True)
+
+    assert any("/restore" in call for call in calls)
