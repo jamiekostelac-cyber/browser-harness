@@ -4,6 +4,7 @@ Core helpers live here. Agent-editable helpers live in
 BH_AGENT_WORKSPACE/agent_helpers.py.
 """
 import base64, hashlib, importlib.util, json, math, os, sys, tempfile, time, urllib.request
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -105,9 +106,27 @@ _TARGET_SAFE_METHODS = {"Target.getTargets", "Target.createTarget"}
 # Global, but act on a specific target named in the params — check THAT target.
 _TARGET_SCOPED_METHODS = {
     "Target.closeTarget", "Target.activateTarget", "Target.attachToTarget",
-    "Target.getTargetInfo", "Target.exposeDevToolsProtocol",
+    "Target.getTargetInfo",
 }
 # Other Target methods are refused; session calls must use an owned session.
+_GUARD_CONTEXT_WIDE_METHODS = {
+    "Network.canClearBrowserCache", "Network.canClearBrowserCookies",
+    "Network.clearBrowserCache", "Network.clearBrowserCookies",
+    "Network.deleteCookies", "Network.getAllCookies", "Network.getCookies",
+    "Network.setCookie", "Network.setCookies",
+    "Storage.clearCookies", "Storage.clearDataForOrigin",
+    "Storage.clearDataForStorageKey", "Storage.getCookies", "Storage.setCookies",
+}
+
+
+def _guard_scope_reason(method):
+    if method == "Target.exposeDevToolsProtocol":
+        return "Target.exposeDevToolsProtocol exposes unrestricted target commands"
+    if method.startswith(("Browser.", "SystemInfo.")):
+        return "browser-wide method is unavailable under the tab guard"
+    if method in _GUARD_CONTEXT_WIDE_METHODS:
+        return "browser/context-wide method is unavailable under the tab guard"
+    return None
 
 
 def _tab_guard_on():
@@ -136,6 +155,10 @@ def _owned_path():
 
 def _owned_state():
     owned_path = _owned_path()  # Invalid run IDs must not be swallowed below.
+    return _read_owned_state(owned_path)
+
+
+def _read_owned_state(owned_path):
     try:
         state = json.loads(owned_path.read_text(encoding="utf-8"))
     except Exception:
@@ -147,6 +170,38 @@ def _owned_state():
         if isinstance(state.get(kind), list) else []
         for kind in ("tabs", "sessions")
     }
+
+
+@contextmanager
+def _ownership_lock(path):
+    """Hold the per-record lock across ownership read, update, and replace."""
+    lock_path = path.with_name(path.name + ".lock")
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        if os.name != "nt":
+            os.fchmod(fd, 0o600)
+        if os.name == "nt":
+            import msvcrt
+            if os.fstat(fd).st_size == 0:
+                os.write(fd, b"1")
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            if os.name == "nt":
+                import msvcrt
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
 
 
 def _owned_ids():
@@ -163,18 +218,19 @@ def _owned_sessions():
 def _remember(kind, value, remove=False):
     if not _tab_guard_on() or not value:
         return
-    state = _owned_state()
-    present = value in state[kind]
-    if (not remove and present) or (remove and not present):
-        return
-    state[kind] = sorted(set(state[kind]) - {value} if remove else set(state[kind]) | {value})
+    path = _owned_path()
     temporary = None
     try:
-        path = _owned_path()
-        fd, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(state, f)
-        os.replace(temporary, path)
+        with _ownership_lock(path):
+            state = _read_owned_state(path)
+            present = value in state[kind]
+            if (not remove and present) or (remove and not present):
+                return
+            state[kind] = sorted(set(state[kind]) - {value} if remove else set(state[kind]) | {value})
+            fd, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(state, f)
+            os.replace(temporary, path)
     except Exception as e:
         # NOT silent. With the guard on, a lost ownership record refuses every
         # later action on a tab the run genuinely opened, and swallowing this
@@ -194,8 +250,12 @@ def tab_guard_reset():
     """Forget every owned tab and session. Rarely needed: a run with its own
     BH_TAB_GUARD_RUN already starts owning nothing. Calling it mid-run makes the
     run disown its own tabs and be refused on them."""
+    if not _tab_guard_on():
+        return
+    path = _owned_path()
     try:
-        _owned_path().unlink()
+        with _ownership_lock(path):
+            path.unlink()
     except FileNotFoundError:
         pass
     except Exception:
@@ -261,6 +321,9 @@ def _tab_guard_check(method, params, session_id=None):
     if not _tab_guard_on():
         return session_id
     _run_id()
+    scope_reason = _guard_scope_reason(method)
+    if scope_reason:
+        _refuse(method, params.get("targetId"), params.get("url", ""), scope_reason)
     if method in _TARGET_SAFE_METHODS:
         return
 
@@ -274,7 +337,10 @@ def _tab_guard_check(method, params, session_id=None):
             try:
                 message = json.loads(params.get("message", ""))
                 nested_method = message["method"]
-                if not isinstance(nested_method, str) or nested_method.startswith("Target.") or "sessionId" in message:
+                nested_scope_reason = _guard_scope_reason(nested_method) if isinstance(nested_method, str) else None
+                if (not isinstance(message, dict) or not isinstance(nested_method, str)
+                        or nested_method.startswith("Target.") or nested_scope_reason
+                        or "sessionId" in message):
                     raise ValueError("nested routing")
             except (ValueError, KeyError, TypeError):
                 _refuse(method, f"session:{sid}", "", "invalid or nested target-routing message")

@@ -315,6 +315,51 @@ def test_nested_message_cannot_route_to_foreign_target(owning):
                     message=json.dumps({"id": 1, "method": "Target.attachToTarget", "params": {"targetId": "FOREIGN"}}))
 
 
+@pytest.mark.parametrize("method", [
+    "Target.exposeDevToolsProtocol",
+    "Network.getAllCookies",
+    "Network.clearBrowserCookies",
+    "Network.clearBrowserCache",
+    "Network.getCookies",
+    "Network.setCookies",
+    "Storage.getCookies",
+    "Storage.clearDataForOrigin",
+    "Browser.getVersion",
+    "SystemInfo.getProcessInfo",
+])
+def test_guard_refuses_browser_and_context_wide_methods_before_dispatch(owning, monkeypatch, method):
+    calls = []
+    original = helpers._send
+    def send(req, **kwargs):
+        calls.append(req)
+        return original(req, **kwargs)
+    monkeypatch.setattr(helpers, "_send", send)
+    with pytest.raises(helpers.TabGuardRefused):
+        helpers.cdp(method, targetId="MINE")
+    assert calls == []
+
+
+@pytest.mark.parametrize("method", ["Network.getAllCookies", "Network.clearBrowserCookies", "Target.exposeDevToolsProtocol"])
+def test_nested_message_applies_browser_scope_policy_before_dispatch(owning, monkeypatch, method):
+    calls = []
+    monkeypatch.setattr(helpers, "_send", lambda req, **kwargs: calls.append(req) or {"result": {}})
+    with pytest.raises(helpers.TabGuardRefused):
+        helpers.cdp(
+            "Target.sendMessageToTarget",
+            sessionId="SESSION-MINE",
+            message=json.dumps({"id": 1, "method": method, "params": {}}),
+        )
+    assert calls == []
+
+
+def test_nested_owned_page_method_remains_allowed(owning):
+    helpers.cdp(
+        "Target.sendMessageToTarget",
+        sessionId="SESSION-MINE",
+        message=json.dumps({"id": 1, "method": "Runtime.evaluate", "params": {"expression": "1"}}),
+    )
+
+
 def test_owned_iframe_js_proves_ancestry_and_detaches(owning, monkeypatch):
     calls = []
     base = _fake_send(current={"targetId": "MINE"}, target_type="iframe")
@@ -394,6 +439,80 @@ def test_removal_guard_off_does_not_resolve_ownership_path(guard, monkeypatch):
     monkeypatch.delenv("BH_TAB_GUARD")
     monkeypatch.setattr(helpers, "_owned_path", lambda: pytest.fail("path must not be resolved"))
     helpers._remember("tabs", "MINE", remove=True)
+
+
+def test_ownership_update_lock_covers_cross_process_read_modify_replace(guard, tmp_path, monkeypatch):
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    monkeypatch.setattr(helpers.ipc, "_TMP", tmp_path)
+    monkeypatch.setattr(helpers.ipc, "BH_TMP_DIR", str(tmp_path))
+    monkeypatch.setattr(helpers.ipc, "BH_TMP_DIR_SHARED", False)
+    monkeypatch.setattr(helpers.ipc, "_RUNTIME", runtime)
+    helpers.tab_guard_reset()
+    helpers._own_tab("BASE")
+    path = helpers._owned_path()
+    script = (
+        "from browser_harness import helpers\n"
+        "print('started', flush=True)\n"
+        "helpers._own_tab('CHILD')\n"
+        "print('done', flush=True)\n"
+    )
+    env = {
+        **os.environ,
+        "BH_TAB_GUARD": "1",
+        "BH_TAB_GUARD_RUN": "test-run",
+        "BH_TMP_DIR": str(tmp_path),
+        "BH_RUNTIME_DIR": str(runtime),
+    }
+    with helpers._ownership_lock(path):
+        process = subprocess.Popen(
+            [sys.executable, "-c", script],
+            cwd=str(pathlib.Path.cwd()),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        assert process.stdout.readline().strip() == "started"
+        assert process.poll() is None
+    stdout, stderr = process.communicate(timeout=5)
+    assert process.returncode == 0, stderr
+    assert "done" in stdout
+    assert helpers._owned_ids() == {"BASE", "CHILD"}
+
+
+def test_reset_uses_the_same_ownership_lock(guard, tmp_path, monkeypatch):
+    monkeypatch.setattr(helpers.ipc, "_TMP", tmp_path)
+    monkeypatch.setattr(helpers.ipc, "BH_TMP_DIR", str(tmp_path))
+    monkeypatch.setattr(helpers.ipc, "BH_TMP_DIR_SHARED", False)
+    helpers._own_tab("MINE")
+    path = helpers._owned_path()
+    script = (
+        "from browser_harness import helpers\n"
+        "helpers.tab_guard_reset()\n"
+        "print('done', flush=True)\n"
+    )
+    env = {
+        **os.environ,
+        "BH_TAB_GUARD": "1",
+        "BH_TAB_GUARD_RUN": "test-run",
+        "BH_TMP_DIR": str(tmp_path),
+        "BH_RUNTIME_DIR": str(helpers.ipc._RUNTIME),
+    }
+    with helpers._ownership_lock(path):
+        process = subprocess.Popen(
+            [sys.executable, "-c", script],
+            cwd=str(pathlib.Path.cwd()),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        assert process.poll() is None
+    stdout, stderr = process.communicate(timeout=5)
+    assert process.returncode == 0, stderr
+    assert stdout.strip() == "done"
+    assert not path.exists()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
@@ -607,7 +726,9 @@ def test_failed_atomic_write_preserves_record_and_removes_temporary(owning, monk
     monkeypatch.setattr(helpers.os, "replace", fail_replace)
     helpers._own_tab("SECOND")
     assert path.read_bytes() == before
-    assert list(path.parent.iterdir()) == [path]
+    assert sorted(p.name for p in path.parent.iterdir()) == sorted(
+        [path.name, path.name + ".lock"]
+    )
     assert "WARNING" in capsys.readouterr().err
 
 
