@@ -2,6 +2,7 @@
 DevToolsActivePort lives. get_ws_url() must not crash on that: it falls back to a
 dedicated automation Chrome, and fails with actionable guidance when it can't.
 No real browser is launched."""
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -110,14 +111,18 @@ def test_automation_profile_rediscovers_selected_port_after_restart(monkeypatch,
     (profile / "DevToolsActivePort").write_text("49231\n/devtools/browser/persisted\n")
     monkeypatch.setattr(daemon, "AUTOMATION_PROFILE", profile)
     monkeypatch.setattr(daemon, "browser_running_for_profile", lambda path: path == profile)
-    monkeypatch.setattr(daemon, "_json_version_ws", lambda port: f"ws://127.0.0.1:{port}/json" if port == 49231 else None)
+    monkeypatch.setattr(
+        daemon,
+        "_json_version_ws",
+        lambda port: f"ws://127.0.0.1:{port}/devtools/browser/persisted" if port == 49231 else None,
+    )
 
     def unexpected_launch():
         pytest.fail("a live automation profile should be reused")
 
     monkeypatch.setattr(daemon, "_automation_chrome_binary", unexpected_launch)
     monkeypatch.setattr(daemon, "_profile_process_owns", lambda _profile: True)
-    assert daemon.launch_automation_chrome() == "ws://127.0.0.1:49231/json"
+    assert daemon.launch_automation_chrome() == "ws://127.0.0.1:49231/devtools/browser/persisted"
 
 
 @pytest.mark.parametrize(
@@ -182,6 +187,129 @@ def test_live_automation_profile_with_unverifiable_endpoint_is_not_reused(
     monkeypatch.setattr(daemon, "_automation_chrome_binary", lambda: None)
 
     assert daemon.launch_automation_chrome() is None
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "ws://example.com:49231/devtools/browser/profile-owner",
+        "ws://192.168.1.2:49231/devtools/browser/profile-owner",
+        "ws://127.0.0.1:49232/devtools/browser/profile-owner",
+        "ws://127.0.0.1:49231/devtools/browser/foreign-profile",
+        "wss://127.0.0.1:49231/devtools/browser/profile-owner",
+    ],
+)
+def test_automation_reuse_rejects_foreign_endpoint_identity(
+    monkeypatch, tmp_path, endpoint
+):
+    profile = tmp_path / "automation-profile"
+    profile.mkdir()
+    (profile / "DevToolsActivePort").write_text(
+        "49231\n/devtools/browser/profile-owner\n"
+    )
+    monkeypatch.setattr(daemon, "AUTOMATION_PROFILE", profile)
+    monkeypatch.setattr(daemon, "_profile_process_owns", lambda *_args: True)
+    monkeypatch.setattr(daemon, "_json_version_ws", lambda _port: endpoint)
+    monkeypatch.setattr(daemon, "_automation_chrome_binary", lambda: None)
+
+    assert daemon.launch_automation_chrome() is None
+
+
+def test_automation_launch_rejects_unrelated_listener(monkeypatch, tmp_path):
+    profile = tmp_path / "automation-profile"
+    profile.mkdir()
+    monkeypatch.setattr(daemon, "AUTOMATION_PROFILE", profile)
+    monkeypatch.setattr(daemon, "_port_in_use", lambda _port: True)
+    monkeypatch.setattr(daemon, "_free_port", lambda: 49231)
+    monkeypatch.setattr(daemon, "_automation_chrome_binary", lambda: "/mock/chrome")
+    monkeypatch.setattr(daemon, "_profile_process_owns", lambda *_args: True)
+    monkeypatch.setattr(
+        daemon, "_json_version_ws", lambda _port: "ws://127.0.0.1:49231/devtools/browser/other"
+    )
+    clock_values = iter([0, 0, 21])
+    monkeypatch.setattr(
+        daemon, "time", SimpleNamespace(time=lambda: next(clock_values), sleep=lambda _seconds: None)
+    )
+
+    class RunningChild:
+        pid = 1234
+
+        @staticmethod
+        def poll():
+            return None
+
+    monkeypatch.setattr(daemon.subprocess, "Popen", lambda *_args, **_kwargs: RunningChild())
+
+    assert daemon.launch_automation_chrome() is None
+
+
+def test_automation_launch_stops_polling_when_child_exits(monkeypatch, tmp_path):
+    profile = tmp_path / "automation-profile"
+    profile.mkdir()
+    monkeypatch.setattr(daemon, "AUTOMATION_PROFILE", profile)
+    monkeypatch.setattr(daemon, "_port_in_use", lambda _port: True)
+    monkeypatch.setattr(daemon, "_free_port", lambda: 49231)
+    monkeypatch.setattr(daemon, "_automation_chrome_binary", lambda: "/mock/chrome")
+    discovery = []
+    monkeypatch.setattr(daemon, "_json_version_ws", lambda _port: discovery.append(True))
+
+    class FailedChild:
+        pid = 1234
+
+        @staticmethod
+        def poll():
+            return 1
+
+    monkeypatch.setattr(daemon.subprocess, "Popen", lambda *_args, **_kwargs: FailedChild())
+
+    assert daemon.launch_automation_chrome() is None
+    assert discovery == []
+
+
+def test_automation_launch_requires_launched_pid_and_profile_endpoint(
+    monkeypatch, tmp_path
+):
+    profile = tmp_path / "automation-profile"
+    profile.mkdir()
+    monkeypatch.setattr(daemon, "AUTOMATION_PROFILE", profile)
+    monkeypatch.setattr(daemon, "_port_in_use", lambda _port: True)
+    monkeypatch.setattr(daemon, "_free_port", lambda: 49231)
+    monkeypatch.setattr(daemon, "_automation_chrome_binary", lambda: "/mock/chrome")
+    clock_values = iter([0, 0])
+    monkeypatch.setattr(
+        daemon, "time", SimpleNamespace(time=lambda: next(clock_values), sleep=lambda _seconds: None)
+    )
+
+    class RunningChild:
+        pid = 1234
+
+        @staticmethod
+        def poll():
+            return None
+
+    def spawn(*_args, **_kwargs):
+        (profile / "DevToolsActivePort").write_text(
+            "49231\n/devtools/browser/launched-profile\n"
+        )
+        return RunningChild()
+
+    monkeypatch.setattr(daemon.subprocess, "Popen", spawn)
+    owners = []
+    monkeypatch.setattr(
+        daemon,
+        "_profile_process_owns",
+        lambda _profile, expected_pid=None: owners.append(expected_pid) or expected_pid == 1234,
+    )
+    monkeypatch.setattr(
+        daemon,
+        "_json_version_ws",
+        lambda _port: "ws://127.0.0.1:49231/devtools/browser/launched-profile",
+    )
+
+    assert daemon.launch_automation_chrome() == (
+        "ws://127.0.0.1:49231/devtools/browser/launched-profile"
+    )
+    assert owners == [1234]
 
 
 @pytest.mark.parametrize(

@@ -1,5 +1,5 @@
 """CDP WS holder + IPC relay (Unix socket on POSIX, TCP loopback on Windows). One daemon per BU_NAME."""
-import asyncio, json, os, platform, shlex, shutil, socket, subprocess, sys, time, urllib.error, urllib.request
+import asyncio, ipaddress, json, os, platform, shlex, shutil, socket, subprocess, sys, time, urllib.error, urllib.request
 from urllib.parse import urlparse
 from collections import deque
 from pathlib import Path
@@ -203,11 +203,13 @@ def browser_running_for_profile(base):
         return True  # pid exists but belongs to another user
 
 
-def _profile_process_owns(base):
+def _profile_process_owns(base, expected_pid=None):
     """Verify SingletonLock's live process command line names this user-data dir."""
     try:
         target = os.readlink(str(base / "SingletonLock"))
         pid = int(target.rsplit("-", 1)[-1])
+        if expected_pid is not None and pid != expected_pid:
+            return False
         if platform.system() == "Darwin":
             raw = subprocess.check_output(
                 ["ps", "-p", str(pid), "-o", "command="],
@@ -293,12 +295,22 @@ def _ws_matches_devtools_active_port(base: Path, port: str, ws_url: str) -> bool
             encoding="utf-8", errors="replace"
         ).splitlines()
         endpoint = urlparse(ws_url)
+        host = endpoint.hostname or ""
+        try:
+            loopback = ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            loopback = host.lower() == "localhost"
         return (
             len(active) > 1
             and active[0].strip() == port
-            and endpoint.scheme in {"ws", "wss"}
+            and endpoint.scheme == "ws"
+            and loopback
+            and endpoint.username is None
+            and endpoint.password is None
             and endpoint.port == int(port)
             and endpoint.path == active[1].strip()
+            and not endpoint.query
+            and not endpoint.fragment
         )
     except (OSError, TypeError, ValueError):
         return False
@@ -387,16 +399,19 @@ def launch_automation_chrome():
         # SingletonLock proves that its owning browser process is still alive,
         # and require fresh endpoint discovery. A listener on the stale port
         # may belong to an unrelated Chrome or another local service.
-        if _profile_process_owns(AUTOMATION_PROFILE):
-            if ws := _json_version_ws(int(port)):
-                return ws
+        if (
+            _profile_process_owns(AUTOMATION_PROFILE)
+            and (ws := _json_version_ws(int(port)))
+            and _ws_matches_devtools_active_port(AUTOMATION_PROFILE, port, ws)
+        ):
+            return ws
     binary = _automation_chrome_binary()
     if not binary:
         return None
     port = AUTOMATION_PORT if not _port_in_use(AUTOMATION_PORT) else _free_port()
     try:
         AUTOMATION_PROFILE.mkdir(parents=True, exist_ok=True)
-        subprocess.Popen(
+        child = subprocess.Popen(
             [
                 binary,
                 f"--remote-debugging-port={port}",
@@ -411,7 +426,14 @@ def launch_automation_chrome():
         return None
     deadline = time.time() + 20
     while time.time() < deadline:
-        if ws := _json_version_ws(port):
+        if child.poll() is not None:
+            log("automation chrome launch exited before DevTools became available")
+            return None
+        if (
+            (ws := _json_version_ws(port))
+            and _profile_process_owns(AUTOMATION_PROFILE, child.pid)
+            and _ws_matches_devtools_active_port(AUTOMATION_PROFILE, str(port), ws)
+        ):
             log(f"launched dedicated automation chrome on :{port}")
             return ws
         time.sleep(0.3)
