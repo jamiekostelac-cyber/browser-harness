@@ -917,6 +917,25 @@ def test_event_drain_filters_owned_sessions_and_preserves_foreign_events(daemon_
     assert helpers.drain_events() == []
 
 
+@pytest.mark.parametrize("method", ["Page.loadEventFired", "Page.domContentEventFired"])
+def test_guarded_timestamp_page_events_use_owned_document_provenance(
+    daemon_bridge, monkeypatch, method
+):
+    d, _ = daemon_bridge
+    monkeypatch.setenv("BH_TAB_MARKER", "0")
+    params = {"timestamp": 123.456}
+
+    async def record_events():
+        d._record_event(method, params, "SESSION-MINE")
+        d._record_event(method, params, "FOREIGN-SESSION")
+
+    asyncio.run(record_events())
+
+    events = helpers.drain_events()
+    assert [(event["method"], event["params"]) for event in events] == [(method, params)]
+    assert events[0]["session_id"] == "SESSION-MINE"
+
+
 def test_event_drain_hides_owned_session_after_privileged_navigation(daemon_bridge, monkeypatch):
     d, _ = daemon_bridge
     monkeypatch.setenv("BH_TAB_MARKER", "0")
@@ -1674,15 +1693,18 @@ def test_legacy_caller_id_cannot_be_reused_for_a_delayed_reply(daemon_bridge):
     assert json.loads(events[0]["params"]["message"])["id"] == 905
 
 
-def test_dialog_and_subframe_events_require_current_document_provenance(daemon_bridge):
+def test_dialog_and_subframe_events_require_current_document_provenance(
+    daemon_bridge, monkeypatch
+):
     d, _ = daemon_bridge
+    monkeypatch.setenv("BH_TAB_MARKER", "0")
     d._record_event("Page.javascriptDialogOpening", {
         "message": "subframe dialog", "url": "https://frame.example/",
     }, "SESSION-MINE")
     d._record_event("Page.frameNavigated", {"frame": {
         "id": "CHILD", "parentId": "FRAME-MINE", "url": "https://frame.example/",
     }}, "SESSION-MINE")
-    d._record_event("Page.loadEventFired", {"frameId": "CHILD"}, "SESSION-MINE")
+    d._record_event("Page.loadEventFired", {"timestamp": 123.456}, "FOREIGN-SESSION")
     assert helpers.drain_events() == []
     assert d.dialog is None
 

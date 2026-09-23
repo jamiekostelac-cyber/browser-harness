@@ -994,9 +994,11 @@ class Daemon:
                         or inner_params.get("url") != state.get("document_url")):
                     return
             elif inner_method in {"Page.loadEventFired", "Page.domContentEventFired"}:
-                frame_id = inner_params.get("frameId") if isinstance(inner_params, dict) else None
-                if (not isinstance(state.get("frame_id"), str)
-                        or frame_id != state.get("frame_id")):
+                # These CDP events carry a timestamp, not a frameId. Their
+                # transport session is already bound to an owned target above;
+                # bind them to that session's current allowed document here.
+                if (not isinstance(state.get("document_url"), str)
+                        or not isinstance(state.get("frame_id"), str)):
                     return
             elif inner_method in _NETWORK_REQUEST_CORRELATED_METHODS:
                 request_id = inner_params.get("requestId") if isinstance(inner_params, dict) else None
