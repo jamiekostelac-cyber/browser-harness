@@ -28,6 +28,8 @@ def _subprocess_env(**updates):
 
 def _fake_send(current=FOREIGN, created="MINE", session="SESSION-MINE", target_type="page"):
     def send(req, response_timeout=None):
+        if req.get("meta") == "tab_guard_reset":
+            return {"tab_guard": "ok", "tab_guard_run": req.get("tab_guard_run")}
         if req.get("meta") == "guard_context":
             return {"target_id": current["targetId"], "session_id": session, "url": current.get("url", "")}
         if req.get("meta") == "current_tab":
@@ -53,8 +55,8 @@ def guard(tmp_path, monkeypatch):
     monkeypatch.setenv("BH_TAB_GUARD_RUN", RUN_ID)
     monkeypatch.delenv("BH_TAB_GUARD_LOG", raising=False)
     monkeypatch.setattr(helpers.ipc, "_TMP", tmp_path)
-    helpers.tab_guard_reset()
     monkeypatch.setattr(helpers, "_send", _fake_send())
+    helpers.tab_guard_reset()
 
 
 @pytest.fixture
@@ -105,6 +107,10 @@ def test_fails_closed_when_the_attached_tab_cannot_be_read(tmp_path, monkeypatch
     monkeypatch.setenv("BH_TAB_GUARD", "1")
     monkeypatch.setenv("BH_TAB_GUARD_RUN", RUN_ID)
     monkeypatch.setattr(helpers.ipc, "_TMP", tmp_path)
+    monkeypatch.setattr(
+        helpers, "_send",
+        lambda req, **kwargs: {"tab_guard": "ok", "tab_guard_run": req.get("tab_guard_run")},
+    )
     helpers.tab_guard_reset()
 
     def flaky(req, response_timeout=None):
@@ -253,6 +259,35 @@ def test_new_tab_does_not_reuse_a_blank_tab_the_run_does_not_own(guard):
     """Upstream new_tab() navigates the attached tab when it is blank. A blank
     tab is still someone's tab, so under the guard a fresh one is always made."""
     assert helpers._may_reuse_attached_tab() is False
+
+
+def test_guarded_new_tab_skips_unowned_unmark_and_attaches_fresh_target(guard, monkeypatch):
+    requests = []
+    current = {"targetId": "FOREIGN", "url": "https://mail.example.com/", "title": "Inbox"}
+    base = _fake_send(current=current)
+
+    def send(req, **kwargs):
+        requests.append(req)
+        if req.get("meta") == "guard_context":
+            return {
+                "target_id": current["targetId"],
+                "session_id": "SESSION-MINE",
+                "url": current.get("url", ""),
+                "tab_guard": "ok",
+            }
+        if req.get("meta") == "set_session":
+            current.update({"targetId": "MINE", "url": "about:blank", "title": ""})
+            return {"session_id": "SESSION-MINE", "url": "about:blank", "tab_guard": "ok"}
+        return base(req, **kwargs)
+
+    monkeypatch.setattr(helpers, "_send", send)
+    assert helpers.new_tab("https://new.example/") == "MINE"
+    methods = [req.get("method") for req in requests if req.get("method")]
+    assert methods.index("Target.attachToTarget") < methods.index("Runtime.evaluate")
+    assert not any(
+        req.get("method") == "Runtime.evaluate"
+        for req in requests[:methods.index("Target.attachToTarget")]
+    )
 
 
 def test_new_tab_may_still_reuse_a_blank_tab_the_run_opened(owning):
@@ -681,6 +716,7 @@ def test_reset_uses_the_same_ownership_lock(guard, tmp_path, monkeypatch):
     path = helpers._owned_path()
     script = (
         "from browser_harness import helpers\n"
+        "helpers._send = lambda req, **kw: {'tab_guard': 'ok', 'tab_guard_run': req.get('tab_guard_run')}\n"
         "helpers.tab_guard_reset()\n"
         "print('done', flush=True)\n"
     )
@@ -730,6 +766,10 @@ def daemon_bridge(owning, monkeypatch):
     d._guard_policy_active = True
     d._guarded_sessions = {"SESSION-MINE"}
     d._guarded_targets = {"MINE"}
+    d._document_state["SESSION-MINE"] = {
+        "target_id": "MINE", "generation": 0,
+        "url": "https://owned.example/", "allowed": True,
+    }
     calls = []
     class CDP:
         async def send_raw(self, method, params=None, session_id=None):
@@ -810,25 +850,40 @@ def test_event_drain_filters_owned_sessions_and_preserves_foreign_events(daemon_
     # Even with a foreign current page, reading this run's own events is safe.
     d.target_id, d.session = "FOREIGN", "FOREIGN-SESSION"
     assert [e["session_id"] for e in helpers.drain_events()] == ["SESSION-MINE"]
-    assert [e["session_id"] for e in d.events] == ["FOREIGN-SESSION", None]
+    assert list(d.events) == []
     assert helpers.drain_events() == []
 
 
 def test_event_drain_hides_owned_session_after_privileged_navigation(daemon_bridge, monkeypatch):
-    d, calls = daemon_bridge
+    d, _ = daemon_bridge
     monkeypatch.setenv("BH_TAB_MARKER", "0")
-    original = d.cdp.send_raw
-
-    async def privileged_info(method, params=None, session_id=None):
-        if method == "Target.getTargetInfo":
-            calls.append((method, params, session_id))
-            return {"targetInfo": {"type": "page", "targetId": "MINE", "url": "chrome://settings"}}
-        return await original(method, params, session_id)
-
-    d.cdp.send_raw = privileged_info
+    d._record_event("Page.frameNavigated", {"frame": {"url": "chrome://settings"}}, "SESSION-MINE")
     d._record_event("Page.loadEventFired", {}, "SESSION-MINE")
     assert helpers.drain_events() == []
-    assert d.events
+    assert list(d.events) == []
+
+
+@pytest.mark.parametrize("intermediate_drain", [False, True])
+def test_event_provenance_drops_privileged_document_payloads_across_navigation(
+    daemon_bridge, monkeypatch, intermediate_drain
+):
+    d, _ = daemon_bridge
+    monkeypatch.setenv("BH_TAB_MARKER", "0")
+    d._record_event("Network.requestWillBeSent", {"secret": "allowed-before"}, "SESSION-MINE")
+    d._record_event(
+        "Page.frameNavigated", {"frame": {"url": "chrome://settings"}}, "SESSION-MINE"
+    )
+    d._record_event("Network.requestWillBeSent", {"secret": "privileged"}, "SESSION-MINE")
+    before = helpers.drain_events() if intermediate_drain else []
+    d._record_event(
+        "Page.frameNavigated", {"frame": {"url": "https://allowed.example/"}}, "SESSION-MINE"
+    )
+    d._record_event("Network.requestWillBeSent", {"secret": "allowed-after"}, "SESSION-MINE")
+    after = helpers.drain_events()
+    payload = json.dumps(before + after)
+    assert "privileged" not in payload
+    assert "allowed-before" in payload
+    assert "allowed-after" in payload
 
 
 def test_event_drain_hides_owned_session_without_target_proof(daemon_bridge):
@@ -836,7 +891,7 @@ def test_event_drain_hides_owned_session_without_target_proof(daemon_bridge):
     d._session_targets.pop("SESSION-MINE")
     d._record_event("Network.requestWillBeSent", {"secret": "owned"}, "SESSION-MINE")
     assert helpers.drain_events() == []
-    assert d.events
+    assert list(d.events) == []
 
 
 def test_legacy_target_reply_uses_params_session_id_for_guarded_event_filter(daemon_bridge):
@@ -850,7 +905,7 @@ def test_legacy_target_reply_uses_params_session_id_for_guarded_event_filter(dae
     d._record_event(owned["method"], owned["params"], owned["session_id"])
     d._record_event(foreign["method"], foreign["params"], foreign["session_id"])
     assert helpers.drain_events() == [owned]
-    assert list(d.events) == [foreign]
+    assert list(d.events) == []
 
 
 def test_legacy_target_reply_ignores_outer_owned_carrier_and_malformed_nested_messages(daemon_bridge):
@@ -869,7 +924,70 @@ def test_legacy_target_reply_ignores_outer_owned_carrier_and_malformed_nested_me
     for event in events:
         d._record_event(event["method"], event["params"], event["session_id"])
     assert helpers.drain_events() == []
-    assert list(d.events) == events
+    assert list(d.events) == []
+
+
+def test_legacy_privileged_navigation_payload_is_discarded(daemon_bridge):
+    d, _ = daemon_bridge
+    event = {
+        "method": "Target.receivedMessageFromTarget",
+        "params": {
+            "sessionId": "SESSION-MINE",
+            "message": json.dumps({
+                "method": "Page.frameNavigated",
+                "params": {"frame": {"url": "chrome://settings"}},
+            }),
+        },
+        "session_id": "FOREIGN-OUTER-CARRIER",
+    }
+    d._record_event(event["method"], event["params"], event["session_id"])
+    assert helpers.drain_events() == []
+
+
+async def _send_raw_for_guard_reset(self, method, params=None, session_id=None):
+    self.calls.append((method, params or {}, session_id))
+    if method == "Target.getTargetInfo":
+        return {"targetInfo": {"type": "page", "targetId": "MINE", "url": "https://owned.example/"}}
+    return {}
+
+
+def test_guard_reset_revokes_queued_and_future_marker_work(monkeypatch):
+    monkeypatch.setenv("BH_TAB_GUARD", "1")
+    monkeypatch.delenv("BH_TAB_MARKER", raising=False)
+    d = daemon.Daemon()
+    d.cdp = daemon_test_cdp = type("CDP", (), {
+        "send_raw": _send_raw_for_guard_reset,
+    })()
+    daemon_test_cdp.calls = []
+    d._guard_policy_active = True
+    d._guarded_run_id = RUN_ID
+    d._guarded_sessions = {"SESSION-MINE"}
+    d._guarded_targets = {"MINE"}
+    d._session_targets = {"SESSION-MINE": "MINE"}
+    d._document_state["SESSION-MINE"] = {
+        "target_id": "MINE", "generation": 0,
+        "url": "https://owned.example/", "allowed": True,
+    }
+    d.session = "SESSION-MINE"
+    d.target_id = "MINE"
+
+    async def run():
+        d._record_event("Page.loadEventFired", {}, "SESSION-MINE")
+        response = await d.handle({"meta": "tab_guard_reset", "tab_guard_run": RUN_ID})
+        d._record_event("Page.loadEventFired", {}, "SESSION-MINE")
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        return response
+
+    response = asyncio.run(run())
+    assert response == {"tab_guard": "ok", "tab_guard_run": RUN_ID}
+    assert d._guard_policy_active is False
+    assert d._guarded_sessions == set()
+    assert d._guarded_targets == set()
+    assert d.session is None
+    assert d.target_id is None
+    assert d._marker_tasks == set()
+    assert not [call for call in daemon_test_cdp.calls if call[0] == "Runtime.evaluate"]
 
 
 def test_context_wide_event_subscription_is_refused_and_foreign_events_stay_hidden(daemon_bridge):
@@ -879,8 +997,7 @@ def test_context_wide_event_subscription_is_refused_and_foreign_events_stay_hidd
     with pytest.raises(helpers.TabGuardRefused):
         helpers.cdp("ServiceWorker.enable")
     assert helpers.drain_events() == []
-    assert len(d.events) == 1
-    assert d.events[0]["session_id"] == "FOREIGN-SESSION"
+    assert len(d.events) == 0
     assert calls[-1] == ("Network.enable", {}, "SESSION-MINE")
 
 

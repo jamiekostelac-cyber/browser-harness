@@ -450,7 +450,12 @@ class Daemon:
         self._guarded_sessions = set()
         self._guarded_targets = set()
         self._guard_policy_active = False
+        self._guarded_run_id = None
+        self._revoked_sessions = set()
+        self._marker_tasks = set()
         self.events = deque(maxlen=BUF)
+        self._event_provenance = deque(maxlen=BUF)
+        self._document_state = {}
         self.dialog_session = None
         self.dialog = None
         self.stop = None  # asyncio.Event, set inside start()
@@ -642,6 +647,8 @@ class Daemon:
         target_id = self._session_targets.get(session_id)
 
         async def mark():
+            if session_id in self._revoked_sessions:
+                return
             if self._guard_policy_active:
                 if (session_id not in self._guarded_sessions
                         or not target_id or target_id not in self._guarded_targets):
@@ -654,6 +661,10 @@ class Daemon:
                     return
                 if not _guard_url_allowed(info.get("url")):
                     return
+                if (not self._guard_policy_active
+                        or session_id not in self._guarded_sessions
+                        or target_id not in self._guarded_targets):
+                    return
             elif os.environ.get("BH_TAB_GUARD") == "1":
                 # Guarded startup has no explicit session policy yet. Stay
                 # inert until a guarded request registers one.
@@ -664,7 +675,16 @@ class Daemon:
                 session_id=session_id,
             )
 
-        return asyncio.create_task(_silent(asyncio.wait_for(mark(), timeout=2)))
+        async def run_marker():
+            try:
+                await asyncio.wait_for(mark(), timeout=2)
+            except BaseException:
+                return
+
+        task = asyncio.create_task(run_marker())
+        self._marker_tasks.add(task)
+        task.add_done_callback(self._marker_tasks.discard)
+        return task
 
     def _record_event(self, method, params, session_id=None):
         self.events.append({"method": method, "params": params, "session_id": session_id})
@@ -709,27 +729,135 @@ class Daemon:
         self.cdp._event_registry.handle_event = tap
 
     @staticmethod
-    def _event_source_session(event):
-        """Extract the transport source, never an untrusted outer carrier."""
+    def _event_details(event):
+        """Return source, inner method, and params from one event envelope."""
         if event.get("method") != "Target.receivedMessageFromTarget":
             session_id = event.get("session_id")
-            return session_id if isinstance(session_id, str) and session_id else None
+            if not isinstance(session_id, str) or not session_id:
+                return None, event.get("method"), event.get("params")
+            return session_id, event.get("method"), event.get("params")
         params = event.get("params")
         if not isinstance(params, dict):
-            return None
+            return None, None, None
         session_id, message = params.get("sessionId"), params.get("message")
         if not isinstance(session_id, str) or not session_id or not isinstance(message, str):
-            return None
+            return None, None, None
         try:
             payload = json.loads(message)
         except (TypeError, ValueError):
-            return None
+            return None, None, None
         if not isinstance(payload, dict):
-            return None
+            return None, None, None
         nested_session = payload.get("sessionId")
         if nested_session is not None and nested_session != session_id:
-            return None
-        return session_id
+            return None, None, None
+        return session_id, payload.get("method"), payload.get("params")
+
+    @classmethod
+    def _event_source_session(cls, event):
+        """Extract the transport source, never an untrusted outer carrier."""
+        return cls._event_details(event)[0]
+
+    @staticmethod
+    def _navigation_url(method, params):
+        if method == "Page.frameNavigated":
+            frame = params.get("frame") if isinstance(params, dict) else None
+            if not isinstance(frame, dict) or frame.get("parentId") is not None:
+                return None
+            return frame.get("url")
+        if method == "Page.navigatedWithinDocument":
+            return params.get("url") if isinstance(params, dict) else None
+        return None
+
+    def _record_event(self, method, params, session_id=None):
+        event = {"method": method, "params": params, "session_id": session_id}
+        source_session = self._event_source_session(event)
+        provenance = None
+        if self._guard_policy_active:
+            source, inner_method, inner_params = self._event_details(event)
+            target_id = self._session_targets.get(source)
+            state = self._document_state.get(source)
+            if (source not in self._guarded_sessions
+                    or target_id not in self._guarded_targets
+                    or not isinstance(state, dict)
+                    or state.get("target_id") != target_id):
+                return
+            navigation_url = self._navigation_url(inner_method, inner_params)
+            if inner_method in {"Page.frameNavigated", "Page.navigatedWithinDocument"}:
+                state["generation"] += 1
+                state["url"] = navigation_url
+                state["allowed"] = _guard_url_allowed(navigation_url)
+            if not state.get("allowed"):
+                return
+            provenance = {
+                "session_id": source,
+                "target_id": target_id,
+                "generation": state["generation"],
+                "url": state.get("url"),
+                "allowed": True,
+            }
+        self.events.append(event)
+        self._event_provenance.append(provenance)
+        event_session = source_session if self._guard_policy_active else session_id
+        if method == "Page.javascriptDialogOpening":
+            self.dialog = params
+            self.dialog_session = event_session
+        elif method == "Page.javascriptDialogClosed":
+            if event_session == self.dialog_session:
+                self.dialog = None
+                self.dialog_session = None
+        elif method in ("Page.loadEventFired", "Page.domContentEventFired"):
+            self._schedule_tab_marker(event_session)
+
+    async def _tab_guard_reset(self, req):
+        run_id = req.get("tab_guard_run")
+        if not isinstance(run_id, str) or not run_id:
+            return {"tab_guard": "refused"}
+        if self._guarded_run_id not in (None, run_id):
+            return {"tab_guard": "refused", "tab_guard_run": self._guarded_run_id}
+        async with self._session_state_lock:
+            revoked_sessions = set(self._guarded_sessions)
+            revoked_targets = set(self._guarded_targets)
+            old_mapping = dict(self._session_targets)
+            self._guard_policy_active = False
+            self._guarded_run_id = None
+            self._revoked_sessions.update(revoked_sessions)
+            self._guarded_sessions.clear()
+            self._guarded_targets.clear()
+            self._session_targets = {
+                sid: target for sid, target in self._session_targets.items()
+                if sid not in revoked_sessions and target not in revoked_targets
+            }
+            self._session_replacements = {
+                stale: replacement for stale, replacement in self._session_replacements.items()
+                if stale not in revoked_sessions and replacement not in revoked_sessions
+            }
+            if self.session in revoked_sessions or self.target_id in revoked_targets:
+                self.session = None
+                self.target_id = None
+            remaining = deque(maxlen=BUF)
+            remaining_provenance = deque(maxlen=BUF)
+            for event, provenance in zip(self.events, self._event_provenance):
+                source = self._event_source_session(event)
+                target = old_mapping.get(source)
+                if source in revoked_sessions or target in revoked_targets:
+                    continue
+                remaining.append(event)
+                remaining_provenance.append(provenance)
+            self.events = remaining
+            self._event_provenance = remaining_provenance
+            if self.dialog_session in revoked_sessions:
+                self.dialog = None
+                self.dialog_session = None
+            marker_tasks = list(self._marker_tasks)
+            for task in marker_tasks:
+                task.cancel()
+            for sid in revoked_sessions:
+                self._document_state.pop(sid, None)
+        if marker_tasks:
+            await asyncio.gather(*marker_tasks, return_exceptions=True)
+            self._marker_tasks.difference_update(marker_tasks)
+        return {"tab_guard": "ok", "tab_guard_run": run_id}
 
     async def _guarded_read(self, req):
         """Validate and snapshot before yielding; never expose other sessions."""
@@ -738,24 +866,23 @@ class Daemon:
         target_id, sid = self.target_id, self.session
         if meta == "drain_events":
             out, remaining = [], deque(maxlen=BUF)
-            target_allowed = {}
-            for event in self.events:
-                event_session = self._event_source_session(event)
-                event_target = self._session_targets.get(event_session)
-                allowed = bool(event_session in sessions and event_target in tabs)
-                if allowed and event_target not in target_allowed:
-                    try:
-                        info = (await self.cdp.send_raw(
-                            "Target.getTargetInfo", {"targetId": event_target}
-                        )).get("targetInfo", {})
-                        target_allowed[event_target] = _guard_url_allowed(info.get("url"))
-                    except Exception:
-                        target_allowed[event_target] = False
-                if allowed and target_allowed.get(event_target, False):
+            remaining_provenance = deque(maxlen=BUF)
+            for event, provenance in zip(self.events, self._event_provenance):
+                allowed = (
+                    isinstance(provenance, dict)
+                    and provenance.get("allowed") is True
+                    and provenance.get("session_id") in sessions
+                    and provenance.get("target_id") in tabs
+                    and self._session_targets.get(provenance.get("session_id"))
+                    == provenance.get("target_id")
+                )
+                if allowed:
                     out.append(event)
                 else:
                     remaining.append(event)
+                    remaining_provenance.append(provenance)
             self.events = remaining
+            self._event_provenance = remaining_provenance
             return {"events": out, "tab_guard": "ok"}
         if not target_id or target_id not in tabs or not sid or sid not in sessions:
             return {"tab_guard": "refused", "target_id": target_id}
@@ -801,6 +928,8 @@ class Daemon:
                 except Exception:
                     context["url"] = None
             return context
+        if meta == "tab_guard_reset":
+            return await self._tab_guard_reset(req)
         if "tab_guard" in req and meta != "set_session":
             return await self._guarded_read(req)
         # Liveness probe — lets clients confirm the listener is actually this
@@ -809,7 +938,9 @@ class Daemon:
         # signaling — protects against SIGTERM-by-stale-pid-file after PID reuse.
         if meta == "ping":        return {"pong": True, "pid": os.getpid(), "browser_kind": BROWSER_KIND}
         if meta == "drain_events":
-            out = list(self.events); self.events.clear()
+            out = list(self.events)
+            self.events.clear()
+            self._event_provenance.clear()
             return {"events": out}
         if meta == "session":     return {"session_id": self.session}
         if meta == "current_tab":
@@ -842,11 +973,12 @@ class Daemon:
         if meta == "set_session":
             async with self._session_state_lock:
                 owned = req.get("tab_guard")
-                if owned is not None:
-                    self._guarded_sessions = set(owned.get("sessions", []))
+                guard_run = req.get("tab_guard_run")
                 if owned is not None and (
                     not req.get("session_id") or req["session_id"] not in owned.get("sessions", [])
                     or not req.get("target_id") or req["target_id"] not in owned.get("tabs", [])
+                    or not isinstance(guard_run, str) or not guard_run
+                    or self._guarded_run_id not in (None, guard_run)
                 ):
                     return {"tab_guard": "refused", "target_id": req.get("target_id")}
                 if owned is not None:
@@ -860,6 +992,8 @@ class Daemon:
                         return {"tab_guard": "refused", "target_id": req.get("target_id"),
                                 "url": info.get("url", "")}
                     self._guard_policy_active = True
+                    self._guarded_run_id = guard_run
+                    self._revoked_sessions.difference_update(owned.get("sessions", []))
                     self._guarded_sessions = set(owned.get("sessions", []))
                     self._guarded_targets = set(owned.get("tabs", []))
                 old_session = self.session
@@ -868,6 +1002,13 @@ class Daemon:
                 new_session = self.session
                 if new_session and self.target_id:
                     self._session_targets[new_session] = self.target_id
+                    if owned is not None:
+                        self._document_state[new_session] = {
+                            "target_id": self.target_id,
+                            "generation": 0,
+                            "url": info.get("url"),
+                            "allowed": True,
+                        }
             # Run the old-session Network.disable (defense in depth — keeps
             # background-tab traffic out of the global event buffer; the
             # consumer-side filter in wait_for_network_idle is the actual
@@ -927,6 +1068,7 @@ class Daemon:
                 attached_session = result.get("sessionId")
                 target_id = params.get("targetId")
                 if attached_session and target_id:
+                    self._revoked_sessions.discard(attached_session)
                     self._session_targets[attached_session] = target_id
             elif method == "Target.detachFromTarget":
                 self._session_targets.pop(params.get("sessionId"), None)

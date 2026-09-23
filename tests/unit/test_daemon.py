@@ -144,6 +144,7 @@ def test_guard_policy_blocks_unregistered_marker_and_domain_authorization(monkey
             "session_id": "owned-session",
             "target_id": "owned-target",
             "tab_guard": {"tabs": ["owned-target"], "sessions": ["owned-session"]},
+            "tab_guard_run": "123e4567-e89b-42d3-a456-426614174000",
         })
 
     assert asyncio.run(register()) == {"session_id": "owned-session", "tab_guard": "ok"}
@@ -215,6 +216,10 @@ def test_guarded_event_marker_uses_origin_session_and_owned_target(monkeypatch):
     d._guarded_sessions = {"event-session"}
     d._guarded_targets = {"event-target"}
     d._session_targets = {"event-session": "event-target"}
+    d._document_state["event-session"] = {
+        "target_id": "event-target", "generation": 0,
+        "url": "https://owned.example/", "allowed": True,
+    }
     d.session = "current-session"
     d.target_id = "current-target"
 
@@ -252,6 +257,11 @@ def test_guarded_event_marker_fails_closed_for_foreign_or_privileged_source(
     d._guard_policy_active = True
     d._guarded_sessions = {"event-session"}
     d._session_targets = {"event-session": "event-target"}
+    d._guarded_targets = {"event-target"}
+    d._document_state["event-session"] = {
+        "target_id": "event-target", "generation": 0,
+        "url": "https://owned.example/", "allowed": True,
+    }
     d.session = "current-session"
     d.target_id = "current-target"
 

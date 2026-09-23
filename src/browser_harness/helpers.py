@@ -358,6 +358,11 @@ def tab_guard_reset():
     run disown its own tabs and be refused on them."""
     if not _tab_guard_on():
         return
+    run_id = _run_id()
+    response = _send({"meta": "tab_guard_reset", "tab_guard_run": run_id})
+    if (response.get("tab_guard") != "ok"
+            or response.get("tab_guard_run") != run_id):
+        _refuse("tab_guard_reset", None, "", "daemon did not acknowledge run revocation")
     path = _owned_path()
     with _ownership_lock(path):
         try:
@@ -517,8 +522,9 @@ def _read_meta(meta, **params):
     req = {"meta": meta, **params}
     guarded = _tab_guard_on()
     if guarded:
-        _run_id()
+        run_id = _run_id()
         req["tab_guard"] = _owned_state()
+        req["tab_guard_run"] = run_id
     try:
         # An old daemon ignores unknown request fields. Detect it before a
         # set_session could enable domains or disable a foreign session.
@@ -867,6 +873,22 @@ def _mark_tab():
     except Exception:
         pass
 
+
+def _guard_can_unmark_current_tab():
+    """Only remove a marker after proving the current tab is ours and safe."""
+    if not _tab_guard_on():
+        return True
+    try:
+        context = _send({"meta": "guard_context"})
+        if not isinstance(context, dict):
+            return False
+        target_id, session_id = context.get("target_id"), context.get("session_id")
+        if target_id not in _owned_ids() or session_id not in _owned_sessions():
+            return False
+        return _url_scope_reason(context.get("url"), required=True) is None
+    except Exception:
+        return False
+
 def _target_id(target):
     """Accept a raw target id or a tab dict returned by the helpers."""
     return (target.get("targetId") or target.get("target_id")) if isinstance(target, dict) else target
@@ -896,13 +918,14 @@ def switch_tab(target, activate=False):
             _refuse("switch_tab", target_id, target.get("url", ""), url_reason)
     # Unmark old tab. Horse emoji is a surrogate pair in JS UTF-16 strings (2 code units),
     # plus the trailing space = 3 code units, so slice(3) cleanly removes the prefix.
-    try:
-        cdp("Runtime.evaluate", expression="if(document.title.startsWith('\U0001F434 '))document.title=document.title.slice(3)")
-    except TabGuardRefused:
-        if _tab_guard_on():
-            raise
-    except Exception:
-        pass
+    if _guard_can_unmark_current_tab():
+        try:
+            cdp("Runtime.evaluate", expression="if(document.title.startsWith('\U0001F434 '))document.title=document.title.slice(3)")
+        except TabGuardRefused:
+            if _tab_guard_on():
+                raise
+        except Exception:
+            pass
     if activate:
         activate_tab(target_id)
     sid = cdp("Target.attachToTarget", targetId=target_id, flatten=True)["sessionId"]
