@@ -502,6 +502,7 @@ class Daemon:
         self._legacy_commands = {}
         self._legacy_wire_id = 0
         self._revoked_sessions = set()
+        self._pending_detached_sessions = set()
         self._marker_tasks = set()
         self.events = deque(maxlen=BUF)
         self._event_provenance = deque(maxlen=BUF)
@@ -963,8 +964,11 @@ class Daemon:
             return
         if method == "Target.detachedFromTarget":
             sid = params.get("sessionId")
-            if isinstance(sid, str) and sid in self._guarded_sessions:
-                self._revoke_event_ownership({sid})
+            if isinstance(sid, str):
+                if sid in self._session_targets or sid in self._guarded_sessions:
+                    self._revoke_event_ownership({sid})
+                else:
+                    self._pending_detached_sessions.add(sid)
         elif method == "Target.targetDestroyed":
             target = params.get("targetId")
             if isinstance(target, str) and target in self._guarded_targets:
@@ -1628,6 +1632,10 @@ class Daemon:
                 attached_session = result.get("sessionId")
                 target_id = params.get("targetId")
                 if attached_session and target_id:
+                    if attached_session in self._pending_detached_sessions:
+                        self._pending_detached_sessions.discard(attached_session)
+                        self._revoked_sessions.add(attached_session)
+                        return {"error": "Target.attachToTarget session was detached before registration"}
                     self._revoked_sessions.discard(attached_session)
                     self._session_targets[attached_session] = target_id
                     if guard_identity is not None:

@@ -2142,6 +2142,37 @@ def test_target_scoped_handler_allows_owned_current_document(daemon_bridge, meth
         assert d._session_targets["SESSION-MINE"] == "MINE"
 
 
+def test_detach_before_attach_response_rejects_late_session_registration(daemon_bridge):
+    d, calls = daemon_bridge
+    request = _guarded_dispatch_request(d, "Target.attachToTarget", {"targetId": "MINE"})
+    request["session_id"] = None
+    request["tab_guard_session_id"] = None
+    request["tab_guard_document_generation"] = None
+    request["tab_guard_url"] = "https://owned.example/"
+    request["tab_guard"]["sessions"] = []
+    d._session_targets.clear()
+    d._guarded_sessions.clear()
+    d._document_state.clear()
+
+    async def attach_response(method, params=None, session_id=None):
+        calls.append((method, params, session_id))
+        if method == "Target.getTargetInfo":
+            return {"targetInfo": {"type": "page", "targetId": "MINE",
+                                   "url": "https://owned.example/", "title": "Owned"}}
+        return {"sessionId": "SESSION-LATE"}
+
+    d.cdp.send_raw = attach_response
+    d._record_event("Target.detachedFromTarget", {"sessionId": "SESSION-LATE", "targetId": "MINE"})
+
+    response = asyncio.run(d.handle(request))
+
+    assert response == {"error": "Target.attachToTarget session was detached before registration"}
+    assert "SESSION-LATE" not in d._session_targets
+    assert "SESSION-LATE" not in d._guarded_sessions
+    assert "SESSION-LATE" not in d._document_state
+    assert "SESSION-LATE" in d._revoked_sessions
+
+
 @pytest.mark.parametrize("method", [
     "Target.closeTarget", "Target.activateTarget", "Target.attachToTarget",
 ])
