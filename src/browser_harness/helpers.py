@@ -3,7 +3,7 @@
 Core helpers live here. Agent-editable helpers live in
 BH_AGENT_WORKSPACE/agent_helpers.py.
 """
-import base64, importlib.util, json, math, os, sys, time, urllib.request
+import base64, hashlib, importlib.util, json, math, os, sys, tempfile, time, urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -101,14 +101,13 @@ class TabGuardRefused(RuntimeError):
 
 
 # Global, and safe under the guard: enumeration and creation.
-_TARGET_SAFE_METHODS = {"Target.getTargets", "Target.getTargetInfo", "Target.createTarget"}
+_TARGET_SAFE_METHODS = {"Target.getTargets", "Target.createTarget"}
 # Global, but act on a specific target named in the params — check THAT target.
 _TARGET_SCOPED_METHODS = {
     "Target.closeTarget", "Target.activateTarget", "Target.attachToTarget",
-    "Target.detachFromTarget", "Target.exposeDevToolsProtocol",
+    "Target.getTargetInfo", "Target.exposeDevToolsProtocol",
 }
-# Everything else is session-scoped: it acts on whatever target the daemon is
-# attached to, which is precisely what drifts.
+# Other Target methods are refused; session calls must use an owned session.
 
 
 def _tab_guard_on():
@@ -119,7 +118,10 @@ def _run_id():
     """Identifies one run. Set BH_TAB_GUARD_RUN to something unique per run (a
     job id): ownership is scoped to it, so a run starts owning nothing and two
     concurrent runs cannot consume each other's list."""
-    return os.environ.get("BH_TAB_GUARD_RUN", "")
+    run_id = os.environ.get("BH_TAB_GUARD_RUN", "")
+    if not run_id.strip():
+        _refuse("run", None, "", "BH_TAB_GUARD_RUN must be non-empty")
+    return run_id
 
 
 def _owned_path():
@@ -127,20 +129,23 @@ def _owned_path():
     # users sharing a daemon name (the default is literally "default") would
     # otherwise read-modify-write one file and drop each other's entries —
     # which refuses a run on its OWN tab, mid-task.
-    slug = "".join(c if c.isalnum() or c in "-_" else "_" for c in _run_id())[:64]
-    return ipc._TMP / f"{ipc._tmp_stem(NAME)}-owned-tabs-{slug or 'norun'}.json"
+    key = json.dumps([NAME, str(ipc._RUNTIME), _run_id()], ensure_ascii=True)
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    return ipc._TMP / f"{ipc._tmp_stem(NAME)}-owned-tabs-{digest}.json"
 
 
 def _owned_state():
+    owned_path = _owned_path()  # Invalid run IDs must not be swallowed below.
     try:
-        state = json.loads(_owned_path().read_text())
+        state = json.loads(owned_path.read_text(encoding="utf-8"))
     except Exception:
         return {"tabs": [], "sessions": []}
     if not isinstance(state, dict):
         return {"tabs": [], "sessions": []}
     return {
-        "tabs": state.get("tabs") if isinstance(state.get("tabs"), list) else [],
-        "sessions": state.get("sessions") if isinstance(state.get("sessions"), list) else [],
+        kind: [v for v in state[kind] if isinstance(v, str) and v]
+        if isinstance(state.get(kind), list) else []
+        for kind in ("tabs", "sessions")
     }
 
 
@@ -155,25 +160,32 @@ def _owned_sessions():
     return set(_owned_state()["sessions"])
 
 
-def _remember(kind, value):
-    if not value:
+def _remember(kind, value, remove=False):
+    if not _tab_guard_on() or not value:
         return
     state = _owned_state()
-    if value in state[kind]:
+    if (value in state[kind]) != remove:
         return
-    state[kind] = sorted(set(state[kind]) | {value})
+    state[kind] = sorted(set(state[kind]) - {value} if remove else set(state[kind]) | {value})
+    temporary = None
     try:
-        _owned_path().write_text(json.dumps(state))
+        path = _owned_path()
+        fd, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+        os.replace(temporary, path)
     except Exception as e:
         # NOT silent. With the guard on, a lost ownership record refuses every
         # later action on a tab the run genuinely opened, and swallowing this
         # would make a disk problem look like a guard bug.
         print(f"[tab-guard] WARNING could not record ownership of {value}: {e}", file=sys.stderr, flush=True)
+    finally:
+        if temporary and os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def _own_tab(target_id):
-    """Record a tab this run created. Runs whether the guard is on or off, so
-    enabling it part-way through cannot strand tabs the run legitimately owns."""
+    """Record a tab created while this run's guard is enabled."""
     _remember("tabs", target_id)
 
 
@@ -189,22 +201,42 @@ def tab_guard_reset():
         pass
 
 
-def _current_target():
-    """The target the daemon is attached to, or None when it cannot be read."""
+def _checked_session(method, params):
+    """Snapshot target/session together, validate both, and pin later dispatch."""
     try:
-        return _send({"meta": "current_tab"}).get("targetId")
+        context = _send({"meta": "guard_context"})
     except Exception:
-        return None
+        context = {}
+    context = context if isinstance(context, dict) else {}
+    target_id, sid = context.get("target_id"), context.get("session_id")
+    if (isinstance(target_id, str) and target_id in _owned_ids()
+            and isinstance(sid, str) and sid and sid in _owned_sessions()):
+        return sid
+    _refuse(method, target_id, params.get("url", ""),
+            "attached tab/session is not owned or could not be resolved (failing closed)")
 
 
-def _is_page_target(target_id):
-    """True when the target is a top-level tab, False for a subframe/worker, and
-    True when it cannot be determined — unknown must not mean permitted."""
+def _is_owned_iframe(target_id):
+    """Only a frame in an owned page's frame tree may inherit tab ownership.
+
+    OOPIF target IDs are frame IDs. Enumeration, target type, opener IDs and
+    URLs alone do not establish ancestry. Workers without proof fail closed.
+    """
     try:
         info = _send({"method": "Target.getTargetInfo", "params": {"targetId": target_id}, "session_id": None})
-        return (info.get("result", {}).get("targetInfo", {}) or {}).get("type", "page") == "page"
+        if info.get("result", {}).get("targetInfo", {}).get("type") != "iframe":
+            return False
+        sid = _checked_session("Target.attachToTarget", {})
+        tree = _send({"method": "Page.getFrameTree", "params": {}, "session_id": sid})["result"]["frameTree"]
+        pending = list(tree.get("childFrames", []))
+        while pending:
+            child = pending.pop()
+            if child.get("frame", {}).get("id") == target_id:
+                return True
+            pending.extend(child.get("childFrames", []))
     except Exception:
-        return True
+        pass
+    return False
 
 
 def _refuse(method, target_id, url, reason):
@@ -226,39 +258,49 @@ def _refuse(method, target_id, url, reason):
 
 def _tab_guard_check(method, params, session_id=None):
     if not _tab_guard_on():
-        return
+        return session_id
+    _run_id()
     if method in _TARGET_SAFE_METHODS:
+        return
+
+    if method in {"Target.detachFromTarget", "Target.sendMessageToTarget"}:
+        sid = params.get("sessionId")
+        if not sid or sid not in _owned_sessions():
+            _refuse(method, f"session:{sid}", "", "session was not attached by this run")
+        if params.get("targetId") is not None:
+            _refuse(method, params["targetId"], "", "use only the owned sessionId")
+        if method == "Target.sendMessageToTarget":
+            try:
+                message = json.loads(params.get("message", ""))
+                nested_method = message["method"]
+                if not isinstance(nested_method, str) or nested_method.startswith("Target.") or "sessionId" in message:
+                    raise ValueError("nested routing")
+            except (ValueError, KeyError, TypeError):
+                _refuse(method, f"session:{sid}", "", "invalid or nested target-routing message")
         return
 
     if method in _TARGET_SCOPED_METHODS:
         target_id = params.get("targetId")
         if target_id in _owned_ids():
             return
-        # A subframe or worker is reached only through a page the run already
-        # holds, so it is not a separate tab to protect. The unit of ownership
-        # here is the TAB.
-        if target_id and not _is_page_target(target_id):
+        if method == "Target.attachToTarget" and target_id and _is_owned_iframe(target_id):
             return
         _refuse(method, target_id, params.get("url", ""), "not a tab this run opened")
+
+    # Unknown Target methods are browser-scoped in the daemon. Never authorize
+    # them merely because the daemon happens to be attached to an owned page.
+    if method.startswith("Target."):
+        _refuse(method, None, "", "unsupported browser-level target operation")
 
     if session_id is not None:
         # An explicitly-addressed session: allowed only if this run attached it.
         # Validating the daemon's CURRENT target instead would check one target
         # and then dispatch into another.
-        if session_id in _owned_sessions():
-            return
+        if session_id and session_id in _owned_sessions():
+            return session_id
         _refuse(method, f"session:{session_id}", params.get("url", ""), "session was not attached by this run")
 
-    # Session-scoped: acts on whatever the daemon is attached to.
-    target_id = _current_target()
-    if target_id is not None and target_id in _owned_ids():
-        return
-    # Fail CLOSED. An unreadable current target is not permission to act on it;
-    # treating "unknown" as "nothing to refuse" turns any daemon hiccup into a
-    # bypass.
-    url = params.get("url") or ""
-    reason = "not a tab this run opened" if target_id else "could not resolve the attached tab (failing closed)"
-    _refuse(method, target_id, url, reason)
+    return _checked_session(method, params)
 
 
 def cdp(method, session_id=None, _response_timeout=DEFAULT_IPC_RESPONSE_TIMEOUT_SECONDS, **params):
@@ -266,7 +308,7 @@ def cdp(method, session_id=None, _response_timeout=DEFAULT_IPC_RESPONSE_TIMEOUT_
 
     Under BH_TAB_GUARD=1, a call against a tab this run did not open raises
     TabGuardRefused — see the tab guard block above."""
-    _tab_guard_check(method, params, session_id)
+    session_id = _tab_guard_check(method, params, session_id)
     result = _send(
         {"method": method, "params": params, "session_id": session_id},
         response_timeout=_response_timeout,
@@ -277,10 +319,38 @@ def cdp(method, session_id=None, _response_timeout=DEFAULT_IPC_RESPONSE_TIMEOUT_
         _own_tab(result.get("targetId"))
     elif method == "Target.attachToTarget":
         _remember("sessions", result.get("sessionId"))
+    elif method == "Target.detachFromTarget":
+        _remember("sessions", params.get("sessionId"), remove=True)
+    elif method == "Target.closeTarget" and result.get("success"):
+        _remember("tabs", params.get("targetId"), remove=True)
     return result
 
 
-def drain_events():  return _send({"meta": "drain_events"})["events"]
+def _read_meta(meta, **params):
+    req = {"meta": meta, **params}
+    guarded = _tab_guard_on()
+    if guarded:
+        _run_id()
+        req["tab_guard"] = _owned_state()
+    try:
+        # An old daemon ignores unknown request fields. Detect it before a
+        # set_session could enable domains or disable a foreign session.
+        if guarded and meta == "set_session":
+            if _send({"meta": "guard_context"}).get("tab_guard") != "ok":
+                _refuse(meta, None, "", "daemon must be reloaded for tab guard support")
+        response = _send(req)
+    except TabGuardRefused:
+        raise
+    except Exception:
+        if guarded:
+            _refuse(meta, None, "", "metadata could not be read (failing closed)")
+        raise
+    if guarded and response.get("tab_guard") != "ok":
+        _refuse(meta, response.get("target_id"), "", "metadata ownership could not be verified")
+    return response
+
+
+def drain_events():  return _read_meta("drain_events")["events"]
 
 
 def _js_snippet(expression, limit=160):
@@ -365,7 +435,7 @@ def page_info():
     If a native dialog (alert/confirm/prompt/beforeunload) is open, returns
     {dialog: {type, message, ...}} instead — the page's JS thread is frozen
     until the dialog is handled (see interaction-skills/dialogs.md)."""
-    dialog = _send({"meta": "pending_dialog"}).get("dialog")
+    dialog = _read_meta("pending_dialog").get("dialog")
     if dialog:
         return {"dialog": dialog}
     expression = "JSON.stringify({url:location.href,title:document.title,w:innerWidth,h:innerHeight,sx:scrollX,sy:scrollY,pw:document.documentElement.scrollWidth,ph:document.documentElement.scrollHeight})"
@@ -580,7 +650,7 @@ def list_tabs(include_chrome=True):
     return out
 
 def current_tab():
-    r = _send({"meta": "current_tab"})
+    r = _read_meta("current_tab")
     return {
         "targetId": r["targetId"],
         "target_id": r["targetId"],
@@ -625,7 +695,7 @@ def switch_tab(target, activate=False):
     if activate:
         activate_tab(target_id)
     sid = cdp("Target.attachToTarget", targetId=target_id, flatten=True)["sessionId"]
-    _send({"meta": "set_session", "session_id": sid, "target_id": target_id})
+    _read_meta("set_session", session_id=sid, target_id=target_id)
     _mark_tab()
     return sid
 
@@ -758,7 +828,7 @@ def wait_for_network_idle(timeout=10.0, idle_ms=500):
     deadline = time.time() + timeout
     last_activity = time.time()
     inflight = set()
-    active_session = _send({"meta": "session"}).get("session_id")
+    active_session = _read_meta("session").get("session_id")
     while time.time() < deadline:
         for e in drain_events():
             if e.get("session_id") != active_session:

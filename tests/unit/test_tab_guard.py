@@ -1,4 +1,5 @@
 """Tab guard: an unattended run may act only on tabs it opened (BH_TAB_GUARD=1)."""
+import asyncio
 import json
 import os
 import pathlib
@@ -7,7 +8,7 @@ import sys
 
 import pytest
 
-from browser_harness import helpers
+from browser_harness import daemon, helpers
 
 
 FOREIGN = {"targetId": "FOREIGN", "url": "https://mail.example.com/", "title": "Inbox"}
@@ -15,8 +16,10 @@ FOREIGN = {"targetId": "FOREIGN", "url": "https://mail.example.com/", "title": "
 
 def _fake_send(current=FOREIGN, created="MINE", session="SESSION-MINE", target_type="page"):
     def send(req, response_timeout=None):
+        if req.get("meta") == "guard_context":
+            return {"target_id": current["targetId"], "session_id": session}
         if req.get("meta") == "current_tab":
-            return dict(current)
+            return {**current, "tab_guard": "ok"}
         method = req.get("method")
         if method == "Target.createTarget":
             return {"result": {"targetId": created}}
@@ -44,6 +47,7 @@ def guard(tmp_path, monkeypatch):
 def owning(guard, monkeypatch):
     """As `guard`, but the run has opened a tab and the daemon is attached to it."""
     assert helpers.cdp("Target.createTarget", url="about:blank")["targetId"] == "MINE"
+    helpers.cdp("Target.attachToTarget", targetId="MINE", flatten=True)
     monkeypatch.setattr(helpers, "_send", _fake_send(current={"targetId": "MINE", "url": "https://example.com/", "title": "t"}))
 
 
@@ -90,7 +94,7 @@ def test_fails_closed_when_the_attached_tab_cannot_be_read(tmp_path, monkeypatch
     helpers.tab_guard_reset()
 
     def flaky(req, response_timeout=None):
-        if req.get("meta") == "current_tab":
+        if req.get("meta") == "guard_context":
             raise RuntimeError("daemon unreachable")
         return {"result": {}}
 
@@ -113,15 +117,15 @@ def test_allows_enumerating_tabs_without_attaching(guard):
     """Refusing reads on a foreign tab costs a run nothing, because
     Target.getTargets still answers "what else is open?"."""
     helpers.cdp("Target.getTargets")
-    helpers.cdp("Target.getTargetInfo", targetId="FOREIGN")
+    with pytest.raises(helpers.TabGuardRefused):
+        helpers.cdp("Target.getTargetInfo", targetId="FOREIGN")
 
 
-def test_allows_attaching_to_a_subframe_of_a_page_the_run_holds(guard, monkeypatch):
-    """js(target_id=...) reaches an out-of-process iframe, whose target id is
-    only discoverable through a page the run already has. The unit of ownership
-    is the TAB, so a subframe is not a separate thing to protect."""
-    monkeypatch.setattr(helpers, "_send", _fake_send(target_type="iframe"))
-    helpers.cdp("Target.attachToTarget", targetId="SOME-IFRAME", flatten=True)
+def test_refuses_non_page_targets_without_owned_ancestry(owning, monkeypatch):
+    monkeypatch.setattr(helpers, "_send", _fake_send(
+        current={"targetId": "MINE"}, target_type="iframe"))
+    with pytest.raises(helpers.TabGuardRefused):
+        helpers.cdp("Target.attachToTarget", targetId="FOREIGN-IFRAME", flatten=True)
 
 
 def test_allows_a_session_this_run_attached_and_refuses_one_it_did_not(owning):
@@ -169,7 +173,9 @@ def test_a_concurrent_run_cannot_consume_this_run_s_ownership(guard, monkeypatch
     helpers.cdp("Target.createTarget", url="about:blank")
     assert helpers._owned_ids() == {"MINE"}
     monkeypatch.setenv("BH_TAB_GUARD_RUN", "")   # a different (unguarded) user
+    monkeypatch.delenv("BH_TAB_GUARD")
     helpers._own_tab("THEIRS")
+    monkeypatch.setenv("BH_TAB_GUARD", "1")
     monkeypatch.setenv("BH_TAB_GUARD_RUN", "test-run")
     assert helpers._owned_ids() == {"MINE"}
 
@@ -221,3 +227,382 @@ def test_an_unwritable_log_does_not_swallow_the_refusal(guard, monkeypatch):
     monkeypatch.setenv("BH_TAB_GUARD_LOG", "/nonexistent-dir/run.log")
     with pytest.raises(helpers.TabGuardRefused):
         helpers.goto_url("https://example.com/")
+
+
+@pytest.mark.parametrize("run_id", [None, "", " \t\n"])
+def test_guard_requires_nonempty_run_before_any_dispatch(guard, monkeypatch, run_id):
+    if run_id is None:
+        monkeypatch.delenv("BH_TAB_GUARD_RUN")
+    else:
+        monkeypatch.setenv("BH_TAB_GUARD_RUN", run_id)
+    calls = []
+    monkeypatch.setattr(helpers, "_send", lambda req, **kw: calls.append(req))
+    for method in ("Target.createTarget", "Target.getTargets", "Runtime.evaluate"):
+        with pytest.raises(helpers.TabGuardRefused, match="BH_TAB_GUARD_RUN"):
+            helpers.cdp(method)
+    assert calls == []
+
+
+@pytest.mark.parametrize("first,second", [
+    ("job/a", "job_a"), ("x" * 64 + "a", "x" * 64 + "b"),
+    ("é", "e\u0301"), ("run", " run"),
+])
+def test_lossy_run_names_cannot_share_ownership(guard, monkeypatch, first, second):
+    monkeypatch.setenv("BH_TAB_GUARD_RUN", first)
+    helpers._own_tab("MINE")
+    first_path = helpers._owned_path()
+    monkeypatch.setenv("BH_TAB_GUARD_RUN", second)
+    assert helpers._owned_path() != first_path
+    assert helpers._owned_ids() == set()
+
+
+def test_daemon_names_are_part_of_ownership_key_even_in_custom_tmp(guard, monkeypatch):
+    monkeypatch.setattr(helpers.ipc, "BH_TMP_DIR", "custom")
+    monkeypatch.setattr(helpers.ipc, "BH_TMP_DIR_SHARED", False)
+    helpers._own_tab("MINE")
+    monkeypatch.setattr(helpers, "NAME", "another-daemon")
+    assert helpers._owned_ids() == set()
+
+
+def test_detach_checks_parameter_session_and_forgets_it(owning):
+    helpers.cdp("Target.detachFromTarget", sessionId="SESSION-MINE")
+    assert "SESSION-MINE" not in helpers._owned_sessions()
+    with pytest.raises(helpers.TabGuardRefused):
+        helpers.cdp("Runtime.evaluate", session_id="SESSION-MINE", expression="1")
+
+
+@pytest.mark.parametrize("params", [
+    {}, {"sessionId": "FOREIGN"}, {"targetId": "MINE"},
+    {"sessionId": "FOREIGN", "targetId": "MINE"},
+])
+@pytest.mark.parametrize("method", ["Target.detachFromTarget", "Target.sendMessageToTarget"])
+def test_routing_params_cannot_borrow_current_or_explicit_session(owning, params, method):
+    with pytest.raises(helpers.TabGuardRefused):
+        helpers.cdp(method, session_id="SESSION-MINE", **params)
+
+
+def test_send_message_to_owned_session_works(owning):
+    helpers.cdp("Target.sendMessageToTarget", sessionId="SESSION-MINE",
+                message=json.dumps({"id": 1, "method": "Runtime.evaluate", "params": {"expression": "1"}}))
+
+
+def test_nested_message_cannot_route_to_foreign_target(owning):
+    with pytest.raises(helpers.TabGuardRefused):
+        helpers.cdp("Target.sendMessageToTarget", sessionId="SESSION-MINE",
+                    message=json.dumps({"id": 1, "method": "Target.attachToTarget", "params": {"targetId": "FOREIGN"}}))
+
+
+def test_owned_iframe_js_proves_ancestry_and_detaches(owning, monkeypatch):
+    calls = []
+    base = _fake_send(current={"targetId": "MINE"}, target_type="iframe")
+    def send(req, **kw):
+        calls.append(req)
+        if req.get("method") == "Page.getFrameTree":
+            assert req["session_id"] == "SESSION-MINE"
+            return {"result": {"frameTree": {"frame": {"id": "MINE"}, "childFrames": [
+                {"frame": {"id": "CHILD"}, "childFrames": [{"frame": {"id": "IFRAME"}}]}]}}}
+        if req.get("method") == "Target.attachToTarget":
+            return {"result": {"sessionId": "IFRAME-SESSION"}}
+        if req.get("method") == "Runtime.evaluate":
+            return {"result": {"result": {"value": 42}}}
+        return base(req, **kw)
+    monkeypatch.setattr(helpers, "_send", send)
+    assert helpers.js("42", target_id="IFRAME") == 42
+    assert calls[-1]["params"] == {"sessionId": "IFRAME-SESSION"}
+    assert "IFRAME-SESSION" not in helpers._owned_sessions()
+
+
+@pytest.mark.parametrize("target_type", ["iframe", "worker", "service_worker", "browser", None])
+def test_enumerating_non_page_target_does_not_grant_ownership(guard, monkeypatch, target_type):
+    calls = []
+    base = _fake_send(target_type=target_type)
+    def send(req, **kw):
+        calls.append(req)
+        return base(req, **kw)
+    monkeypatch.setattr(helpers, "_send", send)
+    helpers.cdp("Target.getTargets")
+    with pytest.raises(helpers.TabGuardRefused):
+        helpers.cdp("Target.attachToTarget", targetId="FOREIGN-CHILD")
+    assert not any(r.get("method") == "Target.attachToTarget" for r in calls)
+    assert helpers._owned_sessions() == set()
+
+
+def test_implicit_dispatch_is_pinned_to_validated_session(owning, monkeypatch):
+    calls = []
+    def send(req, **kw):
+        calls.append(req)
+        if req.get("meta") == "guard_context":
+            # Another run switches the daemon immediately after this snapshot.
+            return {"target_id": "MINE", "session_id": "SESSION-MINE"}
+        assert req["session_id"] == "SESSION-MINE"
+        return {"result": {}}
+    monkeypatch.setattr(helpers, "_send", send)
+    helpers.cdp("Page.navigate", url="https://example.com")
+    assert calls[-1]["session_id"] == "SESSION-MINE"
+
+
+@pytest.mark.parametrize("context", [
+    None, [], {}, {"target_id": []}, {"target_id": "MINE"},
+    {"target_id": "MINE", "session_id": []}, {"target_id": "MINE", "session_id": ""},
+    {"target_id": "MINE", "session_id": "FOREIGN"},
+    {"target_id": "FOREIGN", "session_id": "SESSION-MINE"},
+])
+def test_implicit_dispatch_fails_closed_on_unowned_or_incomplete_context(owning, monkeypatch, context):
+    calls = []
+    monkeypatch.setattr(helpers, "_send", lambda req, **kw: calls.append(req) or context)
+    with pytest.raises(helpers.TabGuardRefused):
+        helpers.cdp("Runtime.evaluate", expression="1")
+    assert all("method" not in req for req in calls)
+
+
+def test_guard_off_performs_no_ownership_io(guard, monkeypatch, capsys):
+    monkeypatch.delenv("BH_TAB_GUARD")
+    def unexpected():
+        pytest.fail("unguarded requests must not touch ownership files")
+    monkeypatch.setattr(helpers, "_owned_path", unexpected)
+    for _ in range(3):
+        helpers.cdp("Target.createTarget")
+        helpers.cdp("Target.attachToTarget", targetId="FOREIGN")
+        helpers.cdp("Target.detachFromTarget", sessionId="SESSION-MINE")
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+def test_guarded_ownership_is_private_on_creation_and_update(guard):
+    helpers._own_tab("MINE")
+    assert helpers._owned_path().stat().st_mode & 0o777 == 0o600
+    helpers._own_tab("SECOND")
+    assert helpers._owned_path().stat().st_mode & 0o777 == 0o600
+
+
+def test_enabling_guard_does_not_inherit_unguarded_tabs(guard, monkeypatch):
+    monkeypatch.delenv("BH_TAB_GUARD")
+    helpers.cdp("Target.createTarget")
+    monkeypatch.setenv("BH_TAB_GUARD", "1")
+    assert helpers._owned_ids() == set()
+
+
+@pytest.fixture
+def daemon_bridge(owning, monkeypatch):
+    """Exercise helpers against the actual daemon handler, without a browser."""
+    d = daemon.Daemon()
+    d.target_id, d.session = "MINE", "SESSION-MINE"
+    calls = []
+    class CDP:
+        async def send_raw(self, method, params=None, session_id=None):
+            calls.append((method, params, session_id))
+            if method == "Target.getTargetInfo":
+                return {"targetInfo": {"type": "page", "targetId": params["targetId"],
+                                       "url": "https://owned.example/", "title": "Owned"}}
+            if method == "Runtime.evaluate":
+                return {"result": {"value": '{"url":"https://owned.example/"}'}}
+            return {}
+    d.cdp = CDP()
+    def send(req, **kwargs):
+        result = asyncio.run(d.handle(req))
+        if "error" in result:
+            raise RuntimeError(result["error"])
+        return result
+    monkeypatch.setattr(helpers, "_send", send)
+    return d, calls
+
+
+@pytest.mark.parametrize("call", [
+    helpers.current_tab, helpers.page_info, helpers.wait_for_network_idle,
+    lambda: helpers._read_meta("connection_status"),
+])
+def test_metadata_helpers_refuse_foreign_current_tab(daemon_bridge, call):
+    d, calls = daemon_bridge
+    d.target_id, d.session = "FOREIGN", "FOREIGN-SESSION"
+    d._record_event("Page.javascriptDialogOpening", {"message": "private dialog"}, "FOREIGN-SESSION")
+    with pytest.raises(helpers.TabGuardRefused):
+        call()
+    assert calls == []
+
+
+def test_metadata_helpers_still_read_owned_page_and_dialog(daemon_bridge):
+    d, _ = daemon_bridge
+    assert helpers.current_tab()["targetId"] == "MINE"
+    assert helpers.page_info()["url"] == "https://owned.example/"
+    d._record_event("Page.javascriptDialogOpening", {"message": "owned"}, "SESSION-MINE")
+    assert helpers.page_info() == {"dialog": {"message": "owned"}}
+
+
+def test_foreign_dialog_does_not_leak_when_current_tab_is_owned(daemon_bridge):
+    d, _ = daemon_bridge
+    d._record_event("Page.javascriptDialogOpening", {"message": "private"}, "FOREIGN-SESSION")
+    assert helpers.page_info() == {"url": "https://owned.example/"}
+
+
+def test_foreign_dialog_close_cannot_clear_owned_dialog(daemon_bridge):
+    d, _ = daemon_bridge
+    d._record_event("Page.javascriptDialogOpening", {"message": "owned"}, "SESSION-MINE")
+    d._record_event("Page.javascriptDialogClosed", {}, "FOREIGN-SESSION")
+    assert helpers.page_info() == {"dialog": {"message": "owned"}}
+
+
+def test_event_drain_filters_owned_sessions_and_preserves_foreign_events(daemon_bridge):
+    d, _ = daemon_bridge
+    for sid in ("SESSION-MINE", "FOREIGN-SESSION", None):
+        d._record_event("Network.requestWillBeSent", {"secret": sid}, sid)
+    # Even with a foreign current page, reading this run's own events is safe.
+    d.target_id, d.session = "FOREIGN", "FOREIGN-SESSION"
+    assert [e["session_id"] for e in helpers.drain_events()] == ["SESSION-MINE"]
+    assert [e["session_id"] for e in d.events] == ["FOREIGN-SESSION", None]
+    assert helpers.drain_events() == []
+
+
+def test_older_daemon_cannot_silently_return_unguarded_metadata(owning, monkeypatch):
+    monkeypatch.setattr(helpers, "_send", lambda req: {"dialog": {"message": "private"}})
+    with pytest.raises(helpers.TabGuardRefused):
+        helpers.page_info()
+
+
+def test_metadata_snapshot_stays_owned_during_concurrent_switch(daemon_bridge):
+    d, _ = daemon_bridge
+    async def send_raw(method, params=None, session_id=None):
+        assert params == {"targetId": "MINE"}
+        d.target_id, d.session = "FOREIGN", "FOREIGN-SESSION"
+        await asyncio.sleep(0)
+        return {"targetInfo": {"targetId": "MINE", "type": "page", "url": "https://owned.example/"}}
+    d.cdp.send_raw = send_raw
+    response = helpers._read_meta("connection_status")
+    assert response["target_id"] == "MINE"
+    assert response["session_id"] == "SESSION-MINE"
+
+
+def test_pinned_request_never_uses_new_current_session_or_recovers_there(daemon_bridge, monkeypatch):
+    d, calls = daemon_bridge
+    original_send = helpers._send
+    def switch_after_snapshot(req, **kwargs):
+        response = original_send(req, **kwargs)
+        if req.get("meta") == "guard_context":
+            d.target_id, d.session = "FOREIGN", "FOREIGN-SESSION"
+        return response
+    monkeypatch.setattr(helpers, "_send", switch_after_snapshot)
+    helpers.cdp("Page.navigate", url="https://owned.example/")
+    assert calls[-1][2] == "SESSION-MINE"
+    # A dropped pinned session must error, never replay against the new tab.
+    d.target_id, d.session = "MINE", "SESSION-MINE"
+    async def stale(method, params=None, session_id=None):
+        calls.append((method, params, session_id))
+        raise RuntimeError("Session with given id not found")
+    d.cdp.send_raw = stale
+    count = len(calls)
+    with pytest.raises(RuntimeError, match="Session with given id not found"):
+        helpers.cdp("Page.navigate", url="https://owned.example/")
+    assert len(calls) == count + 1
+    assert calls[-1][2] == "SESSION-MINE"
+
+
+def test_guarded_switch_does_not_disable_foreign_session(daemon_bridge, monkeypatch):
+    d, calls = daemon_bridge
+    monkeypatch.setenv("BH_TAB_MARKER", "0")
+    d.target_id, d.session = "FOREIGN", "FOREIGN-SESSION"
+    helpers._read_meta("set_session", target_id="MINE", session_id="SESSION-MINE")
+    assert d.target_id == "MINE"
+    assert all(sid == "SESSION-MINE" for _, _, sid in calls)
+
+
+def test_guarded_switch_rejects_foreign_session(daemon_bridge):
+    d, calls = daemon_bridge
+    with pytest.raises(helpers.TabGuardRefused):
+        helpers._read_meta("set_session", target_id="MINE", session_id="FOREIGN-SESSION")
+    assert d.session == "SESSION-MINE"
+    assert calls == []
+
+
+def test_old_daemon_refused_before_session_switch(owning, monkeypatch):
+    requests = []
+    def old_daemon(req):
+        requests.append(req)
+        return {"session_id": "SESSION-MINE"}
+    monkeypatch.setattr(helpers, "_send", old_daemon)
+    with pytest.raises(helpers.TabGuardRefused, match="reloaded"):
+        helpers._read_meta("set_session", target_id="MINE", session_id="SESSION-MINE")
+    assert [req["meta"] for req in requests] == ["guard_context"]
+
+
+@pytest.mark.parametrize("meta", ["current_tab", "pending_dialog", "session", "drain_events"])
+def test_metadata_connection_failure_is_a_guard_refusal(owning, monkeypatch, meta):
+    def disconnected(req):
+        raise RuntimeError("cdp_disconnected")
+    monkeypatch.setattr(helpers, "_send", disconnected)
+    with pytest.raises(helpers.TabGuardRefused, match="failing closed"):
+        helpers._read_meta(meta)
+
+
+@pytest.mark.parametrize("failure", ["disconnected", "missing-tree", "foreign-frame"])
+def test_iframe_proof_failure_never_dispatches_attach(owning, monkeypatch, failure):
+    calls = []
+    base = _fake_send(current={"targetId": "MINE"}, target_type="iframe")
+    def send(req, **kwargs):
+        calls.append(req)
+        if req.get("method") == "Page.getFrameTree":
+            if failure == "disconnected":
+                raise RuntimeError("cdp_disconnected")
+            if failure == "missing-tree":
+                return {"result": {}}
+            return {"result": {"frameTree": {"frame": {"id": "MINE"},
+                "childFrames": [{"frame": {"id": "OTHER-IFRAME"}}]}}}
+        return base(req, **kwargs)
+    monkeypatch.setattr(helpers, "_send", send)
+    with pytest.raises(helpers.TabGuardRefused):
+        helpers.cdp("Target.attachToTarget", targetId="FOREIGN-IFRAME")
+    assert not any(r.get("method") == "Target.attachToTarget" for r in calls)
+
+
+@pytest.mark.parametrize("message", [
+    "{bad json", "null", "[]", "{}", '{"method": 3}',
+    '{"method":"Runtime.evaluate","sessionId":"FOREIGN"}',
+    '{"method":"Target.sendMessageToTarget","params":{"sessionId":"FOREIGN"}}',
+])
+def test_message_routing_envelope_cannot_escape_owned_session(owning, monkeypatch, message):
+    calls = []
+    monkeypatch.setattr(helpers, "_send", lambda req, **kwargs: calls.append(req))
+    with pytest.raises(helpers.TabGuardRefused):
+        helpers.cdp("Target.sendMessageToTarget", sessionId="SESSION-MINE", message=message)
+    assert calls == []
+
+
+def test_unknown_target_routing_method_fails_closed(owning):
+    with pytest.raises(helpers.TabGuardRefused):
+        helpers.cdp("Target.autoAttachRelated", targetId="FOREIGN")
+
+
+def test_failed_atomic_write_preserves_record_and_removes_temporary(owning, monkeypatch, capsys):
+    path = helpers._owned_path()
+    before = path.read_bytes()
+    def fail_replace(src, dst):
+        raise OSError("replace failed")
+    monkeypatch.setattr(helpers.os, "replace", fail_replace)
+    helpers._own_tab("SECOND")
+    assert path.read_bytes() == before
+    assert list(path.parent.iterdir()) == [path]
+    assert "WARNING" in capsys.readouterr().err
+
+
+def test_run_reset_removes_its_record(owning):
+    path = helpers._owned_path()
+    helpers.tab_guard_reset()
+    assert not path.exists()
+    assert helpers._owned_ids() == set()
+    assert helpers._owned_sessions() == set()
+
+
+@pytest.mark.parametrize("tool", ["browser_page_info", "browser_current_tab"])
+def test_mcp_metadata_tools_cannot_return_foreign_dialog_or_page(daemon_bridge, monkeypatch, tool):
+    pytest.importorskip("mcp")
+    from mcp_types import CallToolRequestParams
+    import mcp_server
+
+    d, calls = daemon_bridge
+    d.target_id, d.session = "FOREIGN", "FOREIGN-SESSION"
+    d._record_event("Page.javascriptDialogOpening", {"message": "private dialog"}, "FOREIGN-SESSION")
+    monkeypatch.setattr(mcp_server, "ensure_daemon", lambda: None)
+    result = asyncio.run(mcp_server.SERVER._handle_call_tool(
+        None, CallToolRequestParams(name=tool, arguments={})))
+    assert result.is_error is True
+    assert "[tab-guard] REFUSED" in result.content[0].text
+    assert "private dialog" not in result.content[0].text
+    assert calls == []

@@ -58,9 +58,18 @@ PY
   It fails closed — if the attached tab cannot be read, the call is refused.
   Leave it unset for interactive work, where driving a tab the human already
   opened is the point.
-  Also set `BH_TAB_GUARD_RUN` to something unique per run (a job id): ownership
-  is scoped to it, so a run starts owning nothing and two concurrent runs cannot
-  consume each other's list. Set `BH_TAB_GUARD_LOG` to a file path when the
+  `BH_TAB_GUARD_RUN` is required and must be non-empty and unique per run (a job
+  id). Ownership is scoped to its full value and the daemon, so distinct runs
+  cannot consume each other's list. Ownership is recorded only while the guard
+  is enabled, in private files. Enabling it later does not claim earlier tabs.
+  Call `tab_guard_reset()` after the run's last invocation to remove its record.
+  Reload an older daemon before guarded use. Requests pin the checked session;
+  if it expires, use `switch_tab()` on an owned tab to attach again.
+  Metadata reads require ownership; events are filtered to owned sessions.
+  Iframe attachment requires ancestry in the current owned page's frame tree.
+  Workers or other targets without that proof are refused. The guard protects
+  helper calls, not arbitrary Python or direct IPC access.
+  Set `BH_TAB_GUARD_LOG` to a file path when the
   supervisor cannot see this process's stderr and still needs to count refusals.
 - A timeout or page that pauses while hidden is not permission to foreground
   Chrome. Keep using background CDP operations. For a focus-gated page,

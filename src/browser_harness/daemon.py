@@ -436,6 +436,7 @@ class Daemon:
         self._shutting_down = False
         self._session_replacements = {}
         self.events = deque(maxlen=BUF)
+        self.dialog_session = None
         self.dialog = None
         self.stop = None  # asyncio.Event, set inside start()
 
@@ -627,8 +628,11 @@ class Daemon:
         self.events.append({"method": method, "params": params, "session_id": session_id})
         if method == "Page.javascriptDialogOpening":
             self.dialog = params
+            self.dialog_session = session_id
         elif method == "Page.javascriptDialogClosed":
-            self.dialog = None
+            if session_id == self.dialog_session:
+                self.dialog = None
+                self.dialog_session = None
         elif method in ("Page.loadEventFired", "Page.domContentEventFired"):
             self._schedule_tab_marker(self.session)
 
@@ -662,6 +666,35 @@ class Daemon:
             return await orig(method, params, session_id)
         self.cdp._event_registry.handle_event = tap
 
+    async def _guarded_read(self, req):
+        """Validate and snapshot before yielding; never expose other sessions."""
+        meta, owned = req["meta"], req["tab_guard"]
+        tabs, sessions = set(owned.get("tabs", [])), set(owned.get("sessions", []))
+        target_id, sid = self.target_id, self.session
+        if meta == "drain_events":
+            out, remaining = [], deque(maxlen=BUF)
+            for event in self.events:
+                if event.get("session_id") and event["session_id"] in sessions:
+                    out.append(event)
+                else:
+                    remaining.append(event)
+            self.events = remaining
+            return {"events": out, "tab_guard": "ok"}
+        if not target_id or target_id not in tabs or not sid or sid not in sessions:
+            return {"tab_guard": "refused", "target_id": target_id}
+        if meta == "session":
+            return {"session_id": sid, "tab_guard": "ok"}
+        if meta == "pending_dialog":
+            return {"dialog": self.dialog if self.dialog_session == sid else None, "tab_guard": "ok"}
+        if meta in {"current_tab", "connection_status"}:
+            info = (await self.cdp.send_raw("Target.getTargetInfo", {"targetId": target_id}))["targetInfo"]
+            page = {"targetId": target_id, "url": info.get("url", ""), "title": info.get("title", "")}
+            if meta == "current_tab":
+                return {**page, "tab_guard": "ok"}
+            return {"target_id": target_id, "session_id": sid,
+                    "page": page if is_real_page(info) else None, "tab_guard": "ok"}
+        return {"tab_guard": "refused", "target_id": target_id}
+
     async def handle(self, req):
         # Token guard for Windows TCP loopback: any local process can otherwise
         # connect and issue CDP commands. expected_token() is None on POSIX so
@@ -670,6 +703,12 @@ class Daemon:
         if expected is not None and req.get("token") != expected:
             return {"error": "unauthorized"}
         meta = req.get("meta")
+        if meta == "guard_context":
+            # No await between reading these fields: clients pin subsequent
+            # CDP calls to this session instead of using the mutable default.
+            return {"target_id": self.target_id, "session_id": self.session, "tab_guard": "ok"}
+        if "tab_guard" in req and meta != "set_session":
+            return await self._guarded_read(req)
         # Liveness probe — lets clients confirm the listener is actually this
         # daemon and not an unrelated process that reused our port post-crash.
         # `pid` lets restart_daemon() verify the live daemon's identity before
@@ -708,6 +747,12 @@ class Daemon:
             return {"target_id": self.target_id, "session_id": self.session, "page": page}
         if meta == "set_session":
             async with self._session_state_lock:
+                owned = req.get("tab_guard")
+                if owned is not None and (
+                    not req.get("session_id") or req["session_id"] not in owned.get("sessions", [])
+                    or not req.get("target_id") or req["target_id"] not in owned.get("tabs", [])
+                ):
+                    return {"tab_guard": "refused", "target_id": req.get("target_id")}
                 old_session = self.session
                 self.session = req.get("session_id")
                 self.target_id = req.get("target_id") or self.target_id
@@ -721,7 +766,7 @@ class Daemon:
             # even on a remote daemon — sequentially these would have stacked
             # to ~22s worst case.
             tasks = []
-            if old_session and old_session != new_session:
+            if old_session and old_session != new_session and (owned is None or old_session in owned.get("sessions", [])):
                 async def disable_old():
                     try:
                         await asyncio.wait_for(
@@ -735,7 +780,7 @@ class Daemon:
             # 🐴 tab-marker title prefix is purely cosmetic — fire-and-forget so
             # it doesn't add to the synchronous IPC budget.
             self._schedule_tab_marker(new_session)
-            return {"session_id": new_session}
+            return {"session_id": new_session, **({"tab_guard": "ok"} if owned is not None else {})}
         if meta == "pending_dialog": return {"dialog": self.dialog}
         if meta == "shutdown":
             # Flip the barrier synchronously with recovery registration, then
