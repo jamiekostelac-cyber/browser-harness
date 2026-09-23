@@ -49,9 +49,14 @@ def test_ensure_private_dir_rehardens_existing_windows_tree(monkeypatch, tmp_pat
     paths.ensure_private_dir(target)
 
     argv = [call[0] for call in calls]
-    assert argv[0][:3] == ["icacls", str(target), "/save"]
-    assert argv[1] == ["icacls", str(target), "/reset", "/T"]
-    assert argv[-1] == ["icacls", str(target), "/inheritance:r", "/T"]
+    assert len(argv[0]) == 5
+    backup = argv[0][3]
+    assert argv == [
+        ["icacls", str(target), "/save", backup, "/T"],
+        ["icacls", str(target), "/reset", "/T"],
+        ["icacls", str(target), "/grant:r", "WORKSTATION\\alice:(OI)(CI)F", "/T"],
+        ["icacls", str(target), "/inheritance:r", "/T"],
+    ]
 
 
 def test_harden_private_path_replaces_file_acl_on_windows(monkeypatch, tmp_path):
@@ -63,13 +68,14 @@ def test_harden_private_path_replaces_file_acl_on_windows(monkeypatch, tmp_path)
     paths.harden_private_path(target)
 
     argv = [call[0] for call in calls]
-    assert argv[0][:3] == ["icacls", str(target), "/save"]
     assert len(argv[0]) == 4
+    backup = argv[0][3]
     assert argv[1:] == [
         ["icacls", str(target), "/reset"],
         ["icacls", str(target), "/grant:r", "WORKSTATION\\alice:F"],
         ["icacls", str(target), "/inheritance:r"],
     ]
+    assert argv[0] == ["icacls", str(target), "/save", backup]
 
 
 def test_harden_private_path_restores_acl_after_partial_failure(monkeypatch, tmp_path):
@@ -90,10 +96,12 @@ def test_harden_private_path_restores_acl_after_partial_failure(monkeypatch, tmp
         paths.harden_private_path(target, directory=True)
 
     backup = calls[0][3]
-    assert calls[0][:3] == ["icacls", str(target), "/save"]
-    assert calls[1] == ["icacls", str(target), "/reset", "/T"]
-    assert calls[2] == ["icacls", str(target), "/grant:r", "WORKSTATION\\alice:(OI)(CI)F", "/T"]
-    assert calls[3] == ["icacls", str(target.parent), "/restore", backup]
+    assert calls == [
+        ["icacls", str(target), "/save", backup, "/T"],
+        ["icacls", str(target), "/reset", "/T"],
+        ["icacls", str(target), "/grant:r", "WORKSTATION\\alice:(OI)(CI)F", "/T"],
+        ["icacls", str(target.parent), "/restore", backup],
+    ]
     assert not any("/inheritance:r" in call for call in calls)
 
 
