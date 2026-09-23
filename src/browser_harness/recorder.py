@@ -227,10 +227,17 @@ def _auto_is_stale(d):
     try:
         if not _is_auto_recording(d):
             return False  # explicit start_recording() never auto-rolls
-        frames = list(Path(d).glob("*.jpg"))
-        if not frames:
-            return False
-        newest = max(f.stat().st_mtime for f in frames)
+
+        directory = Path(d)
+        events = directory / "events.jsonl"
+        if events.exists():
+            newest = events.stat().st_mtime
+        else:
+            frames = list(directory.glob("*.jpg"))
+            if not frames:
+                return False
+            newest = max(frame.stat().st_mtime for frame in frames)
+
         return (time.time() - newest) > _auto_idle_gap()
     except Exception:
         return False
