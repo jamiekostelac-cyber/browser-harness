@@ -70,6 +70,11 @@ PY
   Call `tab_guard_reset()` after the run's last invocation to remove its record.
   Reload an older daemon before guarded use. Requests pin the checked session;
   if it expires, use `switch_tab()` on an owned tab to attach again.
+  Guarded `Target.createTarget` never uses the shared default browser context:
+  the first create call makes and records a run-owned context, and later calls
+  reuse it. A caller-supplied `browserContextId` must already belong to this
+  run. `Target.createBrowserContext` remains unavailable as a public guarded
+  operation.
   Metadata reads require ownership; events are filtered to owned sessions.
   Iframe attachment requires ancestry in the current owned page's frame tree.
   Workers or other targets without that proof are refused. The guard protects

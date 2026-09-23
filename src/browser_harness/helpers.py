@@ -117,7 +117,7 @@ _GUARD_TAB_SCOPED_METHODS = {
     "Network.setBypassServiceWorker", "Network.setCacheDisabled",
     "Network.setExtraHTTPHeaders", "Network.setUserAgentOverride",
     "Page.bringToFront", "Page.reload",
-    "Page.captureScreenshot", "Page.createIsolatedWorld", "Page.getFrameTree",
+    "Page.captureScreenshot", "Page.getFrameTree",
     "Page.handleJavaScriptDialog", "Page.navigate", "Page.setDocumentContent",
     "Runtime.evaluate",
 }
@@ -231,13 +231,13 @@ def _read_owned_state(owned_path):
     try:
         state = json.loads(owned_path.read_text(encoding="utf-8"))
     except Exception:
-        return {"tabs": [], "sessions": []}
+        return {"tabs": [], "sessions": [], "contexts": []}
     if not isinstance(state, dict):
-        return {"tabs": [], "sessions": []}
+        return {"tabs": [], "sessions": [], "contexts": []}
     return {
         kind: [v for v in state[kind] if isinstance(v, str) and v]
         if isinstance(state.get(kind), list) else []
-        for kind in ("tabs", "sessions")
+        for kind in ("tabs", "sessions", "contexts")
     }
 
 
@@ -282,6 +282,43 @@ def _owned_sessions():
     """Session ids this run attached, so an explicitly-addressed session can be
     told apart from someone else's."""
     return set(_owned_state()["sessions"])
+
+
+def _owned_contexts():
+    """Browser contexts created by this guarded run."""
+    return set(_owned_state()["contexts"])
+
+
+def _create_guard_context():
+    """Create and record the private browser context used by this run."""
+    try:
+        response = _send({"method": "Target.createBrowserContext", "params": {}, "session_id": None})
+        context_id = response.get("result", {}).get("browserContextId")
+    except Exception:
+        context_id = None
+    if not isinstance(context_id, str) or not context_id:
+        _refuse("Target.createTarget", None, "", "could not create a run-owned browser context")
+    _remember("contexts", context_id)
+    if context_id not in _owned_contexts():
+        _refuse("Target.createTarget", None, "", "run-owned browser context could not be recorded")
+    return context_id
+
+
+def _guard_target_context(params):
+    """Pin guarded target creation to a context owned by this run."""
+    requested = params.get("browserContextId")
+    contexts = _owned_contexts()
+    if "browserContextId" in params:
+        if requested not in contexts:
+            _refuse("Target.createTarget", None, params.get("url", ""),
+                    "browser context is not owned by this run")
+        return requested
+    if len(contexts) > 1:
+        _refuse("Target.createTarget", None, params.get("url", ""),
+                "multiple run-owned browser contexts require an explicit browserContextId")
+    context_id = next(iter(contexts), None) or _create_guard_context()
+    params["browserContextId"] = context_id
+    return context_id
 
 
 def _remember(kind, value, remove=False):
@@ -398,6 +435,8 @@ def _tab_guard_check(method, params, session_id=None):
     scope_reason = _guard_scope_reason(method)
     if scope_reason:
         _refuse(method, params.get("targetId"), params.get("url", ""), scope_reason)
+    if method == "Target.createTarget":
+        _guard_target_context(params)
     if method in _TARGET_SAFE_METHODS:
         return
 
@@ -495,6 +534,13 @@ def _read_meta(meta, **params):
         raise
     if guarded and response.get("tab_guard") != "ok":
         _refuse(meta, response.get("target_id"), "", "metadata ownership could not be verified")
+    if guarded and meta in {"current_tab", "pending_dialog", "connection_status", "session"}:
+        page = response.get("page") if isinstance(response.get("page"), dict) else response
+        if not isinstance(page, dict) or "url" not in page:
+            _refuse(meta, response.get("target_id"), "", "metadata URL could not be verified")
+        url_reason = _url_scope_reason(page.get("url"), required=True)
+        if url_reason:
+            _refuse(meta, response.get("target_id"), page.get("url", ""), url_reason)
     return response
 
 
@@ -813,8 +859,13 @@ def _mark_tab():
     """Prepend horse emoji to tab title so the user can see which tab the agent controls."""
     if os.environ.get("BH_TAB_MARKER", "").strip().lower() in {"0", "false", "no", "off"}:
         return
-    try: cdp("Runtime.evaluate", expression="if(!document.title.startsWith('\U0001F434'))document.title='\U0001F434 '+document.title")
-    except Exception: pass
+    try:
+        cdp("Runtime.evaluate", expression="if(!document.title.startsWith('\U0001F434'))document.title='\U0001F434 '+document.title")
+    except TabGuardRefused:
+        if _tab_guard_on():
+            raise
+    except Exception:
+        pass
 
 def _target_id(target):
     """Accept a raw target id or a tab dict returned by the helpers."""
@@ -839,10 +890,19 @@ def switch_tab(target, activate=False):
     # Accept either a raw targetId string or the dict returned by current_tab() / list_tabs(),
     # so `switch_tab(current_tab())` works without a manual ["targetId"] dance.
     target_id = _target_id(target)
+    if _tab_guard_on() and isinstance(target, dict):
+        url_reason = _url_scope_reason(target.get("url"), required=True)
+        if url_reason:
+            _refuse("switch_tab", target_id, target.get("url", ""), url_reason)
     # Unmark old tab. Horse emoji is a surrogate pair in JS UTF-16 strings (2 code units),
     # plus the trailing space = 3 code units, so slice(3) cleanly removes the prefix.
-    try: cdp("Runtime.evaluate", expression="if(document.title.startsWith('\U0001F434 '))document.title=document.title.slice(3)")
-    except Exception: pass
+    try:
+        cdp("Runtime.evaluate", expression="if(document.title.startsWith('\U0001F434 '))document.title=document.title.slice(3)")
+    except TabGuardRefused:
+        if _tab_guard_on():
+            raise
+    except Exception:
+        pass
     if activate:
         activate_tab(target_id)
     sid = cdp("Target.attachToTarget", targetId=target_id, flatten=True)["sessionId"]

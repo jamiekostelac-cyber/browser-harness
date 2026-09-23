@@ -24,6 +24,8 @@ def _fake_send(current=FOREIGN, created="MINE", session="SESSION-MINE", target_t
         if req.get("meta") == "current_tab":
             return {**current, "tab_guard": "ok"}
         method = req.get("method")
+        if method == "Target.createBrowserContext":
+            return {"result": {"browserContextId": "CONTEXT-MINE"}}
         if method == "Target.createTarget":
             return {"result": {"targetId": created}}
         if method == "Target.attachToTarget":
@@ -391,6 +393,49 @@ def test_create_and_attach_record_new_ownership(guard):
     assert helpers._owned_sessions() == {"SESSION-MINE"}
 
 
+def test_create_target_is_pinned_to_a_run_owned_browser_context(guard, monkeypatch):
+    requests = []
+    original = helpers._send
+
+    def send(req, **kwargs):
+        requests.append(req)
+        return original(req, **kwargs)
+
+    monkeypatch.setattr(helpers, "_send", send)
+    result = helpers.cdp("Target.createTarget", url="about:blank")
+    assert result["targetId"] == "MINE"
+    assert helpers._owned_contexts() == {"CONTEXT-MINE"}
+    create = next(req for req in requests if req.get("method") == "Target.createTarget")
+    assert create["params"]["browserContextId"] == "CONTEXT-MINE"
+
+
+@pytest.mark.parametrize("context_id", ["FOREIGN-CONTEXT", None])
+def test_create_target_rejects_a_foreign_or_default_context_before_dispatch(
+    owning, monkeypatch, context_id
+):
+    calls = []
+    monkeypatch.setattr(helpers, "_send", lambda req, **kwargs: calls.append(req) or {"result": {}})
+    with pytest.raises(helpers.TabGuardRefused):
+        helpers.cdp("Target.createTarget", url="about:blank", browserContextId=context_id)
+    assert calls == []
+
+
+def test_nested_create_target_cannot_bypass_context_ownership(owning, monkeypatch):
+    calls = []
+    monkeypatch.setattr(helpers, "_send", lambda req, **kwargs: calls.append(req) or {"result": {}})
+    with pytest.raises(helpers.TabGuardRefused):
+        helpers.cdp(
+            "Target.sendMessageToTarget",
+            sessionId="SESSION-MINE",
+            message=json.dumps({
+                "id": 1,
+                "method": "Target.createTarget",
+                "params": {"url": "about:blank", "browserContextId": "FOREIGN-CONTEXT"},
+            }),
+        )
+    assert calls == []
+
+
 def test_removal_is_noop_only_when_value_is_absent(guard):
     helpers._own_tab("MINE")
     helpers._remember("tabs", "MINE", remove=True)
@@ -465,6 +510,30 @@ def test_nested_message_applies_browser_scope_policy_before_dispatch(owning, mon
             "Target.sendMessageToTarget",
             sessionId="SESSION-MINE",
             message=json.dumps({"id": 1, "method": method, "params": {}}),
+        )
+    assert calls == []
+
+
+def test_create_isolated_world_is_not_guarded_page_scope(owning, monkeypatch):
+    calls = []
+    monkeypatch.setattr(helpers, "_send", lambda req, **kwargs: calls.append(req) or {"result": {}})
+    with pytest.raises(helpers.TabGuardRefused):
+        helpers.cdp("Page.createIsolatedWorld", frameId="frame", grantUniveralAccess=True)
+    assert calls == []
+
+
+def test_nested_create_isolated_world_is_not_guarded_page_scope(owning, monkeypatch):
+    calls = []
+    monkeypatch.setattr(helpers, "_send", lambda req, **kwargs: calls.append(req) or {"result": {}})
+    with pytest.raises(helpers.TabGuardRefused):
+        helpers.cdp(
+            "Target.sendMessageToTarget",
+            sessionId="SESSION-MINE",
+            message=json.dumps({
+                "id": 1,
+                "method": "Page.createIsolatedWorld",
+                "params": {"frameId": "frame", "grantUniveralAccess": True},
+            }),
         )
     assert calls == []
 
@@ -691,6 +760,25 @@ def test_metadata_helpers_still_read_owned_page_and_dialog(daemon_bridge):
     assert helpers.page_info() == {"dialog": {"message": "owned"}}
 
 
+def test_guarded_metadata_and_switch_reject_privileged_current_url(daemon_bridge, monkeypatch):
+    d, calls = daemon_bridge
+    original = d.cdp.send_raw
+
+    async def privileged(method, params=None, session_id=None):
+        if method == "Target.getTargetInfo":
+            calls.append((method, params, session_id))
+            return {"targetInfo": {"type": "page", "targetId": "MINE", "url": "chrome://settings"}}
+        return await original(method, params, session_id)
+
+    d.cdp.send_raw = privileged
+    with pytest.raises(helpers.TabGuardRefused):
+        helpers.current_tab()
+    calls.clear()
+    with pytest.raises(helpers.TabGuardRefused):
+        helpers._read_meta("set_session", target_id="MINE", session_id="SESSION-MINE")
+    assert not any(method.endswith(".enable") for method, _params, _sid in calls)
+
+
 def test_foreign_dialog_does_not_leak_when_current_tab_is_owned(daemon_bridge):
     d, _ = daemon_bridge
     d._record_event("Page.javascriptDialogOpening", {"message": "private"}, "FOREIGN-SESSION")
@@ -718,15 +806,34 @@ def test_event_drain_filters_owned_sessions_and_preserves_foreign_events(daemon_
 def test_legacy_target_reply_uses_params_session_id_for_guarded_event_filter(daemon_bridge):
     d, _ = daemon_bridge
     owned = {"method": "Target.receivedMessageFromTarget",
-             "params": {"sessionId": "SESSION-MINE", "message": "owned"},
+             "params": {"sessionId": "SESSION-MINE", "message": json.dumps({"id": 1, "result": {}})},
              "session_id": None}
     foreign = {"method": "Target.receivedMessageFromTarget",
-               "params": {"sessionId": "FOREIGN-SESSION", "message": "foreign"},
+               "params": {"sessionId": "FOREIGN-SESSION", "message": json.dumps({"id": 2, "result": {}})},
                "session_id": None}
     d._record_event(owned["method"], owned["params"], owned["session_id"])
     d._record_event(foreign["method"], foreign["params"], foreign["session_id"])
     assert helpers.drain_events() == [owned]
     assert list(d.events) == [foreign]
+
+
+def test_legacy_target_reply_ignores_outer_owned_carrier_and_malformed_nested_messages(daemon_bridge):
+    d, _ = daemon_bridge
+    events = [
+        {"method": "Target.receivedMessageFromTarget",
+         "params": {"sessionId": "FOREIGN-SESSION", "message": json.dumps({"id": 3})},
+         "session_id": "SESSION-MINE"},
+        {"method": "Target.receivedMessageFromTarget",
+         "params": {"sessionId": "SESSION-MINE", "message": "not-json"},
+         "session_id": "SESSION-MINE"},
+        {"method": "Target.receivedMessageFromTarget",
+         "params": {"message": json.dumps({"id": 4})},
+         "session_id": "SESSION-MINE"},
+    ]
+    for event in events:
+        d._record_event(event["method"], event["params"], event["session_id"])
+    assert helpers.drain_events() == []
+    assert list(d.events) == events
 
 
 def test_context_wide_event_subscription_is_refused_and_foreign_events_stay_hidden(daemon_bridge):

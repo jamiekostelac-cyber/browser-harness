@@ -145,6 +145,69 @@ def test_tab_marker_disabled_on_page_load_events(monkeypatch, value):
     assert not [call for call in d.cdp.calls if call[0] == "Runtime.evaluate"]
 
 
+def test_guarded_event_marker_uses_origin_session_and_owned_target(monkeypatch):
+    monkeypatch.setenv("BH_TAB_GUARD", "1")
+    monkeypatch.delenv("BH_TAB_MARKER", raising=False)
+
+    class _MarkerCDP(_FakeCDP):
+        async def send_raw(self, method, params=None, session_id=None):
+            self.calls.append((method, params, session_id))
+            if method == "Target.getTargetInfo":
+                return {"targetInfo": {"type": "page", "url": "https://owned.example/"}}
+            return {}
+
+    d = daemon.Daemon()
+    d.cdp = _MarkerCDP()
+    d._guarded_sessions = {"event-session"}
+    d._session_targets = {"event-session": "event-target"}
+    d.session = "current-session"
+    d.target_id = "current-target"
+
+    async def run():
+        d._record_event("Page.loadEventFired", {}, "event-session")
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+    assert [call for call in d.cdp.calls if call[0] == "Runtime.evaluate"] == [
+        ("Runtime.evaluate", {"expression": daemon.TAB_MARKER_JS}, "event-session")
+    ]
+    assert not any(call[2] == "current-session" for call in d.cdp.calls)
+
+
+@pytest.mark.parametrize("event_session,target_url", [
+    ("foreign-session", "https://owned.example/"),
+    ("event-session", "chrome://settings"),
+])
+def test_guarded_event_marker_fails_closed_for_foreign_or_privileged_source(
+    monkeypatch, event_session, target_url
+):
+    monkeypatch.setenv("BH_TAB_GUARD", "1")
+    monkeypatch.delenv("BH_TAB_MARKER", raising=False)
+
+    class _MarkerCDP(_FakeCDP):
+        async def send_raw(self, method, params=None, session_id=None):
+            self.calls.append((method, params, session_id))
+            if method == "Target.getTargetInfo":
+                return {"targetInfo": {"type": "page", "url": target_url}}
+            return {}
+
+    d = daemon.Daemon()
+    d.cdp = _MarkerCDP()
+    d._guarded_sessions = {"event-session"}
+    d._session_targets = {"event-session": "event-target"}
+    d.session = "current-session"
+    d.target_id = "current-target"
+
+    async def run():
+        d._record_event("Page.domContentEventFired", {}, event_session)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+    assert not [call for call in d.cdp.calls if call[0] == "Runtime.evaluate"]
+
+
 def test_set_session_enables_all_four_default_domains_on_new_session():
     """Regression: switch_tab() / new_tab() in helpers.py route through the
     `set_session` IPC, which previously only enabled Page on the new

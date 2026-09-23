@@ -376,6 +376,17 @@ def is_real_page(t):
     return t["type"] == "page" and not t.get("url", "").startswith(INTERNAL)
 
 
+def _guard_url_allowed(url):
+    """Whether a guarded read or marker may touch this page URL."""
+    if not isinstance(url, str) or not url:
+        return False
+    lowered = url.lower()
+    if lowered == "about:blank" or lowered.startswith("about:blank#"):
+        return True
+    parsed = urlparse(url)
+    return parsed.scheme.lower() in {"http", "https"} and bool(parsed.netloc)
+
+
 def is_reusable_blank_page(t):
     """A plain about:blank tab that is safe to attach to and navigate"""
     url = t.get("url", "")
@@ -435,6 +446,8 @@ class Daemon:
         self._recoveries_idle.set()
         self._shutting_down = False
         self._session_replacements = {}
+        self._session_targets = {}
+        self._guarded_sessions = set()
         self.events = deque(maxlen=BUF)
         self.dialog_session = None
         self.dialog = None
@@ -477,6 +490,7 @@ class Daemon:
             ))["sessionId"]
             self._record_session_replacement(replaces_session, self.session)
             self.target_id = tid
+            self._session_targets[self.session] = tid
             log(f"attached {tid} ({page.get('url','')[:80]}) session={self.session}")
             if enable_domains:
                 await self._enable_default_domains(self.session)
@@ -510,6 +524,7 @@ class Daemon:
         ))["sessionId"]
         self._record_session_replacement(replaces_session, self.session)
         self.target_id = pages[0]["targetId"]
+        self._session_targets[self.session] = self.target_id
         log(f"attached {pages[0]['targetId']} ({pages[0].get('url','')[:80]}) session={self.session}")
         if take_over:
             try:
@@ -615,14 +630,27 @@ class Daemon:
         """Mark the controlled tab without extending the synchronous IPC path."""
         if not tab_marker_enabled():
             return None
-        return asyncio.create_task(_silent(asyncio.wait_for(
-            self.cdp.send_raw(
+        target_id = self._session_targets.get(session_id)
+
+        async def mark():
+            if os.environ.get("BH_TAB_GUARD") == "1":
+                if session_id not in self._guarded_sessions or not target_id:
+                    return
+                try:
+                    info = (await self.cdp.send_raw(
+                        "Target.getTargetInfo", {"targetId": target_id}
+                    )).get("targetInfo", {})
+                except Exception:
+                    return
+                if not _guard_url_allowed(info.get("url")):
+                    return
+            await self.cdp.send_raw(
                 "Runtime.evaluate",
                 {"expression": TAB_MARKER_JS},
                 session_id=session_id,
-            ),
-            timeout=2,
-        )))
+            )
+
+        return asyncio.create_task(_silent(asyncio.wait_for(mark(), timeout=2)))
 
     def _record_event(self, method, params, session_id=None):
         self.events.append({"method": method, "params": params, "session_id": session_id})
@@ -634,7 +662,7 @@ class Daemon:
                 self.dialog = None
                 self.dialog_session = None
         elif method in ("Page.loadEventFired", "Page.domContentEventFired"):
-            self._schedule_tab_marker(self.session)
+            self._schedule_tab_marker(session_id)
 
     async def start(self):
         self.stop = asyncio.Event()
@@ -670,15 +698,27 @@ class Daemon:
         """Validate and snapshot before yielding; never expose other sessions."""
         meta, owned = req["meta"], req["tab_guard"]
         tabs, sessions = set(owned.get("tabs", [])), set(owned.get("sessions", []))
+        self._guarded_sessions = sessions
         target_id, sid = self.target_id, self.session
         if meta == "drain_events":
             out, remaining = [], deque(maxlen=BUF)
             for event in self.events:
-                event_session = event.get("session_id")
-                if (not event_session and event.get("method") == "Target.receivedMessageFromTarget"
-                        and isinstance(event.get("params"), dict)):
-                    event_session = event["params"].get("sessionId")
-                if event_session and event_session in sessions:
+                if event.get("method") == "Target.receivedMessageFromTarget":
+                    event_session = None
+                    event_params = event.get("params")
+                    if isinstance(event_params, dict):
+                        candidate = event_params.get("sessionId")
+                        message = event_params.get("message")
+                        if isinstance(candidate, str) and candidate and isinstance(message, str):
+                            try:
+                                payload = json.loads(message)
+                            except (TypeError, ValueError):
+                                payload = None
+                            if isinstance(payload, dict):
+                                event_session = candidate
+                else:
+                    event_session = event.get("session_id")
+                if isinstance(event_session, str) and event_session in sessions:
                     out.append(event)
                 else:
                     remaining.append(event)
@@ -686,12 +726,20 @@ class Daemon:
             return {"events": out, "tab_guard": "ok"}
         if not target_id or target_id not in tabs or not sid or sid not in sessions:
             return {"tab_guard": "refused", "target_id": target_id}
+        try:
+            info = (await self.cdp.send_raw(
+                "Target.getTargetInfo", {"targetId": target_id}
+            ))["targetInfo"]
+        except Exception:
+            return {"tab_guard": "refused", "target_id": target_id}
+        if not _guard_url_allowed(info.get("url")):
+            return {"tab_guard": "refused", "target_id": target_id, "url": info.get("url", "")}
         if meta == "session":
-            return {"session_id": sid, "tab_guard": "ok"}
+            return {"session_id": sid, "url": info.get("url", ""), "tab_guard": "ok"}
         if meta == "pending_dialog":
-            return {"dialog": self.dialog if self.dialog_session == sid else None, "tab_guard": "ok"}
+            return {"dialog": self.dialog if self.dialog_session == sid else None,
+                    "url": info.get("url", ""), "tab_guard": "ok"}
         if meta in {"current_tab", "connection_status"}:
-            info = (await self.cdp.send_raw("Target.getTargetInfo", {"targetId": target_id}))["targetInfo"]
             page = {"targetId": target_id, "url": info.get("url", ""), "title": info.get("title", "")}
             if meta == "current_tab":
                 return {**page, "tab_guard": "ok"}
@@ -761,15 +809,29 @@ class Daemon:
         if meta == "set_session":
             async with self._session_state_lock:
                 owned = req.get("tab_guard")
+                if owned is not None:
+                    self._guarded_sessions = set(owned.get("sessions", []))
                 if owned is not None and (
                     not req.get("session_id") or req["session_id"] not in owned.get("sessions", [])
                     or not req.get("target_id") or req["target_id"] not in owned.get("tabs", [])
                 ):
                     return {"tab_guard": "refused", "target_id": req.get("target_id")}
+                if owned is not None:
+                    try:
+                        info = (await self.cdp.send_raw(
+                            "Target.getTargetInfo", {"targetId": req["target_id"]}
+                        ))["targetInfo"]
+                    except Exception:
+                        return {"tab_guard": "refused", "target_id": req.get("target_id")}
+                    if not _guard_url_allowed(info.get("url")):
+                        return {"tab_guard": "refused", "target_id": req.get("target_id"),
+                                "url": info.get("url", "")}
                 old_session = self.session
                 self.session = req.get("session_id")
                 self.target_id = req.get("target_id") or self.target_id
                 new_session = self.session
+                if new_session and self.target_id:
+                    self._session_targets[new_session] = self.target_id
             # Run the old-session Network.disable (defense in depth — keeps
             # background-tab traffic out of the global event buffer; the
             # consumer-side filter in wait_for_network_idle is the actual
@@ -824,7 +886,15 @@ class Daemon:
         # For everything else, explicit session in req wins; else default.
         sid = None if method.startswith("Target.") else (req.get("session_id") or self.session)
         try:
-            return {"result": await self.cdp.send_raw(method, params, session_id=sid)}
+            result = await self.cdp.send_raw(method, params, session_id=sid)
+            if method == "Target.attachToTarget":
+                attached_session = result.get("sessionId")
+                target_id = params.get("targetId")
+                if attached_session and target_id:
+                    self._session_targets[attached_session] = target_id
+            elif method == "Target.detachFromTarget":
+                self._session_targets.pop(params.get("sessionId"), None)
+            return {"result": result}
         except Exception as e:
             msg = str(e)
             if "Session with given id not found" in msg and sid:
