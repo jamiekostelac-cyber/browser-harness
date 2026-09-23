@@ -1,5 +1,5 @@
 """CDP WS holder + IPC relay (Unix socket on POSIX, TCP loopback on Windows). One daemon per BU_NAME."""
-import asyncio, json, os, platform, shutil, socket, subprocess, sys, time, urllib.error, urllib.request
+import asyncio, json, os, platform, shlex, shutil, socket, subprocess, sys, time, urllib.error, urllib.request
 from urllib.parse import urlparse
 from collections import deque
 from pathlib import Path
@@ -203,6 +203,31 @@ def browser_running_for_profile(base):
         return True  # pid exists but belongs to another user
 
 
+def _profile_process_owns(base):
+    """Verify SingletonLock's live process command line names this user-data dir."""
+    try:
+        target = os.readlink(str(base / "SingletonLock"))
+        pid = int(target.rsplit("-", 1)[-1])
+        if platform.system() == "Darwin":
+            raw = subprocess.check_output(
+                ["ps", "-p", str(pid), "-o", "command="],
+                text=True, stderr=subprocess.DEVNULL, timeout=2,
+            )
+            args = shlex.split(raw)
+        elif platform.system() == "Linux":
+            args = Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace").split("\0")
+        else:
+            return False
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+    expected = str(Path(base).resolve())
+    return any(
+        arg.startswith("--user-data-dir=")
+        and str(Path(arg.split("=", 1)[1]).resolve()) == expected
+        for arg in args
+    )
+
+
 def supported_browser_running():
     """Is any browser whose profile we scan actually running?"""
     if platform.system() == "Windows":
@@ -266,10 +291,12 @@ def _ws_from_devtools_active_port(http_url: str) -> str | None:
 # impossible without Full Disk Access — so when every profile is unreadable we
 # launch a dedicated automation Chrome instead. Its own --user-data-dir lives
 # outside the protected path, so /json/version is reachable.
-AUTOMATION_PROFILE = Path(
-    os.environ.get("BH_AUTOMATION_PROFILE")
-    or (Path.home() / ".config" / "browser-harness" / "chrome-profile")
-)
+def automation_profile():
+    raw = os.environ.get("BH_AUTOMATION_PROFILE")
+    return Path(raw).expanduser().resolve() if raw else paths.home_dir() / "chrome-profile"
+
+
+AUTOMATION_PROFILE = automation_profile()
 # Deliberately not 9222 — the user's everyday Chrome usually claims it first,
 # and Chrome refuses to share the port (our instance would end up IPv6-only and
 # unreachable at 127.0.0.1:9222, which answers 404 from the other instance).
@@ -333,12 +360,14 @@ def launch_automation_chrome():
     except OSError:
         active = []
     port = active[0].strip() if active else ""
-    ws_path = active[1].strip() if len(active) > 1 else ""
     if port.isdigit() and 1 <= int(port) <= 65535:
-        if ws := _json_version_ws(int(port)):
-            return ws
-        if ws_path and _port_in_use(int(port)):
-            return f"ws://127.0.0.1:{port}{ws_path}"
+        # The port file can outlive Chrome. Reuse it only when the profile's
+        # SingletonLock proves that its owning browser process is still alive,
+        # and require fresh endpoint discovery. A listener on the stale port
+        # may belong to an unrelated Chrome or another local service.
+        if _profile_process_owns(AUTOMATION_PROFILE):
+            if ws := _json_version_ws(int(port)):
+                return ws
     binary = _automation_chrome_binary()
     if not binary:
         return None

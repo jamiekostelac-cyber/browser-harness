@@ -107,10 +107,82 @@ def test_automation_profile_rediscovers_selected_port_after_restart(monkeypatch,
     profile.mkdir()
     (profile / "DevToolsActivePort").write_text("49231\n/devtools/browser/persisted\n")
     monkeypatch.setattr(daemon, "AUTOMATION_PROFILE", profile)
+    monkeypatch.setattr(daemon, "browser_running_for_profile", lambda path: path == profile)
     monkeypatch.setattr(daemon, "_json_version_ws", lambda port: f"ws://127.0.0.1:{port}/json" if port == 49231 else None)
 
     def unexpected_launch():
         pytest.fail("a live automation profile should be reused")
 
     monkeypatch.setattr(daemon, "_automation_chrome_binary", unexpected_launch)
+    monkeypatch.setattr(daemon, "_profile_process_owns", lambda _profile: True)
     assert daemon.launch_automation_chrome() == "ws://127.0.0.1:49231/json"
+
+
+def test_stale_automation_port_does_not_attach_to_unrelated_listener(monkeypatch, tmp_path):
+    profile = tmp_path / "automation-profile"
+    profile.mkdir()
+    (profile / "DevToolsActivePort").write_text("49231\n/devtools/browser/stale\n")
+    monkeypatch.setattr(daemon, "AUTOMATION_PROFILE", profile)
+    monkeypatch.setattr(daemon, "_profile_process_owns", lambda _path: False)
+    monkeypatch.setattr(daemon, "_port_in_use", lambda _port: True)
+    monkeypatch.setattr(daemon, "_automation_chrome_binary", lambda: None)
+
+    assert daemon.launch_automation_chrome() is None
+
+
+def test_live_automation_profile_with_unverifiable_endpoint_is_not_reused(
+    monkeypatch, tmp_path
+):
+    profile = tmp_path / "automation-profile"
+    profile.mkdir()
+    (profile / "DevToolsActivePort").write_text("49231\n/devtools/browser/stale\n")
+    monkeypatch.setattr(daemon, "AUTOMATION_PROFILE", profile)
+    monkeypatch.setattr(daemon, "_profile_process_owns", lambda _path: True)
+    monkeypatch.setattr(daemon, "_json_version_ws", lambda _port: None)
+    monkeypatch.setattr(daemon, "_port_in_use", lambda _port: True)
+    monkeypatch.setattr(daemon, "_automation_chrome_binary", lambda: None)
+
+    assert daemon.launch_automation_chrome() is None
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ('/Applications/Chrome --user-data-dir=/tmp/automation-profile', True),
+        ('/Applications/Chrome --user-data-dir=/tmp/unrelated-profile', False),
+    ],
+)
+def test_profile_process_identity_matches_user_data_dir(monkeypatch, tmp_path, command, expected):
+    profile = tmp_path / "automation-profile"
+    profile.mkdir()
+    (profile / "SingletonLock").symlink_to("host-1234")
+    monkeypatch.setattr(daemon.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(daemon.os, "readlink", lambda _path: "host-1234")
+    observed = command.replace("/tmp/automation-profile", str(profile))
+    monkeypatch.setattr(daemon.subprocess, "check_output", lambda *_args, **_kwargs: observed)
+    assert daemon._profile_process_owns(profile) is expected
+
+
+@pytest.mark.parametrize(
+    ("variable", "value", "expected"),
+    [
+        ("BH_HOME", "/custom/bh", "/custom/bh/chrome-profile"),
+        (
+            "BROWSER_HARNESS_HOME",
+            "/custom/browser-harness",
+            "/custom/browser-harness/chrome-profile",
+        ),
+        ("XDG_CONFIG_HOME", "/custom/config", "/custom/config/browser-harness/chrome-profile"),
+    ],
+)
+def test_default_automation_profile_uses_harness_home(
+    monkeypatch, variable, value, expected
+):
+    from browser_harness import paths
+
+    for key in ("BH_HOME", "BROWSER_HARNESS_HOME", "XDG_CONFIG_HOME", "BH_AUTOMATION_PROFILE"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv(variable, value)
+
+    assert daemon.automation_profile() == paths.home_dir() / "chrome-profile"
+    assert str(daemon.automation_profile()) == expected
