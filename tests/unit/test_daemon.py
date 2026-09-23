@@ -134,9 +134,18 @@ def test_guard_policy_blocks_unregistered_marker_and_domain_authorization(monkey
 
     d = daemon.Daemon()
     d.cdp = _PolicyCDP()
-    d.session = "unguarded-session"
-    d.target_id = "unguarded-target"
-    d._session_targets["unguarded-session"] = "unguarded-target"
+    d.session = "owned-session"
+    d.target_id = "owned-target"
+    d._session_targets["owned-session"] = "owned-target"
+    d._guard_policy_active = True
+    d._guarded_run_id = "123e4567-e89b-42d3-a456-426614174000"
+    d._guarded_sessions = {"owned-session"}
+    d._guarded_targets = {"owned-target"}
+    d._document_state["owned-session"] = {
+        "target_id": "owned-target", "generation": 0,
+        "url": "https://owned.example/", "document_url": "https://owned.example/",
+        "frame_id": None, "loader_id": None, "allowed": True,
+    }
 
     async def register():
         return await d.handle({
@@ -145,6 +154,7 @@ def test_guard_policy_blocks_unregistered_marker_and_domain_authorization(monkey
             "target_id": "owned-target",
             "tab_guard": {"tabs": ["owned-target"], "sessions": ["owned-session"]},
             "tab_guard_run": "123e4567-e89b-42d3-a456-426614174000",
+            "tab_guard_epoch": d._authorization_epoch,
         })
 
     assert asyncio.run(register()) == {"session_id": "owned-session", "tab_guard": "ok"}

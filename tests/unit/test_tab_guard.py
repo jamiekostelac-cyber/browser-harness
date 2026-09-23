@@ -28,6 +28,8 @@ def _subprocess_env(**updates):
 
 def _fake_send(current=FOREIGN, created="MINE", session="SESSION-MINE", target_type="page"):
     def send(req, response_timeout=None):
+        if req.get("meta") == "guard_epoch":
+            return {"tab_guard": "ok", "tab_guard_epoch": 0}
         if req.get("meta") == "tab_guard_reset":
             return {"tab_guard": "ok", "tab_guard_run": req.get("tab_guard_run")}
         if req.get("meta") == "guard_context":
@@ -1209,6 +1211,7 @@ def test_legacy_target_reply_uses_params_session_id_for_guarded_event_filter(dae
     d._legacy_commands[("SESSION-MINE", 1)] = {
         "run_id": RUN_ID, "epoch": d._authorization_epoch, "generation": 0,
         "target_id": "MINE",
+        "caller_id": 1,
         "document_url": "https://owned.example/", "session_id": "SESSION-MINE",
     }
     owned = {"method": "Target.receivedMessageFromTarget",
@@ -1387,6 +1390,145 @@ def test_guard_reset_suppresses_inflight_dispatch_result(daemon_bridge):
     assert "private result" not in json.dumps(result)
 
 
+@pytest.mark.parametrize("change", ["reset", "navigation"])
+def test_dispatch_result_is_suppressed_if_authorization_changes_during_final_metadata(
+    daemon_bridge, change
+):
+    d, calls = daemon_bridge
+    request = _guarded_dispatch_request(d, "Runtime.evaluate", {"expression": "1"})
+    entered, release = asyncio.Event(), asyncio.Event()
+    info_calls = 0
+
+    async def blocked_send(method, params=None, session_id=None):
+        nonlocal info_calls
+        calls.append((method, params, session_id))
+        if method == "Target.getTargetInfo":
+            info_calls += 1
+            if info_calls == 2:
+                entered.set()
+                await release.wait()
+            url = d._document_state.get("SESSION-MINE", {}).get("document_url", "https://owned.example/")
+            return {"targetInfo": {"targetId": "MINE", "url": url}}
+        return {"value": "private-after-await"}
+
+    d.cdp.send_raw = blocked_send
+
+    async def run():
+        pending = asyncio.create_task(d.handle(request))
+        await entered.wait()
+        if change == "reset":
+            await d.handle({"meta": "tab_guard_reset", "tab_guard_run": RUN_ID})
+        else:
+            d._document_state["SESSION-MINE"].update({
+                "generation": 1, "document_url": "https://next.example/",
+                "url": "https://next.example/",
+            })
+        release.set()
+        return await pending
+
+    result = asyncio.run(run())
+    assert result == {"error": "tab guard authorization was revoked during dispatch"}
+    assert "private-after-await" not in json.dumps(result)
+
+
+def test_guarded_metadata_is_suppressed_if_reset_occurs_during_target_lookup(daemon_bridge):
+    d, _ = daemon_bridge
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def blocked_info(method, params=None, session_id=None):
+        if method == "Target.getTargetInfo":
+            entered.set()
+            await release.wait()
+        return {"targetInfo": {
+            "targetId": "MINE", "url": "https://owned.example/", "title": "Owned",
+        }}
+
+    d.cdp.send_raw = blocked_info
+
+    async def run():
+        pending = asyncio.create_task(d.handle({
+            "meta": "current_tab", "tab_guard": {"tabs": ["MINE"], "sessions": ["SESSION-MINE"]},
+            "tab_guard_run": RUN_ID, "tab_guard_epoch": d._authorization_epoch,
+        }))
+        await entered.wait()
+        await d.handle({"meta": "tab_guard_reset", "tab_guard_run": RUN_ID})
+        release.set()
+        return await pending
+
+    assert asyncio.run(run()) == {"tab_guard": "refused", "target_id": "MINE"}
+
+
+def test_pre_reset_set_session_cannot_register_with_stale_epoch(daemon_bridge):
+    d, calls = daemon_bridge
+    stale_request = {
+        "meta": "set_session", "session_id": "SESSION-MINE", "target_id": "MINE",
+        "tab_guard": {"tabs": ["MINE"], "sessions": ["SESSION-MINE"]},
+        "tab_guard_run": RUN_ID, "tab_guard_epoch": d._authorization_epoch,
+    }
+    reset = asyncio.run(d.handle({"meta": "tab_guard_reset", "tab_guard_run": RUN_ID}))
+    calls.clear()
+
+    result = asyncio.run(d.handle(stale_request))
+
+    assert reset["tab_guard"] == "ok"
+    assert result == {"tab_guard": "refused", "target_id": "MINE"}
+    assert calls == []
+
+
+def test_guard_context_reply_is_discarded_after_reset_during_target_lookup(daemon_bridge):
+    d, _ = daemon_bridge
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_send = d.cdp.send_raw
+
+    async def blocked_info(method, params=None, session_id=None):
+        if method == "Target.getTargetInfo":
+            entered.set()
+            await release.wait()
+        return await original_send(method, params, session_id)
+
+    d.cdp.send_raw = blocked_info
+
+    async def run():
+        pending = asyncio.create_task(d.handle({
+            "meta": "guard_context", "session_id": "SESSION-MINE",
+        }))
+        await entered.wait()
+        await d.handle({"meta": "tab_guard_reset", "tab_guard_run": RUN_ID})
+        release.set()
+        return await pending
+
+    context = asyncio.run(run())
+    assert context["tab_guard"] == "refused"
+    assert context["target_id"] is None
+
+
+def test_set_session_reply_is_discarded_after_reset_during_domain_setup(daemon_bridge, monkeypatch):
+    d, _ = daemon_bridge
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def blocked_enables(_session):
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(d, "_enable_default_domains", blocked_enables)
+    request = {
+        "meta": "set_session", "session_id": "SESSION-MINE", "target_id": "MINE",
+        "tab_guard": {"tabs": ["MINE"], "sessions": ["SESSION-MINE"]},
+        "tab_guard_run": RUN_ID, "tab_guard_epoch": d._authorization_epoch,
+    }
+
+    async def run():
+        pending = asyncio.create_task(d.handle(request))
+        await entered.wait()
+        reset = await d.handle({"meta": "tab_guard_reset", "tab_guard_run": RUN_ID})
+        release.set()
+        return reset, await pending
+
+    reset, result = asyncio.run(run())
+    assert reset["tab_guard"] == "ok"
+    assert result["tab_guard"] == "refused"
+
+
 @pytest.mark.parametrize("payload", [
     "{bad json", json.dumps({"id": 999, "result": {"secret": "unknown"}}),
     json.dumps({"id": 1, "result": {"secret": "malformed correlation"}}),
@@ -1418,17 +1560,51 @@ def test_legacy_reply_is_dropped_after_its_authorized_document_navigates(daemon_
 
 
 def test_nested_legacy_dispatch_registers_exact_authorized_reply(daemon_bridge):
-    d, _ = daemon_bridge
+    d, calls = daemon_bridge
     helpers.cdp("Target.sendMessageToTarget", sessionId="SESSION-MINE",
                 message=json.dumps({"id": 904, "method": "Runtime.evaluate",
                                     "params": {"expression": "1"}}))
+    wire_id = json.loads(next(
+        params["message"] for method, params, _sid in calls
+        if method == "Target.sendMessageToTarget"
+    ))["id"]
     d._record_event("Target.receivedMessageFromTarget", {
         "sessionId": "SESSION-MINE",
-        "message": json.dumps({"id": 904, "result": {"value": 1}}),
+        "message": json.dumps({"id": wire_id, "result": {"value": 1}}),
     }, None)
     events = helpers.drain_events()
     assert len(events) == 1
     assert json.loads(events[0]["params"]["message"]) == {"id": 904, "result": {"value": 1}}
+
+
+def test_legacy_caller_id_cannot_be_reused_for_a_delayed_reply(daemon_bridge):
+    d, calls = daemon_bridge
+    def command():
+        return helpers.cdp(
+            "Target.sendMessageToTarget", sessionId="SESSION-MINE",
+            message=json.dumps({"id": 905, "method": "Runtime.evaluate",
+                                "params": {"expression": "1"}}),
+        )
+    command()
+    first_wire = json.loads(calls[-2][1]["message"])["id"]
+    assert isinstance(first_wire, int)
+    d._record_event("Target.receivedMessageFromTarget", {
+        "sessionId": "SESSION-MINE", "message": json.dumps({"id": first_wire, "result": {"value": 1}}),
+    }, None)
+    assert len(helpers.drain_events()) == 1
+    command()
+    second_wire = json.loads(calls[-2][1]["message"])["id"]
+    assert first_wire != second_wire
+    d._record_event("Target.receivedMessageFromTarget", {
+        "sessionId": "SESSION-MINE", "message": json.dumps({"id": first_wire, "result": {"secret": "late"}}),
+    }, None)
+    assert "late" not in json.dumps(helpers.drain_events())
+    d._record_event("Target.receivedMessageFromTarget", {
+        "sessionId": "SESSION-MINE", "message": json.dumps({"id": second_wire, "result": {"value": 2}}),
+    }, None)
+    events = helpers.drain_events()
+    assert len(events) == 1
+    assert json.loads(events[0]["params"]["message"])["id"] == 905
 
 
 def test_dialog_and_subframe_events_require_current_document_provenance(daemon_bridge):
@@ -1589,7 +1765,7 @@ def test_pinned_request_never_uses_new_current_session_or_recovers_there(daemon_
         raise RuntimeError("Session with given id not found")
     d.cdp.send_raw = stale
     count = len(calls)
-    with pytest.raises(helpers.TabGuardRefused, match="URL"):
+    with pytest.raises(helpers.TabGuardRefused, match="mapping"):
         helpers.cdp("Page.navigate", url="https://owned.example/")
     assert len(calls) == count + 1
     assert calls[-1][0] == "Target.getTargetInfo"
@@ -1708,7 +1884,7 @@ def test_old_daemon_refused_before_session_switch(owning, monkeypatch):
     monkeypatch.setattr(helpers, "_send", old_daemon)
     with pytest.raises(helpers.TabGuardRefused, match="reloaded"):
         helpers._read_meta("set_session", target_id="MINE", session_id="SESSION-MINE")
-    assert [req["meta"] for req in requests] == ["guard_context"]
+    assert [req["meta"] for req in requests] == ["guard_epoch"]
 
 
 @pytest.mark.parametrize("meta", ["current_tab", "pending_dialog", "session", "drain_events"])

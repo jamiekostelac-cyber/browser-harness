@@ -584,11 +584,25 @@ def _read_meta(meta, **params):
         run_id = _run_id()
         req["tab_guard"] = _owned_state()
         req["tab_guard_run"] = run_id
+        try:
+            context = _send({"meta": "guard_epoch"})
+        except Exception:
+            _refuse(meta, None, "", "metadata could not be read (failing closed)")
+        if not isinstance(context, dict) or context.get("tab_guard") != "ok":
+            reason = ("daemon must be reloaded for tab guard support" if meta == "set_session"
+                      else "metadata could not be read (failing closed)")
+            _refuse(meta, None, "", reason)
+        epoch = context.get("tab_guard_epoch")
+        if not isinstance(epoch, int) or epoch < 0:
+            reason = ("daemon must be reloaded for tab guard support" if meta == "set_session"
+                      else "metadata could not be read (failing closed)")
+            _refuse(meta, None, "", reason)
+        req["tab_guard_epoch"] = epoch
     try:
         # An old daemon ignores unknown request fields. Detect it before a
         # set_session could enable domains or disable a foreign session.
         if guarded and meta == "set_session":
-            if _send({"meta": "guard_context"}).get("tab_guard") != "ok":
+            if context.get("tab_guard") != "ok":
                 _refuse(meta, None, "", "daemon must be reloaded for tab guard support")
         response = _send(req)
     except TabGuardRefused:
