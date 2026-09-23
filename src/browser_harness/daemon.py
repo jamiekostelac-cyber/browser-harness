@@ -396,14 +396,18 @@ def get_ws_url():
         raise RuntimeError(f"BU_CDP_URL={url} unreachable after 30s: {last_err} -- {hint}")
     deadline = time.time() + 30
     next_liveness_check = 0.0
+    candidate_profiles = set()
     tcc_blocked_profiles = set()
     while time.time() < deadline:
         for profile_index, base in enumerate(PROFILES):
+            if base.exists():
+                candidate_profiles.add(profile_index)
             try:
                 active = (base / "DevToolsActivePort").read_text(encoding="utf-8", errors="replace").splitlines()
             except FileNotFoundError:
                 continue
             except PermissionError:
+                candidate_profiles.add(profile_index)
                 tcc_blocked_profiles.add(profile_index)
                 continue
             except OSError:
@@ -430,7 +434,7 @@ def get_ws_url():
         # Closed browser leaves stale DevToolsActivePort files
         now = time.time()
         if now >= next_liveness_check:
-            if PROFILES and len(tcc_blocked_profiles) == len(PROFILES):
+            if candidate_profiles and tcc_blocked_profiles == candidate_profiles:
                 break
             if not supported_browser_running():
                 raise RuntimeError(
@@ -451,7 +455,7 @@ def get_ws_url():
                 raise RuntimeError("permission-blocked: Chrome is reachable, but the per-session Allow remote debugging popup has not been accepted")
         except (OSError, KeyError, ValueError):
             continue
-    all_profiles_tcc_blocked = bool(PROFILES) and len(tcc_blocked_profiles) == len(PROFILES)
+    all_profiles_tcc_blocked = bool(candidate_profiles) and tcc_blocked_profiles == candidate_profiles
     if all_profiles_tcc_blocked:
         # No profile was readable (macOS TCC) and nothing answered on the probe
         # ports — launch a dedicated automation Chrome so the harness still works.

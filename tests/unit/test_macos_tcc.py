@@ -16,6 +16,9 @@ class _BlockedProfile:
     def read_text(self, *args, **kwargs):
         raise PermissionError(1, "Operation not permitted")
 
+    def exists(self):
+        return True
+
     def __str__(self):
         return "/Library/Application Support/Google/Chrome"
 
@@ -52,6 +55,18 @@ def test_blocked_profile_without_browser_raises_actionable_error(blocked_profile
     monkeypatch.setattr(daemon, "remote_debugging_user_enabled", lambda: False)
     with pytest.raises(RuntimeError, match="Full Disk Access"):
         daemon.get_ws_url()
+
+
+def test_blocked_profile_with_missing_profile_falls_back(blocked_profile, monkeypatch, tmp_path):
+    monkeypatch.setattr(daemon, "PROFILES", [_BlockedProfile(), tmp_path / "missing-profile"])
+    endpoint = "ws://127.0.0.1:49231/devtools/browser/auto"
+    monkeypatch.setattr(daemon, "supported_browser_running", lambda: True)
+    monkeypatch.setattr(daemon, "NO_TOGGLE_GRACE", -1)
+    launch = []
+    monkeypatch.setattr(daemon, "launch_automation_chrome", lambda: launch.append(True) or endpoint)
+
+    assert daemon.get_ws_url() == endpoint
+    assert launch == [True]
 
 
 def test_one_readable_profile_prevents_tcc_fallback(blocked_profile, monkeypatch, tmp_path):
