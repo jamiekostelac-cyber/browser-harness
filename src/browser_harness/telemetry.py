@@ -18,7 +18,6 @@ from . import paths
 POSTHOG_KEY = "phc_rCPCLPtaXB3EuBdiH7JLKtU2Wj5iPnuwdsbw58CnjYXc"
 POSTHOG_HOST = "https://eu.i.posthog.com"
 DISABLE_ENVS = ("BH_TELEMETRY", "BROWSER_HARNESS_TELEMETRY", "ANONYMIZED_TELEMETRY")
-MAX_TASK_LENGTH = 20_000
 FORBIDDEN_KEYS = (
     "api_key",
     "content",

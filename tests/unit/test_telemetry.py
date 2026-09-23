@@ -25,6 +25,7 @@ def test_capture_cli_event_does_not_send_user_content(monkeypatch):
     assert properties["task_length"] == len("fill_input('#password', 'hunter2')")
     assert properties["output_length"] == 31
     assert properties["step_count"] == 1
+    assert properties["duration_seconds"] == 1.5
     assert properties["exit_code"] == 0
     assert "task" not in properties
     assert "output" not in properties
