@@ -115,7 +115,9 @@ def test_fails_closed_when_the_attached_tab_cannot_be_read(tmp_path, monkeypatch
     monkeypatch.setattr(helpers.ipc, "_TMP", tmp_path)
     monkeypatch.setattr(
         helpers, "_send",
-        lambda req, **kwargs: {"tab_guard": "ok", "tab_guard_run": req.get("tab_guard_run")},
+        lambda req, **kwargs: ({"tab_guard": "ok", "tab_guard_epoch": 0}
+                               if req.get("meta") == "guard_epoch" else
+                               {"tab_guard": "ok", "tab_guard_run": req.get("tab_guard_run")}),
     )
     helpers.tab_guard_reset()
 
@@ -524,6 +526,8 @@ def test_guarded_dispatch_carries_run_session_target_epoch_and_generation(owning
 
     def send(req, **kwargs):
         calls.append(req)
+        if req.get("meta") == "guard_epoch":
+            return {"tab_guard": "ok", "tab_guard_epoch": 7, "tab_guard_run": RUN_ID}
         if req.get("meta") == "guard_context":
             return {
                 "target_id": "MINE", "session_id": "SESSION-MINE",
@@ -667,6 +671,8 @@ def test_implicit_dispatch_is_pinned_to_validated_session(owning, monkeypatch):
     calls = []
     def send(req, **kw):
         calls.append(req)
+        if req.get("meta") == "guard_epoch":
+            return {"tab_guard": "ok", "tab_guard_epoch": 0, "tab_guard_run": RUN_ID}
         if req.get("meta") == "guard_context":
             # Another run switches the daemon immediately after this snapshot.
             return {"target_id": "MINE", "session_id": "SESSION-MINE", "url": "https://example.com/",
@@ -757,7 +763,7 @@ def test_reset_uses_the_same_ownership_lock(guard, tmp_path, monkeypatch):
     path = helpers._owned_path()
     script = (
         "from browser_harness import helpers\n"
-        "helpers._send = lambda req, **kw: {'tab_guard': 'ok', 'tab_guard_run': req.get('tab_guard_run')}\n"
+        "helpers._send = lambda req, **kw: {'tab_guard': 'ok', 'tab_guard_run': req.get('tab_guard_run'), 'tab_guard_epoch': 0}\n"
         "helpers.tab_guard_reset()\n"
         "print('done', flush=True)\n"
     )
@@ -1428,7 +1434,8 @@ def test_guard_reset_suppresses_inflight_dispatch_result(daemon_bridge):
     async def run():
         pending = asyncio.create_task(d.handle(request))
         await entered.wait()
-        reset = await d.handle({"meta": "tab_guard_reset", "tab_guard_run": RUN_ID})
+        reset = await d.handle({"meta": "tab_guard_reset", "tab_guard_run": RUN_ID,
+                                "tab_guard_epoch": d._authorization_epoch})
         release.set()
         return reset, await pending
 
@@ -1467,7 +1474,8 @@ def test_dispatch_result_is_suppressed_if_authorization_changes_during_final_met
         pending = asyncio.create_task(d.handle(request))
         await entered.wait()
         if change == "reset":
-            await d.handle({"meta": "tab_guard_reset", "tab_guard_run": RUN_ID})
+            await d.handle({"meta": "tab_guard_reset", "tab_guard_run": RUN_ID,
+                            "tab_guard_epoch": d._authorization_epoch})
         elif change == "navigation":
             d._document_state["SESSION-MINE"].update({
                 "generation": 1, "document_url": "https://next.example/",
@@ -1505,7 +1513,8 @@ def test_guarded_metadata_is_suppressed_if_reset_occurs_during_target_lookup(dae
             "tab_guard_run": RUN_ID, "tab_guard_epoch": d._authorization_epoch,
         }))
         await entered.wait()
-        await d.handle({"meta": "tab_guard_reset", "tab_guard_run": RUN_ID})
+        await d.handle({"meta": "tab_guard_reset", "tab_guard_run": RUN_ID,
+                        "tab_guard_epoch": d._authorization_epoch})
         release.set()
         return await pending
 
@@ -1519,7 +1528,8 @@ def test_pre_reset_set_session_cannot_register_with_stale_epoch(daemon_bridge):
         "tab_guard": {"tabs": ["MINE"], "sessions": ["SESSION-MINE"]},
         "tab_guard_run": RUN_ID, "tab_guard_epoch": d._authorization_epoch,
     }
-    reset = asyncio.run(d.handle({"meta": "tab_guard_reset", "tab_guard_run": RUN_ID}))
+    reset = asyncio.run(d.handle({"meta": "tab_guard_reset", "tab_guard_run": RUN_ID,
+                                  "tab_guard_epoch": d._authorization_epoch}))
     calls.clear()
 
     result = asyncio.run(d.handle(stale_request))
@@ -1545,9 +1555,11 @@ def test_guard_context_reply_is_discarded_after_reset_during_target_lookup(daemo
     async def run():
         pending = asyncio.create_task(d.handle({
             "meta": "guard_context", "session_id": "SESSION-MINE",
+            "tab_guard_run": RUN_ID, "tab_guard_epoch": d._authorization_epoch,
         }))
         await entered.wait()
-        await d.handle({"meta": "tab_guard_reset", "tab_guard_run": RUN_ID})
+        await d.handle({"meta": "tab_guard_reset", "tab_guard_run": RUN_ID,
+                        "tab_guard_epoch": d._authorization_epoch})
         release.set()
         return await pending
 
@@ -1574,7 +1586,8 @@ def test_set_session_reply_is_discarded_after_reset_during_domain_setup(daemon_b
     async def run():
         pending = asyncio.create_task(d.handle(request))
         await entered.wait()
-        reset = await d.handle({"meta": "tab_guard_reset", "tab_guard_run": RUN_ID})
+        reset = await d.handle({"meta": "tab_guard_reset", "tab_guard_run": RUN_ID,
+                                "tab_guard_epoch": d._authorization_epoch})
         release.set()
         return reset, await pending
 
@@ -1754,7 +1767,8 @@ def test_guard_reset_revokes_queued_and_future_marker_work(monkeypatch):
 
     async def run():
         d._record_event("Page.loadEventFired", {}, "SESSION-MINE")
-        response = await d.handle({"meta": "tab_guard_reset", "tab_guard_run": RUN_ID})
+        response = await d.handle({"meta": "tab_guard_reset", "tab_guard_run": RUN_ID,
+                                   "tab_guard_epoch": d._authorization_epoch})
         d._record_event("Page.loadEventFired", {}, "SESSION-MINE")
         await asyncio.sleep(0)
         await asyncio.sleep(0)
@@ -1762,13 +1776,105 @@ def test_guard_reset_revokes_queued_and_future_marker_work(monkeypatch):
 
     response = asyncio.run(run())
     assert response == {"tab_guard": "ok", "tab_guard_run": RUN_ID}
-    assert d._guard_policy_active is False
+    assert d._guard_policy_active is True
     assert d._guarded_sessions == set()
     assert d._guarded_targets == set()
     assert d.session is None
     assert d.target_id is None
     assert d._marker_tasks == set()
     assert not [call for call in daemon_test_cdp.calls if call[0] == "Runtime.evaluate"]
+
+
+def test_reset_leaves_guard_enforcement_latched_for_omitted_fields(daemon_bridge):
+    d, calls = daemon_bridge
+    reset = asyncio.run(d.handle({
+        "meta": "tab_guard_reset", "tab_guard_run": RUN_ID,
+        "tab_guard_epoch": d._authorization_epoch,
+    }))
+    assert reset["tab_guard"] == "ok"
+    assert d._guard_policy_active is True
+    calls.clear()
+    for request in (
+        {"method": "Runtime.evaluate", "params": {"expression": "1"}},
+        {"meta": "current_tab"},
+        {"meta": "connection_status"},
+        {"meta": "drain_events"},
+        {"meta": "shutdown"},
+    ):
+        response = asyncio.run(d.handle(request))
+        assert response.get("tab_guard") == "refused" or "stale" in response.get("error", "")
+    assert not any(call[0] == "Runtime.evaluate" for call in calls)
+
+
+def test_delayed_old_run_reset_cannot_revoke_newer_run(daemon_bridge):
+    d, _ = daemon_bridge
+    old_epoch = d._authorization_epoch
+    old_reset = {"meta": "tab_guard_reset", "tab_guard_run": RUN_ID,
+                 "tab_guard_epoch": old_epoch}
+
+    async def run():
+        await d._session_state_lock.acquire()
+        pending = asyncio.create_task(d.handle(old_reset))
+        await asyncio.sleep(0)
+        d._guarded_run_id = RUN_ID_2
+        d._authorization_epoch += 1
+        d._guard_policy_active = True
+        d._guarded_sessions = {"SESSION-NEW"}
+        d._guarded_targets = {"TARGET-NEW"}
+        d._session_state_lock.release()
+        return await pending
+
+    response = asyncio.run(run())
+    assert response["tab_guard"] == "refused"
+    assert response["tab_guard_run"] == RUN_ID_2
+    assert d._guarded_run_id == RUN_ID_2
+    assert d._guarded_sessions == {"SESSION-NEW"}
+    assert d._guarded_targets == {"TARGET-NEW"}
+
+
+@pytest.mark.parametrize("method", [
+    "Target.closeTarget", "Target.activateTarget", "Target.attachToTarget",
+])
+@pytest.mark.parametrize("change", ["generation", "url", "allowed"])
+def test_target_scoped_sessionless_dispatch_rejects_stale_document_snapshot(
+        daemon_bridge, method, change):
+    d, calls = daemon_bridge
+    request = _guarded_dispatch_request(d, method, {"targetId": "MINE"})
+    request["session_id"] = None
+    if change == "generation":
+        d._document_state["SESSION-MINE"]["generation"] += 1
+    elif change == "url":
+        d._document_state["SESSION-MINE"]["document_url"] = "https://next.example/"
+    else:
+        d._document_state["SESSION-MINE"]["allowed"] = False
+    before = len(calls)
+    response = asyncio.run(d.handle(request))
+    assert response == {"error": "tab guard authorization is stale or invalid"}
+    assert not any(call[0] == method for call in calls[before:])
+
+
+@pytest.mark.parametrize("method", [
+    "Target.closeTarget", "Target.activateTarget", "Target.attachToTarget",
+])
+def test_target_scoped_dispatch_revalidates_document_after_target_lookup(daemon_bridge, method):
+    d, calls = daemon_bridge
+    request = _guarded_dispatch_request(d, method, {"targetId": "MINE"})
+    request["session_id"] = None
+    original = d._validate_dispatch_identity
+
+    async def validate_then_navigate(*args, **kwargs):
+        identity = await original(*args, **kwargs)
+        if identity is not None:
+            state = d._document_state["SESSION-MINE"]
+            state["generation"] += 1
+            state["document_url"] = "https://next.example/"
+        return identity
+
+    d._validate_dispatch_identity = validate_then_navigate
+    before = len(calls)
+    response = asyncio.run(d.handle(request))
+    assert response == {"error": "tab guard authorization is stale or invalid"}
+    assert not any(call[0] == method for call in calls[before:])
 
 
 def test_context_wide_event_subscription_is_refused_and_foreign_events_stay_hidden(daemon_bridge):
@@ -1853,6 +1959,8 @@ def test_explicit_owned_iframe_session_resolves_its_mapped_target_before_dispatc
 
     def send(req, **kwargs):
         calls.append(req)
+        if req.get("meta") == "guard_epoch":
+            return {"tab_guard": "ok", "tab_guard_epoch": 0, "tab_guard_run": RUN_ID}
         if req.get("meta") == "guard_context":
             assert req.get("session_id") == "IFRAME-SESSION"
             return {

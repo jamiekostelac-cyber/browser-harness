@@ -187,9 +187,18 @@ def _validate_context_url(method, params, session_id, context):
         _refuse(method, f"session:{session_id}", context.get("url", ""), url_reason)
 
 
+def _guard_context_request(**params):
+    epoch_context = _send({"meta": "guard_epoch"})
+    epoch = epoch_context.get("tab_guard_epoch") if isinstance(epoch_context, dict) else None
+    if not isinstance(epoch, int) or epoch < 0:
+        return {}
+    return _send({"meta": "guard_context", "tab_guard_run": _run_id(),
+                  "tab_guard_epoch": epoch, **params})
+
+
 def _check_session_target_url(method, params, session_id):
     try:
-        context = _send({"meta": "guard_context", "session_id": session_id})
+        context = _guard_context_request(session_id=session_id)
     except Exception:
         _refuse(method, f"session:{session_id}", params.get("url", ""),
                 "attached target URL could not be read (failing closed)")
@@ -368,7 +377,11 @@ def tab_guard_reset():
     if not _tab_guard_on():
         return
     run_id = _run_id()
-    response = _send({"meta": "tab_guard_reset", "tab_guard_run": run_id})
+    epoch = _send({"meta": "guard_epoch"}).get("tab_guard_epoch")
+    if not isinstance(epoch, int) or epoch < 0:
+        _refuse("tab_guard_reset", None, "", "daemon guard epoch is unavailable")
+    response = _send({"meta": "tab_guard_reset", "tab_guard_run": run_id,
+                      "tab_guard_epoch": epoch})
     if (response.get("tab_guard") != "ok"
             or response.get("tab_guard_run") != run_id):
         _refuse("tab_guard_reset", None, "", "daemon did not acknowledge run revocation")
@@ -383,7 +396,7 @@ def tab_guard_reset():
 def _checked_session(method, params):
     """Snapshot target/session together, validate both, and pin later dispatch."""
     try:
-        context = _send({"meta": "guard_context"})
+        context = _guard_context_request()
     except Exception:
         context = {}
     context = context if isinstance(context, dict) else {}
@@ -512,13 +525,19 @@ def _guard_dispatch_fields(method, params, session_id):
     if method in {"Target.detachFromTarget", "Target.sendMessageToTarget"}:
         requested_session = params.get("sessionId")
     requested_target = params.get("targetId") if method in _TARGET_SCOPED_METHODS else None
-    request = {"meta": "guard_context"}
-    if requested_session:
-        request["session_id"] = requested_session
-    elif requested_target:
-        request["target_id"] = requested_target
     try:
-        context = _send(request)
+        epoch_context = _send({"meta": "guard_epoch"})
+        epoch = epoch_context.get("tab_guard_epoch") if isinstance(epoch_context, dict) else None
+        if not isinstance(epoch, int) or epoch < 0:
+            _refuse(method, requested_target or f"session:{requested_session}",
+                    params.get("url", ""), "daemon guard epoch is unavailable")
+        context_request = {"meta": "guard_context", "tab_guard_run": _run_id(),
+                           "tab_guard_epoch": epoch}
+        if requested_session:
+            context_request["session_id"] = requested_session
+        elif requested_target:
+            context_request["target_id"] = requested_target
+        context = _send(context_request)
     except (OSError, RuntimeError, TimeoutError):
         _refuse(method, requested_target or f"session:{requested_session}",
                 params.get("url", ""), "guard authorization could not be read")
@@ -952,7 +971,7 @@ def _guard_can_unmark_current_tab():
     if not _tab_guard_on():
         return True
     try:
-        context = _send({"meta": "guard_context"})
+        context = _guard_context_request()
         if not isinstance(context, dict):
             return False
         target_id, session_id = context.get("target_id"), context.get("session_id")

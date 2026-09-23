@@ -1108,14 +1108,21 @@ class Daemon:
 
     async def _tab_guard_reset(self, req):
         run_id = req.get("tab_guard_run")
-        if not isinstance(run_id, str) or not run_id:
+        expected_epoch = req.get("tab_guard_epoch")
+        if (not isinstance(run_id, str) or not run_id
+                or not isinstance(expected_epoch, int)):
             return {"tab_guard": "refused"}
-        if self._guarded_run_id not in (None, run_id):
-            return {"tab_guard": "refused", "tab_guard_run": self._guarded_run_id}
         async with self._session_state_lock:
+            # A reset may have waited behind registration of a newer run.
+            # Compare both tokens after acquiring the mutation lock.
+            if (run_id != self._guarded_run_id
+                    or expected_epoch != self._authorization_epoch):
+                return {"tab_guard": "refused", "tab_guard_run": self._guarded_run_id,
+                        "tab_guard_epoch": self._authorization_epoch}
             revoked_sessions = set(self._guarded_sessions)
             revoked_targets = set(self._guarded_targets)
-            self._guard_policy_active = False
+            # Enforcement stays latched for this daemon's lifetime. A caller
+            # cannot escape the guard by resetting and omitting guard fields.
             self._authorization_epoch += 1
             self._guarded_run_id = None
             self._legacy_commands.clear()
@@ -1258,6 +1265,10 @@ class Daemon:
             # clients can reject privileged targets before their next dispatch.
             requested_session = req.get("session_id")
             requested_target = req.get("target_id")
+            if self._guard_policy_active and (
+                    req.get("tab_guard_run") != self._guarded_run_id
+                    or req.get("tab_guard_epoch") != self._authorization_epoch):
+                return {"tab_guard": "refused", "tab_guard_epoch": self._authorization_epoch}
             if requested_session is not None:
                 target_id = self._session_targets.get(requested_session)
                 if requested_target is not None and requested_target != target_id:
@@ -1312,7 +1323,18 @@ class Daemon:
             return context
         if meta == "tab_guard_reset":
             return await self._tab_guard_reset(req)
-        if meta is not None and "tab_guard" in req and meta != "set_session":
+        if (self._guard_policy_active and meta is not None
+                and meta not in {"ping", "guard_epoch", "guard_context"}
+                and not isinstance(req.get("tab_guard"), dict)):
+            return {"tab_guard": "refused"}
+        protected_metadata = {
+            "drain_events", "session", "current_tab", "connection_status",
+            "pending_dialog",
+        }
+        if (meta in protected_metadata
+                and (self._guard_policy_active or "tab_guard" in req)):
+            if not isinstance(req.get("tab_guard"), dict):
+                return {"tab_guard": "refused"}
             return await self._guarded_read(req)
         # Liveness probe — lets clients confirm the listener is actually this
         # daemon and not an unrelated process that reused our port post-crash.
@@ -1662,6 +1684,22 @@ class Daemon:
         if (identity["target_id"] not in set(owned.get("tabs", []))
                 or identity["target_id"] not in self._guarded_targets):
             return None
+        target_document_methods = {
+            "Target.closeTarget", "Target.activateTarget", "Target.attachToTarget",
+        }
+        if sid is None and method in target_document_methods:
+            sid = next((mapped for mapped, target in self._session_targets.items()
+                        if target == target_id), None)
+            mapped_state = self._document_state.get(sid)
+            if (not sid or identity["session_id"] != sid
+                    or not isinstance(mapped_state, dict)
+                    or identity["generation"] != mapped_state.get("generation")
+                    or identity["document_url"] != mapped_state.get("document_url")
+                    or mapped_state.get("allowed") is not True):
+                return None
+            identity["session_id"] = sid
+            identity["generation"] = mapped_state["generation"]
+            identity["document_url"] = mapped_state.get("document_url")
         if sid:
             if (identity["session_id"] != sid or sid not in self._guarded_sessions
                     or not isinstance(state, dict)
