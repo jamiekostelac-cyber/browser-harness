@@ -229,10 +229,14 @@ def _auto_is_stale(d):
             return False  # explicit start_recording() never auto-rolls
 
         directory = Path(d)
-        activity_times = []
         events = directory / "events.jsonl"
         if events.exists():
-            activity_times.append(events.stat().st_mtime)
+            events_mtime = events.stat().st_mtime
+            if (time.time() - events_mtime) <= _auto_idle_gap():
+                return False
+            activity_times = [events_mtime]
+        else:
+            activity_times = []
         activity_times.extend(frame.stat().st_mtime for frame in directory.glob("*.jpg"))
         if not activity_times:
             return False
