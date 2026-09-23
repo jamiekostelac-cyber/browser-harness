@@ -95,6 +95,7 @@ def test_permission_error_on_non_macos_uses_normal_profile_error(
     monkeypatch.setattr(daemon, "supported_browser_running", lambda: True)
     monkeypatch.setattr(daemon, "NO_TOGGLE_GRACE", -1)
     monkeypatch.setattr(daemon, "remote_debugging_user_enabled", lambda: None)
+    monkeypatch.setattr(daemon, "_endpoint_owned_by_profile", lambda *_a, **_k: True)
     launch = []
     monkeypatch.setattr(daemon, "launch_automation_chrome", lambda: launch.append(True))
 
@@ -122,6 +123,7 @@ def test_automation_profile_rediscovers_selected_port_after_restart(monkeypatch,
 
     monkeypatch.setattr(daemon, "_automation_chrome_binary", unexpected_launch)
     monkeypatch.setattr(daemon, "_profile_process_owns", lambda _profile: True)
+    monkeypatch.setattr(daemon, "_endpoint_owned_by_profile", lambda *_args, **_kwargs: True)
     assert daemon.launch_automation_chrome() == "ws://127.0.0.1:49231/devtools/browser/persisted"
 
 
@@ -147,6 +149,12 @@ def test_json_version_reuse_requires_profile_endpoint_identity(
     monkeypatch.setattr(daemon, "supported_browser_running", lambda: True)
     monkeypatch.setattr(daemon, "NO_TOGGLE_GRACE", -1)
     monkeypatch.setattr(daemon, "remote_debugging_user_enabled", lambda: None)
+    monkeypatch.setattr(
+        daemon, "_endpoint_owned_by_profile",
+        lambda _base, _port, ws, _snapshot: accepted and daemon._ws_matches_devtools_active_port(
+            profile, "49231", ws
+        ),
+    )
     response = MagicMock()
     response.read.return_value = (
         '{"webSocketDebuggerUrl": '
@@ -180,6 +188,9 @@ def test_json_version_404_fallback_requires_profile_process_identity(
     monkeypatch.setattr(daemon, "remote_debugging_user_enabled", lambda: None)
     monkeypatch.setattr(
         daemon, "_profile_process_owns", lambda base: base == profile and process_owns_profile
+    )
+    monkeypatch.setattr(
+        daemon, "_endpoint_owned_by_profile", lambda *_args, **_kwargs: process_owns_profile
     )
 
     def not_found(*_args, **_kwargs):
@@ -245,6 +256,7 @@ def test_automation_reuse_rejects_foreign_endpoint_identity(
     )
     monkeypatch.setattr(daemon, "AUTOMATION_PROFILE", profile)
     monkeypatch.setattr(daemon, "_profile_process_owns", lambda *_args: True)
+    monkeypatch.setattr(daemon, "_endpoint_owned_by_profile", lambda *_args, **_kwargs: False)
     monkeypatch.setattr(daemon, "_json_version_ws", lambda _port: endpoint)
     monkeypatch.setattr(daemon, "_automation_chrome_binary", lambda: None)
 
@@ -330,11 +342,9 @@ def test_automation_launch_requires_launched_pid_and_profile_endpoint(
         return RunningChild()
 
     monkeypatch.setattr(daemon.subprocess, "Popen", spawn)
-    owners = []
     monkeypatch.setattr(
-        daemon,
-        "_profile_process_owns",
-        lambda _profile, expected_pid=None: owners.append(expected_pid) or expected_pid == 1234,
+        daemon, "_endpoint_owned_by_profile",
+        lambda _profile, _port, _ws, _snapshot=None, expected_pid=None: expected_pid == 1234,
     )
     monkeypatch.setattr(
         daemon,
@@ -345,7 +355,102 @@ def test_automation_launch_requires_launched_pid_and_profile_endpoint(
     assert daemon.launch_automation_chrome() == (
         "ws://127.0.0.1:49231/devtools/browser/launched-profile"
     )
-    assert owners == [1234]
+
+
+def test_endpoint_ownership_binds_browser_pid_and_listener(monkeypatch, tmp_path):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    portfile = profile / "DevToolsActivePort"
+    portfile.write_text("49231\n/devtools/browser/owned\n")
+    snapshot = daemon._devtools_active_port_snapshot(profile)
+    monkeypatch.setattr(daemon, "_profile_browser_pid", lambda *_args: 4321)
+    monkeypatch.setattr(daemon, "_listener_pids", lambda _port: {4321})
+
+    assert daemon._endpoint_owned_by_profile(
+        profile, "49231", "ws://127.0.0.1:49231/devtools/browser/owned", snapshot
+    )
+    assert not daemon._endpoint_owned_by_profile(
+        profile, "49231", "ws://127.0.0.2:49231/devtools/browser/owned", snapshot
+    )
+    monkeypatch.setattr(daemon, "_listener_pids", lambda _port: {9876})
+    assert not daemon._endpoint_owned_by_profile(
+        profile, "49231", "ws://127.0.0.1:49231/devtools/browser/owned", snapshot
+    )
+
+
+def test_endpoint_ownership_rejects_replaced_active_port_file(monkeypatch, tmp_path):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    portfile = profile / "DevToolsActivePort"
+    portfile.write_text("49231\n/devtools/browser/owned\n")
+    snapshot = daemon._devtools_active_port_snapshot(profile)
+    monkeypatch.setattr(daemon, "_profile_browser_pid", lambda *_args: 4321)
+    monkeypatch.setattr(daemon, "_listener_pids", lambda _port: {4321})
+    monkeypatch.setattr(daemon, "_ws_matches_devtools_active_port", lambda *_args: True)
+    replacement = (snapshot[0], snapshot[1] + 1, *snapshot[2:])
+    monkeypatch.setattr(daemon, "_devtools_active_port_snapshot", lambda _base: replacement)
+
+    assert not daemon._endpoint_owned_by_profile(
+        profile, "49231", "ws://127.0.0.1:49231/devtools/browser/owned", snapshot
+    )
+
+
+def test_endpoint_ownership_fails_closed_without_listener_identity(monkeypatch, tmp_path):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    (profile / "DevToolsActivePort").write_text("49231\n/devtools/browser/owned\n")
+    snapshot = daemon._devtools_active_port_snapshot(profile)
+    monkeypatch.setattr(daemon, "_listener_pids", lambda _port: set())
+
+    assert not daemon._endpoint_owned_by_profile(
+        profile, "49231", "ws://127.0.0.1:49231/devtools/browser/owned", snapshot
+    )
+
+
+def test_windows_endpoint_ownership_uses_listener_pid_and_process_command(monkeypatch, tmp_path):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    (profile / "DevToolsActivePort").write_text("49231\n/devtools/browser/owned\n")
+    snapshot = daemon._devtools_active_port_snapshot(profile)
+    monkeypatch.setattr(daemon.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(daemon, "_listener_pids", lambda _port: {55})
+    monkeypatch.setattr(
+        daemon, "_process_args",
+        lambda _pid: ["chrome.exe", f"--user-data-dir={profile}"],
+    )
+
+    assert daemon._endpoint_owned_by_profile(
+        profile, "49231", "ws://127.0.0.1:49231/devtools/browser/owned", snapshot
+    )
+
+
+@pytest.mark.parametrize(
+    ("executable", "profile_arg", "expected"),
+    [("Google Chrome", "match", 77),
+     ("python", "match", None),
+     ("Google Chrome", "other", None)],
+)
+def test_profile_browser_pid_rejects_nonbrowser_and_profile_mismatch(
+    monkeypatch, tmp_path, executable, profile_arg, expected
+):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    (profile / "SingletonLock").symlink_to("host-77")
+    argument = f"--user-data-dir={profile}" if profile_arg == "match" else f"--user-data-dir={tmp_path / 'other'}"
+    monkeypatch.setattr(daemon, "_process_args", lambda _pid: [executable, argument])
+
+    assert daemon._profile_browser_pid(profile) == expected
+
+
+def test_profile_browser_pid_rejects_expected_pid_mismatch(monkeypatch, tmp_path):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    (profile / "SingletonLock").symlink_to("host-77")
+    monkeypatch.setattr(
+        daemon, "_process_args", lambda _pid: ["Google Chrome", f"--user-data-dir={profile}"]
+    )
+
+    assert daemon._profile_browser_pid(profile, expected_pid=78) is None
 
 
 @pytest.mark.parametrize(
@@ -362,7 +467,12 @@ def test_profile_process_identity_matches_user_data_dir(monkeypatch, tmp_path, c
     monkeypatch.setattr(daemon.platform, "system", lambda: "Darwin")
     monkeypatch.setattr(daemon.os, "readlink", lambda _path: "host-1234")
     observed = command.replace("/tmp/automation-profile", str(profile))
-    monkeypatch.setattr(daemon.subprocess, "check_output", lambda *_args, **_kwargs: observed)
+    def check_output(args, **_kwargs):
+        if args[0] == "lsof":
+            return "p1234\nftxt\nn/Applications/Chrome"
+        return observed
+
+    monkeypatch.setattr(daemon.subprocess, "check_output", check_output)
     assert daemon._profile_process_owns(profile) is expected
 
 

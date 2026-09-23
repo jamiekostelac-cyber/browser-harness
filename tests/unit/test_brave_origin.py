@@ -35,6 +35,13 @@ def test_origin_port_discovery_keeps_permission_gate(monkeypatch, origin_profile
     monkeypatch.delenv("BU_CDP_URL", raising=False)
     monkeypatch.setattr(daemon, "REMOTE_ID", None)
     monkeypatch.setattr(daemon, "_profile_process_owns", lambda base: base == origin_profile)
+    monkeypatch.setattr(
+        daemon, "_endpoint_owned_by_profile", lambda *_args, **_kwargs: True
+    )
+    monkeypatch.setattr(
+        daemon, "_devtools_active_port_snapshot",
+        lambda _base: (0, 1, 0, 50, b"9222\n/devtools/browser/origin\n", "9222", "/devtools/browser/origin"),
+    )
 
     def urlopen(url, **kwargs):
         assert url == "http://127.0.0.1:9222/json/version"

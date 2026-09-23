@@ -1,13 +1,25 @@
 """CDP WS holder + IPC relay (Unix socket on POSIX, TCP loopback on Windows). One daemon per BU_NAME."""
-import asyncio, ipaddress, json, os, platform, shlex, shutil, socket, subprocess, sys, time, urllib.error, urllib.request
-from urllib.parse import urlparse
+import asyncio
+import ipaddress
+import json
+import os
+import platform
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
 from collections import deque
 from pathlib import Path
+from urllib.parse import urlparse
+
+from cdp_use.client import CDPClient
 
 from . import _ipc as ipc
-from . import auth
-from . import paths
-from cdp_use.client import CDPClient
+from . import auth, paths
 
 
 def _load_env():
@@ -203,31 +215,180 @@ def browser_running_for_profile(base):
         return True  # pid exists but belongs to another user
 
 
+def _devtools_active_port_snapshot(base):
+    """Read the endpoint and filesystem identity as one validation snapshot."""
+    try:
+        path = base / "DevToolsActivePort"
+        stat = path.stat()
+        raw = path.read_bytes()
+        lines = raw.decode("utf-8", errors="strict").splitlines()
+        port = int(lines[0].strip())
+        ws_path = lines[1].strip()
+        if not 1 <= port <= 65535 or not ws_path.startswith("/devtools/browser/"):
+            return None
+        return (stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_size, raw, str(port), ws_path)
+    except (OSError, AttributeError, TypeError, UnicodeError, ValueError, IndexError):
+        return None
+
+
+def _process_args(pid):
+    """Return live process arguments using the operating system, or fail closed."""
+    try:
+        if platform.system() == "Darwin":
+            raw = subprocess.check_output(
+                ["ps", "-ww", "-p", str(pid), "-o", "command="],
+                text=True, stderr=subprocess.DEVNULL, timeout=2,
+            )
+            executable_info = subprocess.check_output(
+                ["lsof", "-a", "-p", str(pid), "-d", "txt", "-Fn"],
+                text=True, stderr=subprocess.DEVNULL, timeout=2,
+            )
+            executable = next((line[1:] for line in executable_info.splitlines()
+                               if line.startswith("n") and line[1:].startswith("/")), None)
+            if not executable or "--user-data-dir=" not in raw:
+                return None
+            return [executable, raw]
+        if platform.system() == "Windows":
+            command = (
+                "$p=Get-CimInstance Win32_Process -Filter 'ProcessId=" + str(pid) +
+                "'; ConvertTo-Json -Compress @{exe=$p.ExecutablePath; command=$p.CommandLine}"
+            )
+            record = json.loads(subprocess.check_output(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
+                text=True, stderr=subprocess.DEVNULL, timeout=3,
+            ))
+            profile_arg = re.search(
+                r"--user-data-dir=(?:\"([^\"]+)\"|(\S+))", record["command"], re.IGNORECASE
+            )
+            if not record.get("exe") or not profile_arg:
+                return None
+            return [record["exe"], "--user-data-dir=" + next(v for v in profile_arg.groups() if v)]
+        if platform.system() == "Linux":
+            executable = os.readlink(f"/proc/{pid}/exe")
+            args = [arg for arg in Path(f"/proc/{pid}/cmdline").read_bytes().decode().split("\0") if arg]
+            return [executable, *args[1:]] if executable and args else None
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+def _listener_pids(port):
+    """Find OS processes holding a TCP LISTEN socket on port; unknown is empty."""
+    try:
+        if platform.system() == "Darwin":
+            raw = subprocess.check_output(
+                ["lsof", "-nP", "-t", f"-iTCP:{int(port)}", "-sTCP:LISTEN"],
+                text=True, stderr=subprocess.DEVNULL, timeout=2,
+            )
+            return {int(line) for line in raw.splitlines() if line.strip()}
+        if platform.system() == "Windows":
+            raw = subprocess.check_output(
+                ["netstat", "-ano", "-p", "tcp"],
+                text=True, stderr=subprocess.DEVNULL, timeout=3,
+            )
+            owners = set()
+            for line in raw.splitlines():
+                fields = line.split()
+                if len(fields) >= 5 and fields[0].upper() == "TCP" and fields[3].upper() == "LISTENING":
+                    if fields[1].rsplit(":", 1)[-1] == str(int(port)):
+                        owners.add(int(fields[4]))
+            return owners
+        if platform.system() == "Linux":
+            wanted = f"{int(port):04X}"
+            inodes = set()
+            for table in (Path("/proc/net/tcp"), Path("/proc/net/tcp6")):
+                try:
+                    rows = table.read_text().splitlines()[1:]
+                except OSError:
+                    continue
+                for row in rows:
+                    fields = row.split()
+                    if len(fields) > 9 and fields[3] == "0A" and fields[1].rsplit(":", 1)[-1] == wanted:
+                        inodes.add(fields[9])
+            if not inodes:
+                return set()
+            owners = set()
+            for proc in Path("/proc").iterdir():
+                if not proc.name.isdigit():
+                    continue
+                try:
+                    if any(os.readlink(fd).startswith("socket:[") and
+                           os.readlink(fd)[8:-1] in inodes for fd in (proc / "fd").iterdir()):
+                        owners.add(int(proc.name))
+                except OSError:
+                    continue
+            return owners
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return set()
+    return set()
+
+
+def _profile_browser_pid(base, expected_pid=None):
+    """Return the verified Chromium PID for this profile, otherwise None."""
+    if platform.system() == "Windows":
+        pid = expected_pid
+        if pid is None:
+            return None
+    else:
+        try:
+            lock = os.readlink(str(Path(base) / "SingletonLock"))
+            pid = int(lock.rsplit("-", 1)[-1])
+        except (OSError, ValueError):
+            return None
+    if expected_pid is not None and pid != expected_pid:
+        return None
+    args = _process_args(pid)
+    if not args:
+        return None
+    executable = "".join(char for char in Path(args[0]).name.lower() if char.isalnum())
+    if not executable.startswith((
+        "chrome", "googlechrome", "chromium", "brave", "msedge", "microsoftedge",
+        "arc", "dia", "comet", "opera", "vivaldi", "thorium", "helium",
+    )):
+        return None
+    expected = str(Path(base).resolve())
+    if platform.system() == "Darwin":
+        if not re.search(re.escape(f"--user-data-dir={expected}") + r"(?=[\s\"']|$)", args[1]):
+            return None
+    elif not any(arg.startswith("--user-data-dir=") and
+                 str(Path(arg.split("=", 1)[1].strip("\"' ")).resolve()) == expected for arg in args):
+        return None
+    return pid
+
+
+def _endpoint_owned_by_profile(
+    base, port, ws_url, snapshot=None, expected_pid=None, expected_host="127.0.0.1"
+):
+    """Bind endpoint response, active-port file, browser PID, and listener PID."""
+    before = snapshot or _devtools_active_port_snapshot(base)
+    if not before or before[5] != str(port):
+        return False
+    listeners = _listener_pids(port)
+    if len(listeners) != 1:
+        return False
+    pid = next(iter(listeners))
+    if expected_pid is not None and pid != expected_pid:
+        return False
+    if _profile_browser_pid(base, pid) != pid:
+        return False
+    current = _devtools_active_port_snapshot(base)
+    return (_listener_pids(port) == {pid}
+            and _profile_browser_pid(base, pid) == pid
+            and before == current and _ws_matches_devtools_active_port(
+        base, str(port), ws_url, expected_host
+    ))
+
+
 def _profile_process_owns(base, expected_pid=None):
     """Verify SingletonLock's live process command line names this user-data dir."""
+    if platform.system() == "Windows":
+        return expected_pid is not None and _profile_browser_pid(base, expected_pid) == expected_pid
     try:
         target = os.readlink(str(base / "SingletonLock"))
         pid = int(target.rsplit("-", 1)[-1])
-        if expected_pid is not None and pid != expected_pid:
-            return False
-        if platform.system() == "Darwin":
-            raw = subprocess.check_output(
-                ["ps", "-p", str(pid), "-o", "command="],
-                text=True, stderr=subprocess.DEVNULL, timeout=2,
-            )
-            args = shlex.split(raw)
-        elif platform.system() == "Linux":
-            args = Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace").split("\0")
-        else:
-            return False
     except (OSError, ValueError, subprocess.SubprocessError):
         return False
-    expected = str(Path(base).resolve())
-    return any(
-        arg.startswith("--user-data-dir=")
-        and str(Path(arg.split("=", 1)[1]).resolve()) == expected
-        for arg in args
-    )
+    return _profile_browser_pid(base, expected_pid) == pid
 
 
 def supported_browser_running():
@@ -267,7 +428,7 @@ async def _silent(coro):
         pass
 
 
-def _ws_from_devtools_active_port(http_url: str, profile=None) -> str | None:
+def _ws_from_devtools_active_port(http_url: str, profile=None, snapshot=None, expected_pid=None) -> str | None:
     """Recover a 404 DevTools endpoint only when its profile process owns the endpoint."""
     p = urlparse(http_url)
     want_port = str(p.port) if p.port else ""
@@ -288,10 +449,10 @@ def _ws_from_devtools_active_port(http_url: str, profile=None) -> str | None:
         return None
     if ":" in host:  # urlparse strips IPv6 brackets; restore them for the ws:// URL
         host = f"[{host}]"
-    for base in ([profile] if profile is not None else PROFILES):
+    for base in ([profile] if profile is not None else [*PROFILES, AUTOMATION_PROFILE]):
         try:
-            active = (base / "DevToolsActivePort").read_text(encoding="utf-8", errors="replace").splitlines()
-        except OSError:
+            active = (base / "DevToolsActivePort").read_text(encoding="utf-8", errors="strict").splitlines()
+        except (OSError, UnicodeError):
             continue
         port = active[0].strip() if active else ""
         ws_path = active[1].strip() if len(active) > 1 else ""
@@ -299,14 +460,17 @@ def _ws_from_devtools_active_port(http_url: str, profile=None) -> str | None:
         if (
             port == want_port
             and ws_path.startswith("/devtools/browser/")
-            and _profile_process_owns(base)
-            and _ws_matches_devtools_active_port(base, port, ws)
+            and _endpoint_owned_by_profile(
+                base, port, ws, snapshot, expected_pid, expected_host=host.strip("[]")
+            )
         ):
             return ws
     return None
 
 
-def _ws_matches_devtools_active_port(base: Path, port: str, ws_url: str) -> bool:
+def _ws_matches_devtools_active_port(
+    base: Path, port: str, ws_url: str, expected_host="127.0.0.1"
+) -> bool:
     """Confirm /json/version belongs to this profile's active browser instance."""
     try:
         active = (base / "DevToolsActivePort").read_text(
@@ -323,6 +487,7 @@ def _ws_matches_devtools_active_port(base: Path, port: str, ws_url: str) -> bool
             and active[0].strip() == port
             and endpoint.scheme == "ws"
             and loopback
+            and (endpoint.hostname or "").lower() == expected_host.lower()
             and endpoint.username is None
             and endpoint.password is None
             and endpoint.port == int(port)
@@ -334,8 +499,40 @@ def _ws_matches_devtools_active_port(base: Path, port: str, ws_url: str) -> bool
         return False
 
 
-def _ws_owned_by_profile(port: str, ws_url: str) -> bool:
-    return any(_ws_matches_devtools_active_port(base, port, ws_url) for base in PROFILES)
+def _http_endpoint_snapshots(http_url):
+    """Capture candidate local profile endpoint identities before an HTTP probe."""
+    try:
+        parsed = urlparse(http_url)
+        host = parsed.hostname or ""
+        if (parsed.scheme != "http" or parsed.port is None or parsed.username is not None or
+                parsed.password is not None or parsed.query or parsed.fragment):
+            return []
+        try:
+            loopback = ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            loopback = host.lower() == "localhost"
+        if not loopback:
+            return []
+        return [(base, snapshot) for base in [*PROFILES, AUTOMATION_PROFILE]
+                if (snapshot := _devtools_active_port_snapshot(base))
+                and snapshot[5] == str(parsed.port)]
+    except (TypeError, ValueError):
+        return []
+
+
+def _http_endpoint_owned(http_url, ws_url, snapshots):
+    """Accept a local HTTP endpoint only when its pre-probe identity still owns it."""
+    try:
+        parsed = urlparse(http_url)
+        host = parsed.hostname or ""
+        for base, snapshot in snapshots:
+            if _endpoint_owned_by_profile(
+                base, str(parsed.port), ws_url, snapshot, expected_host=host
+            ):
+                return True
+    except (TypeError, ValueError):
+        return False
+    return False
 
 
 # macOS TCC blocks reading the default browser's profile dir, where the
@@ -405,23 +602,14 @@ def launch_automation_chrome():
     # Chrome chooses and records the actual listening port in this profile.
     # Rediscover it after daemon restarts, since AUTOMATION_PORT may have been
     # occupied when this profile was first launched.
-    try:
-        active = (AUTOMATION_PROFILE / "DevToolsActivePort").read_text(
-            encoding="utf-8", errors="replace"
-        ).splitlines()
-    except OSError:
-        active = []
+    snapshot = _devtools_active_port_snapshot(AUTOMATION_PROFILE)
+    active = [snapshot[5], snapshot[6]] if snapshot else []
     port = active[0].strip() if active else ""
-    if port.isdigit() and 1 <= int(port) <= 65535:
-        # The port file can outlive Chrome. Reuse it only when the profile's
-        # SingletonLock proves that its owning browser process is still alive,
-        # and require fresh endpoint discovery. A listener on the stale port
-        # may belong to an unrelated Chrome or another local service.
-        if (
-            _profile_process_owns(AUTOMATION_PROFILE)
-            and (ws := _json_version_ws(int(port)))
-            and _ws_matches_devtools_active_port(AUTOMATION_PROFILE, port, ws)
-        ):
+    if port.isdigit() and 1 <= int(port) <= 65535 and snapshot:
+        # The port file can outlive Chrome. Reuse it only when the live browser
+        # process and OS listener still match the profile and endpoint snapshot.
+        if ((ws := _json_version_ws(int(port))) and
+                _endpoint_owned_by_profile(AUTOMATION_PROFILE, port, ws, snapshot)):
             return ws
     binary = _automation_chrome_binary()
     if not binary:
@@ -447,11 +635,9 @@ def launch_automation_chrome():
         if child.poll() is not None:
             log("automation chrome launch exited before DevTools became available")
             return None
-        if (
-            (ws := _json_version_ws(port))
-            and _profile_process_owns(AUTOMATION_PROFILE, child.pid)
-            and _ws_matches_devtools_active_port(AUTOMATION_PROFILE, str(port), ws)
-        ):
+        snapshot = _devtools_active_port_snapshot(AUTOMATION_PROFILE)
+        if (snapshot and (ws := _json_version_ws(port)) and
+                _endpoint_owned_by_profile(AUTOMATION_PROFILE, str(port), ws, snapshot, child.pid)):
             log(f"launched dedicated automation chrome on :{port}")
             return ws
         time.sleep(0.3)
@@ -469,14 +655,22 @@ def get_ws_url():
         last_err = None
         base_url = url.rstrip("/")
         while time.time() < deadline:
+            snapshots = _http_endpoint_snapshots(url)
             try:
-                return json.loads(urllib.request.urlopen(f"{base_url}/json/version", timeout=5).read())["webSocketDebuggerUrl"]
+                ws = json.loads(urllib.request.urlopen(f"{base_url}/json/version", timeout=5).read())["webSocketDebuggerUrl"]
+                if isinstance(ws, str) and _http_endpoint_owned(url, ws, snapshots):
+                    return ws
+                last_err = RuntimeError("endpoint ownership could not be verified")
             except urllib.error.HTTPError as e:
                 last_err = e
                 if e.code == 403:
                     raise RuntimeError("permission-blocked: Chrome is reachable, but the per-session Allow remote debugging popup has not been accepted")
-                if e.code == 404 and (ws := _ws_from_devtools_active_port(url)):
-                    return ws
+                if e.code == 404:
+                    for base, snapshot in snapshots:
+                        if ws := _ws_from_devtools_active_port(
+                            url, profile=base, snapshot=snapshot
+                        ):
+                            return ws
                 time.sleep(1)
             except Exception as e:
                 last_err = e
@@ -509,6 +703,9 @@ def get_ws_url():
             ws_path = active[1].strip() if len(active) > 1 else ""
             if not port:
                 continue
+            snapshot = _devtools_active_port_snapshot(base)
+            if not snapshot or snapshot[5] != port:
+                continue
             # Resolve the live WS URL via /json/version instead of trusting the path stored
             # alongside the port in DevToolsActivePort: if Chrome was previously launched
             # with a different --user-data-dir on the same port, that file is left behind
@@ -519,7 +716,7 @@ def get_ws_url():
                         f"http://127.0.0.1:{port}/json/version", timeout=1
                     ).read()
                 )["webSocketDebuggerUrl"]
-                if isinstance(ws, str) and _ws_matches_devtools_active_port(base, port, ws):
+                if isinstance(ws, str) and _endpoint_owned_by_profile(base, port, ws, snapshot):
                     return ws
             except urllib.error.HTTPError as e:
                 if e.code == 403:
@@ -528,7 +725,7 @@ def get_ws_url():
                 # the ws path Chrome wrote to DevToolsActivePort still works.
                 if e.code == 404 and ws_path:
                     if ws := _ws_from_devtools_active_port(
-                        f"http://127.0.0.1:{port}", profile=base
+                        f"http://127.0.0.1:{port}", profile=base, snapshot=snapshot
                     ):
                         return ws
             except (OSError, KeyError, ValueError):
@@ -549,10 +746,17 @@ def get_ws_url():
             break
         time.sleep(0.2)
     for probe_port in (9222, 9223):
+        snapshots = [(base, snapshot) for base in [*PROFILES, AUTOMATION_PROFILE]
+                     if (snapshot := _devtools_active_port_snapshot(base))
+                     and snapshot[5] == str(probe_port)]
         try:
             with urllib.request.urlopen(f"http://127.0.0.1:{probe_port}/json/version", timeout=1) as r:
                 ws = json.loads(r.read())["webSocketDebuggerUrl"]
-                if isinstance(ws, str) and _ws_owned_by_profile(str(probe_port), ws):
+                owned = isinstance(ws, str) and any(
+                    _endpoint_owned_by_profile(base, str(probe_port), ws, snapshot)
+                    for base, snapshot in snapshots
+                )
+                if owned:
                     return ws
         except urllib.error.HTTPError as e:
             if e.code == 403:
