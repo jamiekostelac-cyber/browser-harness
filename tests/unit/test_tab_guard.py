@@ -20,7 +20,7 @@ RUN_ID_3 = "123e4567-e89b-42d3-a456-426614174002"
 def _fake_send(current=FOREIGN, created="MINE", session="SESSION-MINE", target_type="page"):
     def send(req, response_timeout=None):
         if req.get("meta") == "guard_context":
-            return {"target_id": current["targetId"], "session_id": session}
+            return {"target_id": current["targetId"], "session_id": session, "url": current.get("url", "")}
         if req.get("meta") == "current_tab":
             return {**current, "tab_guard": "ok"}
         method = req.get("method")
@@ -29,7 +29,7 @@ def _fake_send(current=FOREIGN, created="MINE", session="SESSION-MINE", target_t
         if method == "Target.attachToTarget":
             return {"result": {"sessionId": session}}
         if method == "Target.getTargetInfo":
-            return {"result": {"targetInfo": {"type": target_type}}}
+            return {"result": {"targetInfo": {"type": target_type, "url": current.get("url", "")}}}
         return {"result": {}}
     return send
 
@@ -129,6 +129,79 @@ def test_allows_enumerating_tabs_without_attaching(guard):
     helpers.cdp("Target.getTargets")
     with pytest.raises(helpers.TabGuardRefused):
         helpers.cdp("Target.getTargetInfo", targetId="FOREIGN")
+
+
+@pytest.mark.parametrize("method,params", [
+    ("Target.createTarget", {"url": "chrome://settings"}),
+    ("Target.createTarget", {"url": "devtools://devtools/bundled/inspector.html"}),
+    ("Target.createTarget", {"url": "browser://settings"}),
+    ("Target.createTarget", {"url": "javascript:alert(1)"}),
+    ("Target.createTarget", {"url": "file:///etc/passwd"}),
+    ("Target.createTarget", {"url": "data:text/html,<h1>x</h1>"}),
+    ("Target.createTarget", {"url": "ftp://example.com/file"}),
+    ("Page.navigate", {"url": "chrome://settings"}),
+    ("Page.navigate", {"url": "devtools://devtools/bundled/inspector.html"}),
+    ("Page.navigate", {"url": "browser://settings"}),
+    ("Page.navigate", {"url": "javascript:alert(1)"}),
+    ("Page.navigate", {"url": "file:///etc/passwd"}),
+    ("Page.navigate", {"url": "data:text/html,<h1>x</h1>"}),
+    ("Page.navigate", {"url": "ftp://example.com/file"}),
+])
+def test_guard_rejects_privileged_urls_before_transport(owning, monkeypatch, method, params):
+    calls = []
+    monkeypatch.setattr(helpers, "_send", lambda req, **kwargs: calls.append(req))
+    with pytest.raises(helpers.TabGuardRefused):
+        helpers.cdp(method, **params)
+    assert calls == []
+
+
+@pytest.mark.parametrize("url", [
+    "chrome://settings", "devtools://devtools/bundled/inspector.html",
+    "browser://settings", "javascript:alert(1)", "file:///etc/passwd",
+    "data:text/html,<h1>x</h1>", "ftp://example.com/file",
+])
+def test_nested_navigation_rejects_privileged_urls_before_transport(owning, monkeypatch, url):
+    calls = []
+    monkeypatch.setattr(helpers, "_send", lambda req, **kwargs: calls.append(req))
+    with pytest.raises(helpers.TabGuardRefused):
+        helpers.cdp(
+            "Target.sendMessageToTarget",
+            sessionId="SESSION-MINE",
+            message=json.dumps({"id": 1, "method": "Page.navigate", "params": {"url": url}}),
+        )
+    assert calls == []
+
+
+def test_guard_rejects_interaction_with_privileged_current_target(owning, monkeypatch):
+    calls = []
+    fake = _fake_send(current={"targetId": "MINE", "url": "chrome://settings"})
+    def send(req, **kwargs):
+        calls.append(req)
+        return fake(req, **kwargs)
+    monkeypatch.setattr(helpers, "_send", send)
+    with pytest.raises(helpers.TabGuardRefused):
+        helpers.cdp("Runtime.evaluate", expression="document.title")
+    assert not any(req.get("method") for req in calls)
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_guard_rejects_explicit_owned_session_on_privileged_current_target(owning, monkeypatch, nested):
+    calls = []
+    fake = _fake_send(current={"targetId": "MINE", "url": "chrome://settings"})
+    def send(req, **kwargs):
+        calls.append(req)
+        return fake(req, **kwargs)
+    monkeypatch.setattr(helpers, "_send", send)
+    with pytest.raises(helpers.TabGuardRefused):
+        if nested:
+            helpers.cdp(
+                "Target.sendMessageToTarget",
+                sessionId="SESSION-MINE",
+                message=json.dumps({"id": 1, "method": "Runtime.evaluate", "params": {"expression": "1"}}),
+            )
+        else:
+            helpers.cdp("Runtime.evaluate", session_id="SESSION-MINE", expression="document.title")
+    assert not any(req.get("method") for req in calls)
 
 
 def test_refuses_non_page_targets_without_owned_ancestry(owning, monkeypatch):
@@ -386,7 +459,7 @@ def test_nested_owned_page_method_remains_allowed(owning):
 
 def test_owned_iframe_js_proves_ancestry_and_detaches(owning, monkeypatch):
     calls = []
-    base = _fake_send(current={"targetId": "MINE"}, target_type="iframe")
+    base = _fake_send(current={"targetId": "MINE", "url": "https://example.com/"}, target_type="iframe")
     def send(req, **kw):
         calls.append(req)
         if req.get("method") == "Page.getFrameTree":
@@ -425,7 +498,7 @@ def test_implicit_dispatch_is_pinned_to_validated_session(owning, monkeypatch):
         calls.append(req)
         if req.get("meta") == "guard_context":
             # Another run switches the daemon immediately after this snapshot.
-            return {"target_id": "MINE", "session_id": "SESSION-MINE"}
+            return {"target_id": "MINE", "session_id": "SESSION-MINE", "url": "https://example.com/"}
         assert req["session_id"] == "SESSION-MINE"
         return {"result": {}}
     monkeypatch.setattr(helpers, "_send", send)
@@ -624,6 +697,20 @@ def test_event_drain_filters_owned_sessions_and_preserves_foreign_events(daemon_
     assert helpers.drain_events() == []
 
 
+def test_legacy_target_reply_uses_params_session_id_for_guarded_event_filter(daemon_bridge):
+    d, _ = daemon_bridge
+    owned = {"method": "Target.receivedMessageFromTarget",
+             "params": {"sessionId": "SESSION-MINE", "message": "owned"},
+             "session_id": None}
+    foreign = {"method": "Target.receivedMessageFromTarget",
+               "params": {"sessionId": "FOREIGN-SESSION", "message": "foreign"},
+               "session_id": None}
+    d._record_event(owned["method"], owned["params"], owned["session_id"])
+    d._record_event(foreign["method"], foreign["params"], foreign["session_id"])
+    assert helpers.drain_events() == [owned]
+    assert list(d.events) == [foreign]
+
+
 def test_context_wide_event_subscription_is_refused_and_foreign_events_stay_hidden(daemon_bridge):
     d, calls = daemon_bridge
     helpers.cdp("Network.enable")
@@ -673,10 +760,10 @@ def test_pinned_request_never_uses_new_current_session_or_recovers_there(daemon_
         raise RuntimeError("Session with given id not found")
     d.cdp.send_raw = stale
     count = len(calls)
-    with pytest.raises(RuntimeError, match="Session with given id not found"):
+    with pytest.raises(helpers.TabGuardRefused, match="URL"):
         helpers.cdp("Page.navigate", url="https://owned.example/")
     assert len(calls) == count + 1
-    assert calls[-1][2] == "SESSION-MINE"
+    assert calls[-1][0] == "Target.getTargetInfo"
 
 
 def test_guarded_switch_does_not_disable_foreign_session(daemon_bridge, monkeypatch):
@@ -685,7 +772,8 @@ def test_guarded_switch_does_not_disable_foreign_session(daemon_bridge, monkeypa
     d.target_id, d.session = "FOREIGN", "FOREIGN-SESSION"
     helpers._read_meta("set_session", target_id="MINE", session_id="SESSION-MINE")
     assert d.target_id == "MINE"
-    assert all(sid == "SESSION-MINE" for _, _, sid in calls)
+    assert all(sid in {None, "SESSION-MINE"} for _, _, sid in calls)
+    assert not any(sid == "FOREIGN-SESSION" for _, _, sid in calls)
 
 
 def test_guarded_switch_rejects_foreign_session(daemon_bridge):
@@ -693,7 +781,7 @@ def test_guarded_switch_rejects_foreign_session(daemon_bridge):
     with pytest.raises(helpers.TabGuardRefused):
         helpers._read_meta("set_session", target_id="MINE", session_id="FOREIGN-SESSION")
     assert d.session == "SESSION-MINE"
-    assert calls == []
+    assert not any(sid == "FOREIGN-SESSION" for _, _, sid in calls)
 
 
 def test_old_daemon_refused_before_session_switch(owning, monkeypatch):
@@ -774,6 +862,31 @@ def test_run_reset_removes_its_record(owning):
     assert not path.exists()
     assert helpers._owned_ids() == set()
     assert helpers._owned_sessions() == set()
+
+
+def test_run_reset_propagates_lock_failure(guard, monkeypatch):
+    def fail(_path):
+        raise OSError("lock failed")
+    monkeypatch.setattr(helpers, "_ownership_lock", fail)
+    with pytest.raises(OSError, match="lock failed"):
+        helpers.tab_guard_reset()
+
+
+def test_run_reset_propagates_unlink_failure(guard, monkeypatch):
+    class FailingPath:
+        def unlink(self):
+            raise PermissionError("unlink failed")
+
+    class NoopLock:
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(helpers, "_owned_path", lambda: FailingPath())
+    monkeypatch.setattr(helpers, "_ownership_lock", lambda _path: NoopLock())
+    with pytest.raises(PermissionError, match="unlink failed"):
+        helpers.tab_guard_reset()
 
 
 @pytest.mark.parametrize("tool", ["browser_page_info", "browser_current_tab"])

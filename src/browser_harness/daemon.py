@@ -674,7 +674,11 @@ class Daemon:
         if meta == "drain_events":
             out, remaining = [], deque(maxlen=BUF)
             for event in self.events:
-                if event.get("session_id") and event["session_id"] in sessions:
+                event_session = event.get("session_id")
+                if (not event_session and event.get("method") == "Target.receivedMessageFromTarget"
+                        and isinstance(event.get("params"), dict)):
+                    event_session = event["params"].get("sessionId")
+                if event_session and event_session in sessions:
                     out.append(event)
                 else:
                     remaining.append(event)
@@ -704,9 +708,18 @@ class Daemon:
             return {"error": "unauthorized"}
         meta = req.get("meta")
         if meta == "guard_context":
-            # No await between reading these fields: clients pin subsequent
-            # CDP calls to this session instead of using the mutable default.
-            return {"target_id": self.target_id, "session_id": self.session, "tab_guard": "ok"}
+            # Return the current target URL with the session snapshot so guarded
+            # clients can reject privileged targets before their next dispatch.
+            context = {"target_id": self.target_id, "session_id": self.session, "tab_guard": "ok"}
+            if self.target_id and self.cdp:
+                try:
+                    info = (await self.cdp.send_raw(
+                        "Target.getTargetInfo", {"targetId": self.target_id}
+                    )).get("targetInfo", {})
+                    context["url"] = info.get("url", "")
+                except Exception:
+                    context["url"] = None
+            return context
         if "tab_guard" in req and meta != "set_session":
             return await self._guarded_read(req)
         # Liveness probe — lets clients confirm the listener is actually this

@@ -147,6 +147,48 @@ def _guard_scope_reason(method):
     return None
 
 
+def _url_scope_reason(url, required=False):
+    if url is None or url == "":
+        return "URL is required" if required else None
+    if not isinstance(url, str):
+        return "URL must be a string"
+    lowered = url.lower()
+    if lowered == "about:blank" or lowered.startswith("about:blank#"):
+        return None
+    parsed = urlparse(url)
+    if parsed.scheme.lower() in {"http", "https"} and parsed.netloc:
+        return None
+    return "URL scheme is unavailable under the tab guard"
+
+
+def _url_scope_check(method, params):
+    if method == "Target.createTarget":
+        return _url_scope_reason(params.get("url"))
+    if method == "Page.navigate":
+        return _url_scope_reason(params.get("url"), required=True)
+    return None
+
+
+def _validate_context_url(method, params, session_id, context):
+    if not isinstance(context, dict) or context.get("session_id") != session_id:
+        return
+    if "url" not in context:
+        _refuse(method, f"session:{session_id}", params.get("url", ""),
+                "daemon did not provide the attached target URL (failing closed)")
+    url_reason = _url_scope_reason(context.get("url"), required=True)
+    if url_reason:
+        _refuse(method, f"session:{session_id}", context.get("url", ""), url_reason)
+
+
+def _check_session_target_url(method, params, session_id):
+    try:
+        context = _send({"meta": "guard_context"})
+    except Exception:
+        _refuse(method, f"session:{session_id}", params.get("url", ""),
+                "attached target URL could not be read (failing closed)")
+    _validate_context_url(method, params, session_id, context)
+
+
 def _tab_guard_on():
     return os.environ.get("BH_TAB_GUARD") == "1"
 
@@ -276,13 +318,11 @@ def tab_guard_reset():
     if not _tab_guard_on():
         return
     path = _owned_path()
-    try:
-        with _ownership_lock(path):
+    with _ownership_lock(path):
+        try:
             path.unlink()
-    except FileNotFoundError:
-        pass
-    except Exception:
-        pass
+        except FileNotFoundError:
+            pass
 
 
 def _checked_session(method, params):
@@ -293,6 +333,7 @@ def _checked_session(method, params):
         context = {}
     context = context if isinstance(context, dict) else {}
     target_id, sid = context.get("target_id"), context.get("session_id")
+    _validate_context_url(method, params, sid, context)
     if (isinstance(target_id, str) and target_id in _owned_ids()
             and isinstance(sid, str) and sid and sid in _owned_sessions()):
         return sid
@@ -308,7 +349,10 @@ def _is_owned_iframe(target_id):
     """
     try:
         info = _send({"method": "Target.getTargetInfo", "params": {"targetId": target_id}, "session_id": None})
-        if info.get("result", {}).get("targetInfo", {}).get("type") != "iframe":
+        target_info = info.get("result", {}).get("targetInfo", {})
+        if target_info.get("type") != "iframe":
+            return False
+        if _url_scope_reason(target_info.get("url")):
             return False
         sid = _checked_session("Target.attachToTarget", {})
         tree = _send({"method": "Page.getFrameTree", "params": {}, "session_id": sid})["result"]["frameTree"]
@@ -344,6 +388,9 @@ def _tab_guard_check(method, params, session_id=None):
     if not _tab_guard_on():
         return session_id
     _run_id()
+    url_reason = _url_scope_check(method, params)
+    if url_reason:
+        _refuse(method, params.get("targetId"), params.get("url", ""), url_reason)
     scope_reason = _guard_scope_reason(method)
     if scope_reason:
         _refuse(method, params.get("targetId"), params.get("url", ""), scope_reason)
@@ -361,12 +408,18 @@ def _tab_guard_check(method, params, session_id=None):
                 message = json.loads(params.get("message", ""))
                 nested_method = message["method"]
                 nested_scope_reason = _guard_scope_reason(nested_method) if isinstance(nested_method, str) else None
+                raw_nested_params = message.get("params", {})
+                nested_params = {} if raw_nested_params is None else raw_nested_params
+                nested_url_reason = (_url_scope_check(nested_method, nested_params)
+                                     if isinstance(nested_method, str) and isinstance(nested_params, dict)
+                                     else "invalid nested params")
                 if (not isinstance(message, dict) or not isinstance(nested_method, str)
                         or nested_method.startswith("Target.") or nested_scope_reason
-                        or "sessionId" in message):
+                        or nested_url_reason or "sessionId" in message):
                     raise ValueError("nested routing")
             except (ValueError, KeyError, TypeError):
                 _refuse(method, f"session:{sid}", "", "invalid or nested target-routing message")
+        _check_session_target_url(method, params, sid)
         return
 
     if method in _TARGET_SCOPED_METHODS:
@@ -387,6 +440,7 @@ def _tab_guard_check(method, params, session_id=None):
         # Validating the daemon's CURRENT target instead would check one target
         # and then dispatch into another.
         if session_id and session_id in _owned_sessions():
+            _check_session_target_url(method, params, session_id)
             return session_id
         _refuse(method, f"session:{session_id}", params.get("url", ""), "session was not attached by this run")
 

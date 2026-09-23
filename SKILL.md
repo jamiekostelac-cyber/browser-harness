@@ -59,8 +59,10 @@ PY
   Leave it unset for interactive work, where driving a tab the human already
   opened is the point.
   `BH_TAB_GUARD_RUN` is required and must be a fresh canonical UUID4 generated
-  for each run. Human-readable job IDs and reused IDs are refused before any
-  ownership file is opened. Callers must generate a fresh UUID4 for each run.
+  for each run. Human-readable job IDs and other low-entropy IDs are refused
+  before any ownership file is opened. UUID4 freshness is a caller contract, not
+  a mechanically enforced property: reusing a UUID4 intentionally reopens that
+  run's ownership record. Callers must generate a fresh UUID4 for each run.
   Ownership is scoped to its full value and the daemon,
   so distinct runs cannot consume each other's list. Ownership is recorded only
   while the guard is enabled, in private files. Enabling it later does not claim
