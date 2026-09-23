@@ -1390,7 +1390,7 @@ def test_guard_reset_suppresses_inflight_dispatch_result(daemon_bridge):
     assert "private result" not in json.dumps(result)
 
 
-@pytest.mark.parametrize("change", ["reset", "navigation"])
+@pytest.mark.parametrize("change", ["reset", "navigation", "membership", "mapping", "live_url"])
 def test_dispatch_result_is_suppressed_if_authorization_changes_during_final_metadata(
     daemon_bridge, change
 ):
@@ -1408,6 +1408,8 @@ def test_dispatch_result_is_suppressed_if_authorization_changes_during_final_met
                 entered.set()
                 await release.wait()
             url = d._document_state.get("SESSION-MINE", {}).get("document_url", "https://owned.example/")
+            if change == "live_url" and info_calls == 2:
+                url = "https://replacement.example/"
             return {"targetInfo": {"targetId": "MINE", "url": url}}
         return {"value": "private-after-await"}
 
@@ -1418,11 +1420,15 @@ def test_dispatch_result_is_suppressed_if_authorization_changes_during_final_met
         await entered.wait()
         if change == "reset":
             await d.handle({"meta": "tab_guard_reset", "tab_guard_run": RUN_ID})
-        else:
+        elif change == "navigation":
             d._document_state["SESSION-MINE"].update({
                 "generation": 1, "document_url": "https://next.example/",
                 "url": "https://next.example/",
             })
+        elif change == "membership":
+            d._guarded_sessions.discard("SESSION-MINE")
+        elif change == "mapping":
+            d._session_targets["SESSION-MINE"] = "OTHER-TARGET"
         release.set()
         return await pending
 
