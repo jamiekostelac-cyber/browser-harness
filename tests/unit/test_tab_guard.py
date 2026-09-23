@@ -31,7 +31,11 @@ def _fake_send(current=FOREIGN, created="MINE", session="SESSION-MINE", target_t
         if req.get("meta") == "tab_guard_reset":
             return {"tab_guard": "ok", "tab_guard_run": req.get("tab_guard_run")}
         if req.get("meta") == "guard_context":
-            return {"target_id": current["targetId"], "session_id": session, "url": current.get("url", "")}
+            target_id = req.get("target_id", current["targetId"])
+            return {"target_id": target_id,
+                    "session_id": session if target_id == current["targetId"] else None,
+                    "url": current.get("url", ""), "tab_guard": "ok",
+                    "tab_guard_epoch": 0, "document_generation": 0}
         if req.get("meta") == "current_tab":
             return {**current, "tab_guard": "ok"}
         method = req.get("method")
@@ -269,11 +273,14 @@ def test_guarded_new_tab_skips_unowned_unmark_and_attaches_fresh_target(guard, m
     def send(req, **kwargs):
         requests.append(req)
         if req.get("meta") == "guard_context":
+            target_id = req.get("target_id", current["targetId"])
             return {
-                "target_id": current["targetId"],
-                "session_id": "SESSION-MINE",
+                "target_id": target_id,
+                "session_id": "SESSION-MINE" if target_id == current["targetId"] else None,
                 "url": current.get("url", ""),
                 "tab_guard": "ok",
+                "tab_guard_epoch": 0,
+                "document_generation": 0,
             }
         if req.get("meta") == "set_session":
             current.update({"targetId": "MINE", "url": "about:blank", "title": ""})
@@ -509,6 +516,37 @@ def test_send_message_to_owned_session_works(owning):
                 message=json.dumps({"id": 1, "method": "Runtime.evaluate", "params": {"expression": "1"}}))
 
 
+@pytest.mark.parametrize("nested", [False, True])
+def test_guarded_dispatch_carries_run_session_target_epoch_and_generation(owning, monkeypatch, nested):
+    calls = []
+
+    def send(req, **kwargs):
+        calls.append(req)
+        if req.get("meta") == "guard_context":
+            return {
+                "target_id": "MINE", "session_id": "SESSION-MINE",
+                "url": "https://example.com/", "tab_guard": "ok",
+                "tab_guard_epoch": 7, "document_generation": 3,
+            }
+        return {"result": {}}
+
+    monkeypatch.setattr(helpers, "_send", send)
+    if nested:
+        helpers.cdp(
+            "Target.sendMessageToTarget",
+            sessionId="SESSION-MINE",
+            message=json.dumps({"id": 11, "method": "Runtime.evaluate", "params": {"expression": "1"}}),
+        )
+    else:
+        helpers.cdp("Runtime.evaluate", session_id="SESSION-MINE", expression="1")
+    dispatched = next(req for req in calls if req.get("method"))
+    assert dispatched["tab_guard_run"] == RUN_ID
+    assert dispatched["tab_guard_target_id"] == "MINE"
+    assert dispatched["tab_guard_session_id"] == "SESSION-MINE"
+    assert dispatched["tab_guard_epoch"] == 7
+    assert dispatched["tab_guard_document_generation"] == 3
+
+
 def test_nested_message_cannot_route_to_foreign_target(owning):
     with pytest.raises(helpers.TabGuardRefused):
         helpers.cdp("Target.sendMessageToTarget", sessionId="SESSION-MINE",
@@ -629,7 +667,8 @@ def test_implicit_dispatch_is_pinned_to_validated_session(owning, monkeypatch):
         calls.append(req)
         if req.get("meta") == "guard_context":
             # Another run switches the daemon immediately after this snapshot.
-            return {"target_id": "MINE", "session_id": "SESSION-MINE", "url": "https://example.com/"}
+            return {"target_id": "MINE", "session_id": "SESSION-MINE", "url": "https://example.com/",
+                    "tab_guard": "ok", "tab_guard_epoch": 0, "document_generation": 0}
         assert req["session_id"] == "SESSION-MINE"
         return {"result": {}}
     monkeypatch.setattr(helpers, "_send", send)
@@ -764,6 +803,7 @@ def daemon_bridge(owning, monkeypatch):
     d.target_id, d.session = "MINE", "SESSION-MINE"
     d._session_targets["SESSION-MINE"] = "MINE"
     d._guard_policy_active = True
+    d._guarded_run_id = RUN_ID
     d._guarded_sessions = {"SESSION-MINE"}
     d._guarded_targets = {"MINE"}
     d._document_state["SESSION-MINE"] = {
@@ -808,8 +848,12 @@ def test_metadata_helpers_still_read_owned_page_and_dialog(daemon_bridge):
     d, _ = daemon_bridge
     assert helpers.current_tab()["targetId"] == "MINE"
     assert helpers.page_info()["url"] == "https://owned.example/"
-    d._record_event("Page.javascriptDialogOpening", {"message": "owned"}, "SESSION-MINE")
-    assert helpers.page_info() == {"dialog": {"message": "owned"}}
+    d._record_event("Page.javascriptDialogOpening", {
+        "message": "owned", "url": "https://owned.example/", "frameId": "FRAME-MINE"}, "SESSION-MINE")
+    assert d.dialog == {"message": "owned", "url": "https://owned.example/",
+                        "frameId": "FRAME-MINE"}
+    assert helpers.page_info() == {"dialog": {
+        "message": "owned", "url": "https://owned.example/", "frameId": "FRAME-MINE"}}
 
 
 def test_guarded_metadata_and_switch_reject_privileged_current_url(daemon_bridge, monkeypatch):
@@ -839,9 +883,13 @@ def test_foreign_dialog_does_not_leak_when_current_tab_is_owned(daemon_bridge):
 
 def test_foreign_dialog_close_cannot_clear_owned_dialog(daemon_bridge):
     d, _ = daemon_bridge
-    d._record_event("Page.javascriptDialogOpening", {"message": "owned"}, "SESSION-MINE")
+    d._record_event("Page.javascriptDialogOpening", {
+        "message": "owned", "url": "https://owned.example/", "frameId": "FRAME-MINE"}, "SESSION-MINE")
+    assert d.dialog == {"message": "owned", "url": "https://owned.example/",
+                        "frameId": "FRAME-MINE"}
     d._record_event("Page.javascriptDialogClosed", {}, "FOREIGN-SESSION")
-    assert helpers.page_info() == {"dialog": {"message": "owned"}}
+    assert helpers.page_info() == {"dialog": {
+        "message": "owned", "url": "https://owned.example/", "frameId": "FRAME-MINE"}}
 
 
 def test_event_drain_filters_owned_sessions_and_preserves_foreign_events(daemon_bridge):
@@ -1158,6 +1206,11 @@ def test_event_drain_hides_owned_session_without_target_proof(daemon_bridge):
 
 def test_legacy_target_reply_uses_params_session_id_for_guarded_event_filter(daemon_bridge):
     d, _ = daemon_bridge
+    d._legacy_commands[("SESSION-MINE", 1)] = {
+        "run_id": RUN_ID, "epoch": d._authorization_epoch, "generation": 0,
+        "target_id": "MINE",
+        "document_url": "https://owned.example/", "session_id": "SESSION-MINE",
+    }
     owned = {"method": "Target.receivedMessageFromTarget",
              "params": {"sessionId": "SESSION-MINE", "message": json.dumps({"id": 1, "result": {}})},
              "session_id": None}
@@ -1168,6 +1221,242 @@ def test_legacy_target_reply_uses_params_session_id_for_guarded_event_filter(dae
     d._record_event(foreign["method"], foreign["params"], foreign["session_id"])
     assert helpers.drain_events() == [owned]
     assert list(d.events) == []
+
+
+def _guarded_dispatch_request(d, method, params, *, command_session=None):
+    session = command_session or "SESSION-MINE"
+    state = d._document_state[session]
+    return {
+        "method": method,
+        "params": params,
+        "session_id": None if method.startswith("Target.") else session,
+        "tab_guard": {"tabs": [d._session_targets[session]], "sessions": [session]},
+        "tab_guard_run": d._guarded_run_id,
+        "tab_guard_epoch": d._authorization_epoch,
+        "tab_guard_target_id": d._session_targets[session],
+        "tab_guard_session_id": session,
+        "tab_guard_document_generation": state["generation"],
+    }
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_daemon_rejects_dispatch_snapshots_stale_after_navigation(daemon_bridge, nested):
+    d, calls = daemon_bridge
+    if nested:
+        request = _guarded_dispatch_request(d, "Target.sendMessageToTarget", {
+            "sessionId": "SESSION-MINE",
+            "message": json.dumps({"id": 901, "method": "Runtime.evaluate", "params": {"expression": "1"}}),
+        })
+    else:
+        request = _guarded_dispatch_request(d, "Runtime.evaluate", {"expression": "1"})
+    d._record_event("Page.frameNavigated", {"frame": {
+        "id": "FRAME-NEXT", "loaderId": "LOADER-NEXT", "url": "https://next.example/",
+    }}, "SESSION-MINE")
+    response = asyncio.run(d.handle(request))
+    assert "stale" in response["error"]
+    assert not any(call[0] == ("Target.sendMessageToTarget" if nested else "Runtime.evaluate")
+                   for call in calls)
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_daemon_last_state_check_rejects_navigation_race_before_transport(daemon_bridge, nested):
+    d, calls = daemon_bridge
+    request = (_guarded_dispatch_request(d, "Target.sendMessageToTarget", {
+        "sessionId": "SESSION-MINE",
+        "message": json.dumps({"id": 905, "method": "Runtime.evaluate",
+                                "params": {"expression": "1"}}),
+    }) if nested else _guarded_dispatch_request(d, "Runtime.evaluate", {"expression": "1"}))
+    original = d._validate_dispatch_identity
+
+    async def validate_then_navigate(*args, **kwargs):
+        identity = await original(*args, **kwargs)
+        if identity is not None:
+            d._record_event("Page.frameNavigated", {"frame": {
+                "id": "FRAME-RACE", "loaderId": "LOADER-RACE", "url": "https://race.example/",
+            }}, "SESSION-MINE")
+        return identity
+
+    d._validate_dispatch_identity = validate_then_navigate
+    response = asyncio.run(d.handle(request))
+    assert response == {"error": "tab guard authorization is stale or invalid"}
+    assert not any(call[0] == ("Target.sendMessageToTarget" if nested else "Runtime.evaluate")
+                   for call in calls)
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_daemon_last_state_check_rejects_reset_race_before_transport(daemon_bridge, nested):
+    d, calls = daemon_bridge
+    request = (_guarded_dispatch_request(d, "Target.sendMessageToTarget", {
+        "sessionId": "SESSION-MINE",
+        "message": json.dumps({"id": 906, "method": "Runtime.evaluate",
+                                "params": {"expression": "1"}}),
+    }) if nested else _guarded_dispatch_request(d, "Runtime.evaluate", {"expression": "1"}))
+    original = d._validate_dispatch_identity
+
+    async def validate_then_revoke(*args, **kwargs):
+        identity = await original(*args, **kwargs)
+        if identity is not None:
+            d._authorization_epoch += 1
+            d._guarded_run_id = None
+        return identity
+
+    d._validate_dispatch_identity = validate_then_revoke
+    response = asyncio.run(d.handle(request))
+    assert response == {"error": "tab guard authorization is stale or invalid"}
+    assert not any(call[0] == ("Target.sendMessageToTarget" if nested else "Runtime.evaluate")
+                   for call in calls)
+
+
+def test_daemon_rejects_foreign_detach_session_before_transport(daemon_bridge):
+    d, calls = daemon_bridge
+    request = _guarded_dispatch_request(d, "Target.detachFromTarget", {"sessionId": "FOREIGN-SESSION"})
+    response = asyncio.run(d.handle(request))
+    assert response == {"error": "tab guard authorization is stale or invalid"}
+    assert not any(call[0] == "Target.detachFromTarget" for call in calls)
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_daemon_scope_policy_rejects_context_wide_dispatch_before_transport(daemon_bridge, nested):
+    d, calls = daemon_bridge
+    if nested:
+        request = _guarded_dispatch_request(d, "Target.sendMessageToTarget", {
+            "sessionId": "SESSION-MINE",
+            "message": json.dumps({"id": 907, "method": "Storage.getCookies", "params": {}}),
+        })
+        forbidden = "Target.sendMessageToTarget"
+    else:
+        request = _guarded_dispatch_request(d, "Storage.getCookies", {})
+        forbidden = "Storage.getCookies"
+    response = asyncio.run(d.handle(request))
+    assert response == {"error": "tab guard authorization is stale or invalid"}
+    assert not any(call[0] == forbidden for call in calls)
+
+
+def test_active_guard_rejects_dispatch_with_identity_omitted(daemon_bridge):
+    d, calls = daemon_bridge
+    response = asyncio.run(d.handle({
+        "method": "Runtime.evaluate", "params": {"expression": "1"},
+        "session_id": "SESSION-MINE",
+    }))
+    assert response == {"error": "tab guard authorization is stale or invalid"}
+    assert not any(call[0] == "Runtime.evaluate" for call in calls)
+
+
+def test_dispatch_rejects_live_target_url_changed_since_snapshot(daemon_bridge):
+    d, calls = daemon_bridge
+    request = _guarded_dispatch_request(d, "Runtime.evaluate", {"expression": "1"})
+    original = d.cdp.send_raw
+
+    async def changed_url(method, params=None, session_id=None):
+        if method == "Target.getTargetInfo":
+            calls.append((method, params, session_id))
+            return {"targetInfo": {"targetId": "MINE", "url": "https://new.example/"}}
+        return await original(method, params, session_id)
+
+    d.cdp.send_raw = changed_url
+    response = asyncio.run(d.handle(request))
+    assert "stale" in response["error"]
+    assert not any(call[0] == "Runtime.evaluate" for call in calls)
+
+
+def test_guard_reset_suppresses_inflight_dispatch_result(daemon_bridge):
+    d, calls = daemon_bridge
+    request = _guarded_dispatch_request(d, "Runtime.evaluate", {"expression": "1"})
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def blocked_send(method, params=None, session_id=None):
+        calls.append((method, params, session_id))
+        if method == "Target.getTargetInfo":
+            return {"targetInfo": {"targetId": "MINE", "url": "https://owned.example/"}}
+        entered.set()
+        await release.wait()
+        return {"result": {"value": "private result"}}
+
+    d.cdp.send_raw = blocked_send
+
+    async def run():
+        pending = asyncio.create_task(d.handle(request))
+        await entered.wait()
+        reset = await d.handle({"meta": "tab_guard_reset", "tab_guard_run": RUN_ID})
+        release.set()
+        return reset, await pending
+
+    reset, result = asyncio.run(run())
+    assert reset["tab_guard"] == "ok"
+    assert result == {"error": "tab guard authorization was revoked during dispatch"}
+    assert "private result" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("payload", [
+    "{bad json", json.dumps({"id": 999, "result": {"secret": "unknown"}}),
+    json.dumps({"id": 1, "result": {"secret": "malformed correlation"}}),
+    json.dumps({"id": True, "result": {"secret": "boolean id"}}),
+])
+def test_legacy_replies_without_current_outstanding_authorization_are_dropped(daemon_bridge, payload):
+    d, _ = daemon_bridge
+    event = {"sessionId": "SESSION-MINE", "message": payload}
+    d._record_event("Target.receivedMessageFromTarget", event, None)
+    assert helpers.drain_events() == []
+
+
+def test_legacy_reply_is_dropped_after_its_authorized_document_navigates(daemon_bridge):
+    d, _ = daemon_bridge
+    identity = {
+        "run_id": RUN_ID, "epoch": d._authorization_epoch, "generation": 0,
+        "document_url": "https://owned.example/", "session_id": "SESSION-MINE",
+    }
+    d._remember_legacy_command(identity, {"message": json.dumps({
+        "id": 903, "method": "Runtime.evaluate", "params": {"expression": "1"},
+    })})
+    d._record_event("Page.frameNavigated", {"frame": {
+        "id": "FRAME-NEXT", "loaderId": "LOADER-NEXT", "url": "https://next.example/",
+    }}, "SESSION-MINE")
+    d._record_event("Target.receivedMessageFromTarget", {
+        "sessionId": "SESSION-MINE", "message": json.dumps({"id": 903, "result": {"secret": "late"}}),
+    }, None)
+    assert "late" not in json.dumps(helpers.drain_events())
+
+
+def test_nested_legacy_dispatch_registers_exact_authorized_reply(daemon_bridge):
+    d, _ = daemon_bridge
+    helpers.cdp("Target.sendMessageToTarget", sessionId="SESSION-MINE",
+                message=json.dumps({"id": 904, "method": "Runtime.evaluate",
+                                    "params": {"expression": "1"}}))
+    d._record_event("Target.receivedMessageFromTarget", {
+        "sessionId": "SESSION-MINE",
+        "message": json.dumps({"id": 904, "result": {"value": 1}}),
+    }, None)
+    events = helpers.drain_events()
+    assert len(events) == 1
+    assert json.loads(events[0]["params"]["message"]) == {"id": 904, "result": {"value": 1}}
+
+
+def test_dialog_and_subframe_events_require_current_document_provenance(daemon_bridge):
+    d, _ = daemon_bridge
+    d._record_event("Page.javascriptDialogOpening", {
+        "message": "subframe dialog", "url": "https://frame.example/",
+    }, "SESSION-MINE")
+    d._record_event("Page.frameNavigated", {"frame": {
+        "id": "CHILD", "parentId": "FRAME-MINE", "url": "https://frame.example/",
+    }}, "SESSION-MINE")
+    d._record_event("Page.loadEventFired", {"frameId": "CHILD"}, "SESSION-MINE")
+    assert helpers.drain_events() == []
+    assert d.dialog is None
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_dialog_requires_top_document_frame_even_when_session_is_owned(daemon_bridge, legacy):
+    d, _ = daemon_bridge
+    params = {"message": "subframe", "url": "https://owned.example/", "frameId": "CHILD"}
+    if legacy:
+        d._record_event("Target.receivedMessageFromTarget", {
+            "sessionId": "SESSION-MINE",
+            "message": json.dumps({"method": "Page.javascriptDialogOpening", "params": params}),
+        }, "FOREIGN-OUTER-CARRIER")
+    else:
+        d._record_event("Page.javascriptDialogOpening", params, "SESSION-MINE")
+    assert helpers.drain_events() == []
+    assert d.dialog is None
 
 
 def test_legacy_target_reply_ignores_outer_owned_carrier_and_malformed_nested_messages(daemon_bridge):
@@ -1260,7 +1549,7 @@ def test_context_wide_event_subscription_is_refused_and_foreign_events_stay_hidd
         helpers.cdp("ServiceWorker.enable")
     assert helpers.drain_events() == []
     assert len(d.events) == 0
-    assert calls[-1] == ("Network.enable", {}, "SESSION-MINE")
+    assert ("Network.enable", {}, "SESSION-MINE") in calls
 
 
 def test_older_daemon_cannot_silently_return_unguarded_metadata(owning, monkeypatch):
@@ -1292,7 +1581,7 @@ def test_pinned_request_never_uses_new_current_session_or_recovers_there(daemon_
         return response
     monkeypatch.setattr(helpers, "_send", switch_after_snapshot)
     helpers.cdp("Page.navigate", url="https://owned.example/")
-    assert calls[-1][2] == "SESSION-MINE"
+    assert next(call for call in calls if call[0] == "Page.navigate")[2] == "SESSION-MINE"
     # A dropped pinned session must error, never replay against the new tab.
     d.target_id, d.session = "MINE", "SESSION-MINE"
     async def stale(method, params=None, session_id=None):
@@ -1340,6 +1629,7 @@ def test_explicit_owned_iframe_session_resolves_its_mapped_target_before_dispatc
                 "target_id": "IFRAME-TARGET",
                 "session_id": "IFRAME-SESSION",
                 "url": "https://frame.example/",
+                "tab_guard": "ok", "tab_guard_epoch": 0, "document_generation": 0,
             }
         return {"result": {}}
 
@@ -1357,6 +1647,31 @@ def test_explicit_owned_iframe_session_resolves_its_mapped_target_before_dispatc
         dispatched = calls[-1]
         assert dispatched["session_id"] == "IFRAME-SESSION"
     assert dispatched.get("method") in {"Runtime.evaluate", "Target.sendMessageToTarget"}
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_guarded_direct_and_nested_dispatch_carry_full_snapshot(owning, monkeypatch, nested):
+    requests = []
+    send = helpers._send
+
+    def capture(req, **kwargs):
+        requests.append(req)
+        return send(req, **kwargs)
+
+    monkeypatch.setattr(helpers, "_send", capture)
+    if nested:
+        helpers.cdp("Target.sendMessageToTarget", sessionId="SESSION-MINE",
+                    message=json.dumps({"id": 902, "method": "Runtime.evaluate",
+                                        "params": {"expression": "1"}}))
+    else:
+        helpers.cdp("Runtime.evaluate", session_id="SESSION-MINE", expression="1")
+    dispatch = next(req for req in reversed(requests) if req.get("method"))
+    assert dispatch["tab_guard_run"] == RUN_ID
+    assert dispatch["tab_guard_epoch"] == 0
+    assert dispatch["tab_guard_target_id"] == "MINE"
+    assert dispatch["tab_guard_session_id"] == "SESSION-MINE"
+    assert dispatch["tab_guard_document_generation"] == 0
+    assert dispatch["tab_guard_url"] == "https://example.com/"
 
 
 @pytest.mark.parametrize("nested", [False, True])

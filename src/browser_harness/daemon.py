@@ -156,6 +156,22 @@ _GUARDED_PAGE_EVENT_METHODS = frozenset({
     "Page.javascriptDialogClosed",
 })
 _GUARDED_RESPONSE_METHOD = "Target.receivedMessageFromTarget"
+_GUARDED_SESSION_METHODS = frozenset({
+    "DOM.getDocument", "DOM.querySelector", "DOM.querySelectorAll", "DOM.setFileInputFiles",
+    "Emulation.setEmulatedMedia", "Emulation.setFocusEmulationEnabled",
+    "Input.dispatchKeyEvent", "Input.dispatchMouseEvent", "Input.insertText",
+    "Network.disable", "Network.enable", "Network.setBlockedURLs",
+    "Network.setBypassServiceWorker", "Network.setCacheDisabled",
+    "Network.setExtraHTTPHeaders", "Network.setUserAgentOverride",
+    "Page.bringToFront", "Page.reload", "Page.captureScreenshot", "Page.getFrameTree",
+    "Page.handleJavaScriptDialog", "Page.navigate", "Page.setDocumentContent",
+    "Runtime.evaluate",
+})
+_GUARDED_TARGET_METHODS = frozenset({
+    "Target.getTargets", "Target.createTarget", "Target.getTargetInfo",
+    "Target.attachToTarget", "Target.detachFromTarget", "Target.sendMessageToTarget",
+    "Target.closeTarget", "Target.activateTarget", "Target.createBrowserContext",
+})
 
 
 def tab_marker_enabled():
@@ -477,8 +493,11 @@ class Daemon:
         self._session_targets = {}
         self._guarded_sessions = set()
         self._guarded_targets = set()
+        self._guarded_contexts = set()
         self._guard_policy_active = False
         self._guarded_run_id = None
+        self._authorization_epoch = 0
+        self._legacy_commands = {}
         self._revoked_sessions = set()
         self._marker_tasks = set()
         self.events = deque(maxlen=BUF)
@@ -490,6 +509,8 @@ class Daemon:
         self._execution_contexts = {}
         self.dialog_session = None
         self.dialog = None
+        self.dialog_generation = None
+        self.dialog_document_url = None
         self.stop = None  # asyncio.Event, set inside start()
 
     async def attach_first_page(self, replaces_session=None, enable_domains=True):
@@ -677,13 +698,23 @@ class Daemon:
         if not tab_marker_enabled():
             return None
         target_id = self._session_targets.get(session_id)
+        guarded = self._guard_policy_active
+        epoch = self._authorization_epoch
+        state = self._document_state.get(session_id)
+        generation = state.get("generation") if isinstance(state, dict) else None
+        document_url = state.get("document_url") if isinstance(state, dict) else None
 
         async def mark():
             if session_id in self._revoked_sessions:
                 return
-            if self._guard_policy_active:
+            if guarded:
                 if (session_id not in self._guarded_sessions
-                        or not target_id or target_id not in self._guarded_targets):
+                        or not target_id or target_id not in self._guarded_targets
+                        or epoch != self._authorization_epoch
+                        or not isinstance(generation, int)
+                        or not isinstance(self._document_state.get(session_id), dict)
+                        or self._document_state[session_id].get("generation") != generation
+                        or self._document_state[session_id].get("document_url") != document_url):
                     return
                 try:
                     info = (await self.cdp.send_raw(
@@ -695,9 +726,13 @@ class Daemon:
                     return
                 if (not self._guard_policy_active
                         or session_id not in self._guarded_sessions
-                        or target_id not in self._guarded_targets):
+                        or target_id not in self._guarded_targets
+                        or epoch != self._authorization_epoch
+                        or not isinstance(self._document_state.get(session_id), dict)
+                        or self._document_state[session_id].get("generation") != generation
+                        or self._document_state[session_id].get("document_url") != document_url):
                     return
-            elif os.environ.get("BH_TAB_GUARD") == "1":
+            elif self._guard_policy_active or os.environ.get("BH_TAB_GUARD") == "1":
                 # Guarded startup has no explicit session policy yet. Stay
                 # inert until a guarded request registers one.
                 return
@@ -858,10 +893,10 @@ class Daemon:
 
     def _record_event(self, method, params, session_id=None):
         event = {"method": method, "params": params, "session_id": session_id}
-        source_session = self._event_source_session(event)
+        source_session, inner_method, inner_params, payload = self._event_details(event)
         provenance = None
         if self._guard_policy_active:
-            source, inner_method, inner_params, payload = self._event_details(event)
+            source = source_session
             target_id = self._session_targets.get(source)
             state = self._document_state.get(source)
             if (source not in self._guarded_sessions
@@ -878,6 +913,17 @@ class Daemon:
                 state["frame_id"] = frame.get("id")
                 state["loader_id"] = frame.get("loaderId")
                 state["allowed"] = _guard_url_allowed(navigation_url)
+                if self.dialog_session == source:
+                    self.dialog = None
+                    self.dialog_session = None
+                    self.dialog_generation = None
+                    self.dialog_document_url = None
+                # Anything correlated with the prior document is stale now.
+                self._legacy_commands = {
+                    key: value for key, value in self._legacy_commands.items()
+                    if value.get("session_id") != source
+                    or value.get("generation") == state["generation"]
+                }
             request_id = None
             if inner_method == _NETWORK_REQUEST_METHOD:
                 request_id = inner_params.get("requestId") if isinstance(inner_params, dict) else None
@@ -906,6 +952,32 @@ class Daemon:
                     return
             if not state.get("allowed"):
                 return
+            if inner_method == "Page.javascriptDialogOpening":
+                dialog_url = inner_params.get("url") if isinstance(inner_params, dict) else None
+                dialog_frame_id = inner_params.get("frameId") if isinstance(inner_params, dict) else None
+                if (not isinstance(dialog_url, str)
+                        or dialog_url != state.get("document_url")
+                        or not isinstance(state.get("frame_id"), str)
+                        or dialog_frame_id != state.get("frame_id")
+                        or not _guard_url_allowed(dialog_url)):
+                    return
+            elif inner_method == "Page.javascriptDialogClosed":
+                dialog_frame_id = inner_params.get("frameId") if isinstance(inner_params, dict) else None
+                if (not isinstance(state.get("frame_id"), str)
+                        or dialog_frame_id != state.get("frame_id")):
+                    return
+            if inner_method == "Page.frameNavigated":
+                frame = inner_params.get("frame") if isinstance(inner_params, dict) else None
+                if (not isinstance(frame, dict)
+                        or frame.get("parentId") is not None
+                        or frame.get("id") != state.get("frame_id")
+                        or frame.get("url") != state.get("document_url")):
+                    return
+            elif inner_method in {"Page.loadEventFired", "Page.domContentEventFired"}:
+                frame_id = inner_params.get("frameId") if isinstance(inner_params, dict) else None
+                if (not isinstance(state.get("frame_id"), str)
+                        or frame_id != state.get("frame_id")):
+                    return
             elif inner_method in _NETWORK_REQUEST_CORRELATED_METHODS:
                 request_id = inner_params.get("requestId") if isinstance(inner_params, dict) else None
                 record = self._authorized_request(source, target_id, request_id)
@@ -955,10 +1027,26 @@ class Daemon:
                     method == _GUARDED_RESPONSE_METHOD
                     and isinstance(payload, dict)
                     and isinstance(payload.get("id"), (int, str))
-                    and ("result" in payload or "error" in payload)
+                    and not isinstance(payload.get("id"), bool)
+                    and payload.get("id") != ""
+                    and "method" not in payload
+                    and ((isinstance(payload.get("result"), dict)
+                          and "error" not in payload)
+                         or (isinstance(payload.get("error"), dict)
+                             and isinstance(payload["error"].get("code"), int)
+                             and isinstance(payload["error"].get("message"), str)
+                             and "result" not in payload))
                 )
-                if not is_response:
+                command_key = (source, payload.get("id")) if is_response else None
+                command = self._legacy_commands.get(command_key)
+                if (not is_response or not isinstance(command, dict)
+                        or command.get("run_id") != self._guarded_run_id
+                        or command.get("epoch") != self._authorization_epoch
+                        or command.get("generation") != state.get("generation")
+                        or command.get("document_url") != state.get("document_url")
+                        or command.get("target_id") != target_id):
                     return
+                self._legacy_commands.pop(command_key, None)
             provenance = {
                 "session_id": source,
                 "target_id": target_id,
@@ -973,14 +1061,25 @@ class Daemon:
         self.events.append(event)
         self._event_provenance.append(provenance)
         event_session = source_session if self._guard_policy_active else session_id
-        if method == "Page.javascriptDialogOpening":
-            self.dialog = params
+        if inner_method == "Page.javascriptDialogOpening":
+            self.dialog = inner_params
             self.dialog_session = event_session
-        elif method == "Page.javascriptDialogClosed":
-            if event_session == self.dialog_session:
+            if self._guard_policy_active:
+                current_state = self._document_state.get(source_session)
+                self.dialog_generation = current_state.get("generation") if isinstance(current_state, dict) else None
+                self.dialog_document_url = current_state.get("document_url") if isinstance(current_state, dict) else None
+        elif inner_method == "Page.javascriptDialogClosed":
+            current_state = self._document_state.get(source_session)
+            if (event_session == self.dialog_session
+                    and (not self._guard_policy_active
+                         or (isinstance(current_state, dict)
+                             and self.dialog_generation == current_state.get("generation")
+                             and self.dialog_document_url == current_state.get("document_url")))):
                 self.dialog = None
                 self.dialog_session = None
-        elif method in ("Page.loadEventFired", "Page.domContentEventFired"):
+                self.dialog_generation = None
+                self.dialog_document_url = None
+        elif inner_method in ("Page.loadEventFired", "Page.domContentEventFired"):
             self._schedule_tab_marker(event_session)
         if self._guard_policy_active and inner_method == "Runtime.executionContextDestroyed":
             self._execution_contexts.pop(context_key, None)
@@ -994,12 +1093,14 @@ class Daemon:
         async with self._session_state_lock:
             revoked_sessions = set(self._guarded_sessions)
             revoked_targets = set(self._guarded_targets)
-            old_mapping = dict(self._session_targets)
             self._guard_policy_active = False
+            self._authorization_epoch += 1
             self._guarded_run_id = None
+            self._legacy_commands.clear()
             self._revoked_sessions.update(revoked_sessions)
             self._guarded_sessions.clear()
             self._guarded_targets.clear()
+            self._guarded_contexts.clear()
             self._session_targets = {
                 sid: target for sid, target in self._session_targets.items()
                 if sid not in revoked_sessions and target not in revoked_targets
@@ -1029,18 +1130,15 @@ class Daemon:
                 self.target_id = None
             remaining = deque(maxlen=BUF)
             remaining_provenance = deque(maxlen=BUF)
-            for event, provenance in zip(self.events, self._event_provenance):
-                source = self._event_source_session(event)
-                target = old_mapping.get(source)
-                if source in revoked_sessions or target in revoked_targets:
-                    continue
-                remaining.append(event)
-                remaining_provenance.append(provenance)
+            # Guarded buffers are authorization results; reset revokes all of
+            # them, including entries already drained into daemon state.
             self.events = remaining
             self._event_provenance = remaining_provenance
             if self.dialog_session in revoked_sessions:
                 self.dialog = None
                 self.dialog_session = None
+                self.dialog_generation = None
+                self.dialog_document_url = None
             marker_tasks = list(self._marker_tasks)
             for task in marker_tasks:
                 task.cancel()
@@ -1117,9 +1215,21 @@ class Daemon:
                 if requested_target is not None and requested_target != target_id:
                     target_id = None
                 session_id = requested_session
+            elif requested_target is not None:
+                target_id = requested_target
+                session_id = next((sid for sid, target in self._session_targets.items()
+                                   if target == requested_target), None)
             else:
                 target_id, session_id = self.target_id, self.session
-            context = {"target_id": target_id, "session_id": session_id, "tab_guard": "ok"}
+            state = self._document_state.get(session_id)
+            context = {
+                "target_id": target_id,
+                "session_id": session_id,
+                "tab_guard": "ok",
+                "tab_guard_epoch": self._authorization_epoch,
+                "document_generation": state.get("generation") if isinstance(state, dict) else None,
+                "document_url": state.get("document_url") if isinstance(state, dict) else None,
+            }
             if target_id and self.cdp:
                 try:
                     info = (await self.cdp.send_raw(
@@ -1131,7 +1241,7 @@ class Daemon:
             return context
         if meta == "tab_guard_reset":
             return await self._tab_guard_reset(req)
-        if "tab_guard" in req and meta != "set_session":
+        if meta is not None and "tab_guard" in req and meta != "set_session":
             return await self._guarded_read(req)
         # Liveness probe — lets clients confirm the listener is actually this
         # daemon and not an unrelated process that reused our port post-crash.
@@ -1193,10 +1303,12 @@ class Daemon:
                         return {"tab_guard": "refused", "target_id": req.get("target_id"),
                                 "url": info.get("url", "")}
                     self._guard_policy_active = True
+                    self._authorization_epoch += 1
                     self._guarded_run_id = guard_run
                     self._revoked_sessions.difference_update(owned.get("sessions", []))
                     self._guarded_sessions = set(owned.get("sessions", []))
                     self._guarded_targets = set(owned.get("tabs", []))
+                    self._guarded_contexts.update(owned.get("contexts", []))
                 old_session = self.session
                 self.session = req.get("session_id")
                 self.target_id = req.get("target_id") or self.target_id
@@ -1267,18 +1379,70 @@ class Daemon:
         # For everything else, explicit session in req wins; else default.
         sid = None if method.startswith("Target.") else (req.get("session_id") or self.session)
         try:
+            guard_identity = None
+            if self._guard_policy_active or "tab_guard_run" in req:
+                guard_identity = await self._validate_dispatch_identity(req, sid, method, params)
+                if guard_identity is None:
+                    return {"error": "tab guard authorization is stale or invalid"}
+                if method == "Target.sendMessageToTarget":
+                    self._remember_legacy_command(guard_identity, params)
+                if guard_identity is not None and not self._dispatch_identity_state_current(guard_identity):
+                    return {"error": "tab guard authorization is stale or invalid"}
             result = await self.cdp.send_raw(method, params, session_id=sid)
-            if method == "Target.attachToTarget":
+            if guard_identity is not None and not await self._dispatch_identity_current(guard_identity):
+                return {"error": "tab guard authorization was revoked during dispatch"}
+            if method == "Target.createBrowserContext" and guard_identity is not None:
+                context_id = result.get("browserContextId")
+                if context_id:
+                    self._guarded_contexts.add(context_id)
+            elif method == "Target.attachToTarget":
                 attached_session = result.get("sessionId")
                 target_id = params.get("targetId")
                 if attached_session and target_id:
                     self._revoked_sessions.discard(attached_session)
                     self._session_targets[attached_session] = target_id
+                    if guard_identity is not None:
+                        self._guarded_targets.add(target_id)
+                        self._guarded_sessions.add(attached_session)
+                        self._guard_policy_active = True
+                        self._document_state[attached_session] = {
+                            "target_id": target_id,
+                            "generation": 0,
+                            "url": req.get("tab_guard_url"),
+                            "document_url": req.get("tab_guard_url"),
+                            "frame_id": None,
+                            "loader_id": None,
+                            "allowed": _guard_url_allowed(req.get("tab_guard_url")),
+                        }
             elif method == "Target.detachFromTarget":
-                self._session_targets.pop(params.get("sessionId"), None)
+                detached_session = params.get("sessionId")
+                self._session_targets.pop(detached_session, None)
+                if guard_identity is not None:
+                    self._guarded_sessions.discard(detached_session)
+                    self._document_state.pop(detached_session, None)
+            elif method == "Target.closeTarget" and result.get("success"):
+                closed_target = params.get("targetId")
+                self._guarded_targets.discard(closed_target)
+                for attached, target in list(self._session_targets.items()):
+                    if target == closed_target:
+                        self._session_targets.pop(attached, None)
+                        self._guarded_sessions.discard(attached)
+                        self._document_state.pop(attached, None)
+            elif method == "Target.createTarget" and guard_identity is not None:
+                created_target = result.get("targetId")
+                if created_target:
+                    self._guarded_targets.add(created_target)
             return {"result": result}
         except Exception as e:
+            if method == "Target.sendMessageToTarget" and guard_identity is not None:
+                try:
+                    nested = json.loads(params.get("message", ""))
+                    self._legacy_commands.pop((guard_identity["session_id"], nested.get("id")), None)
+                except (TypeError, ValueError, AttributeError):
+                    pass
             msg = str(e)
+            if guard_identity is not None:
+                return {"error": msg}
             if "Session with given id not found" in msg and sid:
                 # Explicit session callers asked for that exact session; do not
                 # silently redirect them to the daemon's current tab.
@@ -1316,6 +1480,187 @@ class Daemon:
                 finally:
                     self._finish_recovery(recovery_task)
             return {"error": msg}
+
+    async def _validate_dispatch_identity(self, req, session_id, method, params):
+        """Recheck a helper-pinned identity at the daemon boundary."""
+        owned = req.get("tab_guard")
+        identity = {
+            "method": method,
+            "run_id": req.get("tab_guard_run"),
+            "session_id": req.get("tab_guard_session_id"),
+            "target_id": req.get("tab_guard_target_id"),
+            "epoch": req.get("tab_guard_epoch"),
+            "generation": req.get("tab_guard_document_generation"),
+            "document_url": req.get("tab_guard_url"),
+        }
+        sid = (params.get("sessionId")
+               if method in {"Target.detachFromTarget", "Target.sendMessageToTarget"}
+               else session_id)
+        target_id = (self._session_targets.get(sid) if sid else
+                     params.get("targetId") or identity["target_id"])
+        state = self._document_state.get(sid)
+        bootstrap = {"Target.createBrowserContext", "Target.createTarget", "Target.getTargets"}
+        if not isinstance(owned, dict) or not isinstance(identity["run_id"], str):
+            return None
+        if self._guarded_run_id is None:
+            if method not in bootstrap or identity["epoch"] != self._authorization_epoch:
+                return None
+            self._guarded_run_id = identity["run_id"]
+        if (identity["run_id"] != self._guarded_run_id
+                or identity["epoch"] != self._authorization_epoch):
+            return None
+        if method.startswith("Target."):
+            if method not in _GUARDED_TARGET_METHODS:
+                return None
+        elif method not in _GUARDED_SESSION_METHODS:
+            return None
+        if method == "Page.navigate" and not _guard_url_allowed(params.get("url")):
+            return None
+        if (method == "Target.createTarget"
+                and (not isinstance(params.get("url", "about:blank"), str)
+                     or not _guard_url_allowed(params.get("url", "about:blank")))):
+            return None
+        if method == "Target.sendMessageToTarget":
+            try:
+                nested = json.loads(params.get("message", ""))
+            except (TypeError, ValueError):
+                return None
+            if not isinstance(nested, dict) or not isinstance(nested.get("method"), str):
+                return None
+            identity["method"] = nested["method"]
+            nested_params = nested.get("params") or {}
+            if (not isinstance(nested_params, dict)
+                    or nested["method"] not in _GUARDED_SESSION_METHODS
+                    or "sessionId" in nested):
+                return None
+            if (nested["method"] == "Page.navigate"
+                    and not _guard_url_allowed(nested_params.get("url"))):
+                return None
+        if method in {"Target.createBrowserContext", "Target.getTargets"}:
+            return {**identity, "target_id": None, "session_id": None, "generation": None}
+        if method == "Target.createTarget":
+            context_id = params.get("browserContextId")
+            if (not isinstance(context_id, str)
+                    or context_id not in set(owned.get("contexts", []))
+                    or context_id not in self._guarded_contexts):
+                return None
+            return {**identity, "target_id": None, "session_id": None, "generation": None}
+        if identity["target_id"] != target_id:
+            return None
+        if (identity["target_id"] not in set(owned.get("tabs", []))
+                or identity["target_id"] not in self._guarded_targets):
+            return None
+        if sid:
+            if (identity["session_id"] != sid or sid not in self._guarded_sessions
+                    or not isinstance(state, dict)
+                    or identity["generation"] != state.get("generation")
+                    or not state.get("allowed")):
+                return None
+            identity["document_url"] = state.get("document_url")
+        elif method == "Target.attachToTarget":
+            identity["session_id"] = None
+            identity["generation"] = None
+        elif method in {"Target.closeTarget", "Target.activateTarget", "Target.getTargetInfo"}:
+            identity["session_id"] = None
+            identity["generation"] = None
+            identity["document_url"] = req.get("tab_guard_url")
+        else:
+            mapped = next((session for session, target in self._session_targets.items()
+                           if target == target_id), None)
+            mapped_state = self._document_state.get(mapped)
+            if (not mapped or identity["session_id"] != mapped
+                    or not isinstance(mapped_state, dict)
+                    or identity["generation"] != mapped_state.get("generation")
+                    or not mapped_state.get("allowed")):
+                return None
+            identity["session_id"] = mapped
+            identity["generation"] = mapped_state["generation"]
+            identity["document_url"] = mapped_state.get("document_url")
+        if identity["target_id"] is not None:
+            try:
+                info = (await self.cdp.send_raw(
+                    "Target.getTargetInfo", {"targetId": identity["target_id"]}
+                )).get("targetInfo", {})
+            except Exception:
+                return None
+            snapshot_url = identity.get("document_url")
+            if not isinstance(snapshot_url, str):
+                snapshot_url = req.get("tab_guard_url")
+            if (not isinstance(snapshot_url, str)
+                    or info.get("url") != snapshot_url
+                    or not _guard_url_allowed(info.get("url"))):
+                return None
+            identity["live_url"] = snapshot_url
+        return identity
+
+    def _dispatch_identity_state_current(self, identity):
+        """Synchronous last check immediately before entering CDP transport."""
+        if identity["session_id"] is None:
+            return bool(identity["run_id"] == self._guarded_run_id
+                        and identity["epoch"] == self._authorization_epoch)
+        state = self._document_state.get(identity["session_id"])
+        return bool(
+            self._guard_policy_active
+            and identity["run_id"] == self._guarded_run_id
+            and identity["epoch"] == self._authorization_epoch
+            and identity["session_id"] in self._guarded_sessions
+            and self._session_targets.get(identity["session_id"]) == identity["target_id"]
+            and isinstance(state, dict)
+            and state.get("generation") == identity["generation"]
+            and state.get("document_url") == identity["document_url"]
+            and state.get("allowed") is True
+        )
+
+    async def _dispatch_identity_current(self, identity):
+        if identity["session_id"] is None:
+            return bool(identity["run_id"] == self._guarded_run_id
+                        and identity["epoch"] == self._authorization_epoch)
+        if identity["method"] in {"Page.navigate", "Page.reload", "Page.setDocumentContent"}:
+            return bool(
+                self._guard_policy_active
+                and identity["run_id"] == self._guarded_run_id
+                and identity["epoch"] == self._authorization_epoch
+                and identity["session_id"] in self._guarded_sessions
+                and self._session_targets.get(identity["session_id"]) == identity["target_id"]
+            )
+        if not bool(
+            self._guard_policy_active
+            and identity["run_id"] == self._guarded_run_id
+            and identity["epoch"] == self._authorization_epoch
+            and identity["session_id"] in self._guarded_sessions
+            and self._session_targets.get(identity["session_id"]) == identity["target_id"]
+            and isinstance(self._document_state.get(identity["session_id"]), dict)
+            and self._document_state[identity["session_id"]].get("generation") == identity["generation"]
+            and self._document_state[identity["session_id"]].get("document_url") == identity["document_url"]
+        ):
+            return False
+        try:
+            info = (await self.cdp.send_raw(
+                "Target.getTargetInfo", {"targetId": identity["target_id"]}
+            )).get("targetInfo", {})
+        except Exception:
+            return False
+        return info.get("url") == identity.get("live_url")
+
+    def _remember_legacy_command(self, identity, params):
+        try:
+            message = json.loads(params.get("message", ""))
+        except (TypeError, ValueError):
+            return
+        command_id = message.get("id") if isinstance(message, dict) else None
+        if (not isinstance(command_id, (int, str)) or isinstance(command_id, bool)
+                or command_id == ""):
+            return
+        key = (identity["session_id"], command_id)
+        if key in self._legacy_commands:
+            self._legacy_commands.pop(key, None)
+            return
+        self._legacy_commands[key] = {
+            **identity,
+            "document_url": identity["document_url"],
+        }
+        while len(self._legacy_commands) > BUF:
+            self._legacy_commands.pop(next(iter(self._legacy_commands)))
 
 
 async def serve(d):

@@ -148,12 +148,15 @@ def test_guard_policy_blocks_unregistered_marker_and_domain_authorization(monkey
         })
 
     assert asyncio.run(register()) == {"session_id": "owned-session", "tab_guard": "ok"}
+    d._document_state["owned-session"].update({
+        "document_url": "https://owned.example/", "frame_id": "FRAME-MINE",
+    })
     monkeypatch.delenv("BH_TAB_MARKER")
     d.cdp.calls.clear()
 
     async def exercise():
-        d._record_event("Page.loadEventFired", {}, "foreign-session")
-        d._record_event("Page.loadEventFired", {}, "owned-session")
+        d._record_event("Page.loadEventFired", {"frameId": "FRAME-MINE"}, "foreign-session")
+        d._record_event("Page.loadEventFired", {"frameId": "FRAME-MINE"}, "owned-session")
         await d._enable_default_domains("foreign-session")
         await asyncio.sleep(0)
         await asyncio.sleep(0)
@@ -187,6 +190,9 @@ def test_guard_context_resolves_explicit_session_to_its_target(monkeypatch):
         "session_id": "iframe-session",
         "url": "https://frame.example/",
         "tab_guard": "ok",
+        "tab_guard_epoch": 0,
+        "document_generation": None,
+        "document_url": None,
     }
     mismatched = asyncio.run(d.handle({
         "meta": "guard_context",
@@ -250,13 +256,14 @@ def test_guarded_event_marker_uses_origin_session_and_owned_target(monkeypatch):
     d._session_targets = {"event-session": "event-target"}
     d._document_state["event-session"] = {
         "target_id": "event-target", "generation": 0,
-        "url": "https://owned.example/", "allowed": True,
+        "url": "https://owned.example/", "document_url": "https://owned.example/",
+        "frame_id": "FRAME-MINE", "allowed": True,
     }
     d.session = "current-session"
     d.target_id = "current-target"
 
     async def run():
-        d._record_event("Page.loadEventFired", {}, "event-session")
+        d._record_event("Page.loadEventFired", {"frameId": "FRAME-MINE"}, "event-session")
         await asyncio.sleep(0)
         await asyncio.sleep(0)
 
@@ -292,13 +299,14 @@ def test_guarded_event_marker_fails_closed_for_foreign_or_privileged_source(
     d._guarded_targets = {"event-target"}
     d._document_state["event-session"] = {
         "target_id": "event-target", "generation": 0,
-        "url": "https://owned.example/", "allowed": True,
+        "url": "https://owned.example/", "document_url": "https://owned.example/",
+        "frame_id": "FRAME-MINE", "allowed": True,
     }
     d.session = "current-session"
     d.target_id = "current-target"
 
     async def run():
-        d._record_event("Page.domContentEventFired", {}, event_session)
+        d._record_event("Page.domContentEventFired", {"frameId": "FRAME-MINE"}, event_session)
         await asyncio.sleep(0)
         await asyncio.sleep(0)
 

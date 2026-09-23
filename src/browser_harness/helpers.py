@@ -197,6 +197,7 @@ def _check_session_target_url(method, params, session_id):
     if context["target_id"] not in _owned_ids():
         _refuse(method, f"session:{session_id}", context.get("url", ""),
                 "session target was not opened by this run")
+    return context
 
 
 def _tab_guard_on():
@@ -298,7 +299,9 @@ def _owned_contexts():
 def _create_guard_context():
     """Create and record the private browser context used by this run."""
     try:
-        response = _send({"method": "Target.createBrowserContext", "params": {}, "session_id": None})
+        request = {"method": "Target.createBrowserContext", "params": {}, "session_id": None}
+        request.update(_guard_dispatch_fields("Target.createBrowserContext", {}, None))
+        response = _send(request)
         context_id = response.get("result", {}).get("browserContextId")
     except Exception:
         context_id = None
@@ -501,14 +504,64 @@ def _tab_guard_check(method, params, session_id=None):
     return _checked_session(method, params)
 
 
+def _guard_dispatch_fields(method, params, session_id):
+    """Pin guarded IPC to the daemon's current run, target, and document."""
+    if not _tab_guard_on():
+        return {}
+    requested_session = session_id
+    if method in {"Target.detachFromTarget", "Target.sendMessageToTarget"}:
+        requested_session = params.get("sessionId")
+    requested_target = params.get("targetId") if method in _TARGET_SCOPED_METHODS else None
+    request = {"meta": "guard_context"}
+    if requested_session:
+        request["session_id"] = requested_session
+    elif requested_target:
+        request["target_id"] = requested_target
+    try:
+        context = _send(request)
+    except (OSError, RuntimeError, TimeoutError):
+        _refuse(method, requested_target or f"session:{requested_session}",
+                params.get("url", ""), "guard authorization could not be read")
+    if not isinstance(context, dict) or context.get("tab_guard") != "ok":
+        _refuse(method, requested_target or f"session:{requested_session}",
+                params.get("url", ""), "daemon guard authorization is unavailable")
+    epoch = context.get("tab_guard_epoch")
+    if not isinstance(epoch, int) or epoch < 0:
+        _refuse(method, requested_target or f"session:{requested_session}",
+                params.get("url", ""), "daemon guard epoch is unavailable")
+    target_id = context.get("target_id") if (requested_session or requested_target) else None
+    if requested_target and target_id != requested_target:
+        _refuse(method, requested_target, params.get("url", ""),
+                "target mapping changed before dispatch")
+    if requested_target and not requested_session:
+        requested_session = context.get("session_id")
+    generation = context.get("document_generation")
+    if requested_session and (not isinstance(generation, int) or generation < 0):
+        _refuse(method, f"session:{requested_session}", params.get("url", ""),
+                "document generation is unavailable")
+    fields = {
+        "tab_guard": _owned_state(),
+        "tab_guard_run": _run_id(),
+        "tab_guard_epoch": epoch,
+        "tab_guard_target_id": target_id,
+        "tab_guard_session_id": requested_session,
+        "tab_guard_document_generation": generation,
+        "tab_guard_url": context.get("url"),
+    }
+    return fields
+
+
 def cdp(method, session_id=None, _response_timeout=DEFAULT_IPC_RESPONSE_TIMEOUT_SECONDS, **params):
     """Raw CDP. cdp('Page.navigate', url='...'), cdp('DOM.getDocument', depth=-1).
 
     Under BH_TAB_GUARD=1, a call against a tab this run did not open raises
     TabGuardRefused — see the tab guard block above."""
     session_id = _tab_guard_check(method, params, session_id)
+    guard_fields = _guard_dispatch_fields(method, params, session_id)
+    request = {"method": method, "params": params, "session_id": session_id}
+    request.update(guard_fields)
     result = _send(
-        {"method": method, "params": params, "session_id": session_id},
+        request,
         response_timeout=_response_timeout,
     ).get("result", {})
     # Ownership is recorded at the protocol chokepoint, not in new_tab(), so a
