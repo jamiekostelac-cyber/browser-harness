@@ -365,7 +365,7 @@ def _trusted_browser_executable(executable):
             "$v=(Get-Item -LiteralPath $p).VersionInfo; "
             "$signer=''; if($s.SignerCertificate) "
             "{$signer=$s.SignerCertificate.GetNameInfo('SimpleName',$false)}; "
-            "ConvertTo-Json -Compress @{status=$s.Status; signer=$signer; "
+            "ConvertTo-Json -Compress @{status=$s.Status.ToString(); signer=$signer; "
             "product=$v.ProductName; description=$v.FileDescription}"
         )
         try:
@@ -419,19 +419,24 @@ def _trusted_browser_executable(executable):
 
 
 def _profile_argument_matches(args, base):
-    """Accept exactly one canonical profile switch before Chromium's terminator."""
+    """Accept exactly one canonical, effective Chromium profile switch."""
+    expected = str(Path(base).resolve())
     profile_switches = []
     for arg in args:
+        if not isinstance(arg, str) or arg != arg.strip():
+            return False
         if arg == "--":
-            return False
-        if arg.startswith("--") and arg[2:].split("=", 1)[0].casefold() == "user-data-dir":
-            profile_switches.append(arg)
-        elif arg.startswith("-") and not arg.startswith("--") and arg[1:].split("=", 1)[0].casefold() == "user-data-dir":
-            return False
-    expected = str(Path(base).resolve())
-    return (len(profile_switches) == 1
-            and profile_switches[0].startswith("--user-data-dir=")
-            and profile_switches[0].split("=", 1)[1] == expected)
+            break
+        # Chromium recognizes Windows-style slash switches as well as dashes.
+        # Reject case/spacing/prefix variants and the separate-value form too.
+        prefix = arg.lstrip("-/")
+        name = prefix.split("=", 1)[0].casefold()
+        if name == "user-data-dir":
+            if arg.startswith("--user-data-dir="):
+                profile_switches.append(arg)
+            else:
+                return False
+    return len(profile_switches) == 1 and profile_switches[0] == f"--user-data-dir={expected}"
 
 
 def _listener_pids(port):

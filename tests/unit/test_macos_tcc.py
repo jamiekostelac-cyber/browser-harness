@@ -475,10 +475,17 @@ def test_profile_browser_pid_rejects_nonbrowser_and_profile_mismatch(
         lambda profile: [f"--user-data-dir={profile}", f"--user-data-dir={profile}"],
         lambda profile: ["--user-data-dir", str(profile)],
         lambda profile: [f"-user-data-dir={profile}"],
-        lambda profile: [f"--user-data-dir={profile}", "--", "--user-data-dir=/tmp/attacker"],
         lambda profile: ["--", f"--user-data-dir={profile}"],
         lambda profile: [f"--USER-DATA-DIR={profile}"],
         lambda profile: [f"--user-data-dir={profile}", f"--USER-DATA-DIR={profile}"],
+        lambda profile: [f" --user-data-dir={profile}"],
+        lambda profile: [f"--user-data-dir={profile} "],
+        lambda profile: ["--user-data-dir", str(profile)],
+        lambda profile: [f"/user-data-dir={profile}"],
+        lambda profile: [f"/USER-DATA-DIR={profile}"],
+        lambda profile: [f"--User-Data-Dir={profile}"],
+        lambda profile: [f"--user-data-dir={profile}", f"/user-data-dir={profile}"],
+        lambda profile: ["--", f"--user-data-dir={profile}"],
         lambda profile: [f"--app=--user-data-dir={profile}"],
         lambda profile: [f"--app=https://example.test/?profile=--user-data-dir={profile}"],
     ],
@@ -515,6 +522,21 @@ def test_profile_browser_pid_rejects_expected_pid_mismatch(monkeypatch, tmp_path
     monkeypatch.setattr(daemon, "_trusted_browser_executable", lambda _exe: True)
 
     assert daemon._profile_browser_pid(profile, expected_pid=78) is None
+
+
+def test_profile_browser_pid_accepts_canonical_switch_before_terminator(monkeypatch, tmp_path):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    (profile / "SingletonLock").symlink_to("host-77")
+    monkeypatch.setattr(
+        daemon, "_process_args", lambda _pid: [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            f"--user-data-dir={profile}", "--", "--user-data-dir=/tmp/ignored",
+        ]
+    )
+    monkeypatch.setattr(daemon, "_trusted_browser_executable", lambda _exe: True)
+
+    assert daemon._profile_browser_pid(profile) == 77
 
 
 def test_linux_executable_trust_requires_package_ownership(monkeypatch):
@@ -598,6 +620,28 @@ def test_windows_executable_trust_requires_browser_product_and_valid_publisher(
     assert observed["env_path"] == str(browser_path)
     assert len(observed["command"]) == 5
     assert str(browser_path) not in observed["command"][-1]
+
+
+@pytest.mark.parametrize("status, expected", [("Valid", True), ("NotSigned", False), ("HashMismatch", False)])
+def test_windows_authenticode_status_is_stringified_and_validated(
+    monkeypatch, tmp_path, status, expected
+):
+    monkeypatch.setattr(daemon.platform, "system", lambda: "Windows")
+    browser_path = tmp_path / "chrome.exe"
+    observed = {}
+
+    def inspect(command, **_kwargs):
+        observed["script"] = command[-1]
+        return daemon.json.dumps({
+            "status": status,
+            "signer": "Google LLC",
+            "product": "Google Chrome",
+            "description": "Google Chrome",
+        })
+
+    monkeypatch.setattr(daemon.subprocess, "check_output", inspect)
+    assert daemon._trusted_browser_executable(str(browser_path)) is expected
+    assert "$s.Status.ToString()" in observed["script"]
 
 
 @pytest.mark.parametrize(
