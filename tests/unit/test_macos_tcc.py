@@ -2,6 +2,8 @@
 DevToolsActivePort lives. get_ws_url() must not crash on that: it falls back to a
 dedicated automation Chrome, and fails with actionable guidance when it can't.
 No real browser is launched."""
+from unittest.mock import MagicMock
+
 import pytest
 
 from browser_harness import daemon
@@ -116,6 +118,43 @@ def test_automation_profile_rediscovers_selected_port_after_restart(monkeypatch,
     monkeypatch.setattr(daemon, "_automation_chrome_binary", unexpected_launch)
     monkeypatch.setattr(daemon, "_profile_process_owns", lambda _profile: True)
     assert daemon.launch_automation_chrome() == "ws://127.0.0.1:49231/json"
+
+
+@pytest.mark.parametrize(
+    ("response_path", "accepted"),
+    [
+        ("/devtools/browser/profile-owner", True),
+        ("/devtools/browser/unrelated-owner", False),
+    ],
+)
+def test_json_version_reuse_requires_profile_endpoint_identity(
+    monkeypatch, tmp_path, response_path, accepted
+):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    (profile / "DevToolsActivePort").write_text(
+        "49231\n/devtools/browser/profile-owner\n"
+    )
+    monkeypatch.setattr(daemon, "PROFILES", [profile])
+    monkeypatch.delenv("BU_CDP_WS", raising=False)
+    monkeypatch.delenv("BU_CDP_URL", raising=False)
+    monkeypatch.setattr(daemon, "REMOTE_ID", None)
+    monkeypatch.setattr(daemon, "supported_browser_running", lambda: True)
+    monkeypatch.setattr(daemon, "NO_TOGGLE_GRACE", -1)
+    monkeypatch.setattr(daemon, "remote_debugging_user_enabled", lambda: None)
+    response = MagicMock()
+    response.read.return_value = (
+        '{"webSocketDebuggerUrl": '
+        f'"ws://127.0.0.1:49231{response_path}"}}'
+    ).encode()
+    response.__enter__.return_value = response
+    monkeypatch.setattr(daemon.urllib.request, "urlopen", lambda *_a, **_k: response)
+
+    if accepted:
+        assert daemon.get_ws_url() == f"ws://127.0.0.1:49231{response_path}"
+    else:
+        with pytest.raises(RuntimeError, match="DevToolsActivePort not found"):
+            daemon.get_ws_url()
 
 
 def test_stale_automation_port_does_not_attach_to_unrelated_listener(monkeypatch, tmp_path):

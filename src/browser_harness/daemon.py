@@ -286,6 +286,28 @@ def _ws_from_devtools_active_port(http_url: str) -> str | None:
     return None
 
 
+def _ws_matches_devtools_active_port(base: Path, port: str, ws_url: str) -> bool:
+    """Confirm /json/version belongs to this profile's active browser instance."""
+    try:
+        active = (base / "DevToolsActivePort").read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines()
+        endpoint = urlparse(ws_url)
+        return (
+            len(active) > 1
+            and active[0].strip() == port
+            and endpoint.scheme in {"ws", "wss"}
+            and endpoint.port == int(port)
+            and endpoint.path == active[1].strip()
+        )
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def _ws_owned_by_profile(port: str, ws_url: str) -> bool:
+    return any(_ws_matches_devtools_active_port(base, port, ws_url) for base in PROFILES)
+
+
 # macOS TCC blocks reading the default browser's profile dir, where the
 # DevToolsActivePort file lives. That makes "attach to the running browser"
 # impossible without Full Disk Access — so when every profile is unreadable we
@@ -452,7 +474,13 @@ def get_ws_url():
             # with a different --user-data-dir on the same port, that file is left behind
             # with a stale browser UUID and the WS upgrade returns 404.
             try:
-                return json.loads(urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=1).read())["webSocketDebuggerUrl"]
+                ws = json.loads(
+                    urllib.request.urlopen(
+                        f"http://127.0.0.1:{port}/json/version", timeout=1
+                    ).read()
+                )["webSocketDebuggerUrl"]
+                if isinstance(ws, str) and _ws_matches_devtools_active_port(base, port, ws):
+                    return ws
             except urllib.error.HTTPError as e:
                 if e.code == 403:
                     raise RuntimeError("permission-blocked: Chrome is reachable, but the per-session Allow remote debugging popup has not been accepted")
@@ -480,7 +508,9 @@ def get_ws_url():
     for probe_port in (9222, 9223):
         try:
             with urllib.request.urlopen(f"http://127.0.0.1:{probe_port}/json/version", timeout=1) as r:
-                return json.loads(r.read())["webSocketDebuggerUrl"]
+                ws = json.loads(r.read())["webSocketDebuggerUrl"]
+                if isinstance(ws, str) and _ws_owned_by_profile(str(probe_port), ws):
+                    return ws
         except urllib.error.HTTPError as e:
             if e.code == 403:
                 raise RuntimeError("permission-blocked: Chrome is reachable, but the per-session Allow remote debugging popup has not been accepted")
