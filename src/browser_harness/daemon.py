@@ -146,7 +146,16 @@ _NETWORK_REQUEST_CORRELATED_METHODS = frozenset({
     "Network.webSocketFrameReceived",
     "Network.webSocketFrameError",
     "Network.webSocketClosed",
+    "Network.eventSourceMessageReceived",
 })
+_GUARDED_PAGE_EVENT_METHODS = frozenset({
+    "Page.frameNavigated",
+    "Page.loadEventFired",
+    "Page.domContentEventFired",
+    "Page.javascriptDialogOpening",
+    "Page.javascriptDialogClosed",
+})
+_GUARDED_RESPONSE_METHOD = "Target.receivedMessageFromTarget"
 
 
 def tab_marker_enabled():
@@ -476,6 +485,9 @@ class Daemon:
         self._event_provenance = deque(maxlen=BUF)
         self._document_state = {}
         self._request_provenance = {}
+        self._request_index = {}
+        self._ambiguous_request_ids = set()
+        self._execution_contexts = {}
         self.dialog_session = None
         self.dialog = None
         self.stop = None  # asyncio.Event, set inside start()
@@ -738,28 +750,28 @@ class Daemon:
 
     @staticmethod
     def _event_details(event):
-        """Return source, inner method, and params from one event envelope."""
+        """Return source, inner method, params, and payload from one envelope."""
         if event.get("method") != "Target.receivedMessageFromTarget":
             session_id = event.get("session_id")
             if not isinstance(session_id, str) or not session_id:
-                return None, event.get("method"), event.get("params")
-            return session_id, event.get("method"), event.get("params")
+                return None, event.get("method"), event.get("params"), None
+            return session_id, event.get("method"), event.get("params"), None
         params = event.get("params")
         if not isinstance(params, dict):
-            return None, None, None
+            return None, None, None, None
         session_id, message = params.get("sessionId"), params.get("message")
         if not isinstance(session_id, str) or not session_id or not isinstance(message, str):
-            return None, None, None
+            return None, None, None, None
         try:
             payload = json.loads(message)
         except (TypeError, ValueError):
-            return None, None, None
+            return None, None, None, None
         if not isinstance(payload, dict):
-            return None, None, None
+            return None, None, None, None
         nested_session = payload.get("sessionId")
         if nested_session is not None and nested_session != session_id:
-            return None, None, None
-        return session_id, payload.get("method"), payload.get("params")
+            return None, None, None, None
+        return session_id, payload.get("method"), payload.get("params"), payload
 
     @classmethod
     def _event_source_session(cls, event):
@@ -779,12 +791,77 @@ class Daemon:
             return None
         return params["frame"].get("url")
 
+    @staticmethod
+    def _context_origin_allowed(context, document_url):
+        if not isinstance(context, dict) or not isinstance(document_url, str):
+            return False
+        origin = context.get("origin")
+        if not isinstance(origin, str):
+            return False
+        parsed = urlparse(document_url)
+        if parsed.scheme == "about" and parsed.path == "blank":
+            return origin in {"", "null"}
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return False
+        return origin.rstrip("/") == f"{parsed.scheme}://{parsed.netloc}"
+
+    def _remember_request(self, source, target_id, request_id, loader_id,
+                          document_url, frame_id, generation, allowed):
+        base_key = (source, target_id, request_id)
+        full_key = (source, target_id, request_id, loader_id, document_url, frame_id)
+        previous_key = self._request_index.get(base_key)
+        previous = self._request_provenance.get(previous_key) if previous_key else None
+        if previous_key and (
+            previous_key != full_key
+            or not isinstance(previous, dict)
+            or previous.get("allowed") is not allowed
+        ):
+            self._ambiguous_request_ids.add(base_key)
+        if full_key not in self._request_provenance:
+            self._request_provenance[full_key] = {
+                "session_id": source,
+                "target_id": target_id,
+                "request_id": request_id,
+                "generation": generation,
+                "loader_id": loader_id,
+                "document_url": document_url,
+                "frame_id": frame_id,
+                "allowed": allowed,
+            }
+        self._request_index[base_key] = full_key
+        while len(self._request_provenance) > BUF:
+            evicted_key = next(iter(self._request_provenance))
+            self._request_provenance.pop(evicted_key)
+            evicted_base = evicted_key[:3]
+            if self._request_index.get(evicted_base) == evicted_key:
+                remaining = [key for key in self._request_provenance if key[:3] == evicted_base]
+                if remaining:
+                    self._request_index[evicted_base] = remaining[-1]
+                else:
+                    self._request_index.pop(evicted_base, None)
+                    self._ambiguous_request_ids.discard(evicted_base)
+
+    def _authorized_request(self, source, target_id, request_id):
+        base_key = (source, target_id, request_id)
+        if base_key in self._ambiguous_request_ids:
+            return None
+        record = self._request_provenance.get(self._request_index.get(base_key))
+        if (
+            not isinstance(record, dict)
+            or record.get("allowed") is not True
+            or record.get("session_id") != source
+            or record.get("target_id") != target_id
+            or record.get("request_id") != request_id
+        ):
+            return None
+        return record
+
     def _record_event(self, method, params, session_id=None):
         event = {"method": method, "params": params, "session_id": session_id}
         source_session = self._event_source_session(event)
         provenance = None
         if self._guard_policy_active:
-            source, inner_method, inner_params = self._event_details(event)
+            source, inner_method, inner_params, payload = self._event_details(event)
             target_id = self._session_targets.get(source)
             state = self._document_state.get(source)
             if (source not in self._guarded_sessions
@@ -796,32 +873,91 @@ class Daemon:
                 navigation_url = self._navigation_url(inner_method, inner_params)
                 state["generation"] += 1
                 state["url"] = navigation_url
+                frame = inner_params["frame"]
+                state["document_url"] = navigation_url
+                state["frame_id"] = frame.get("id")
+                state["loader_id"] = frame.get("loaderId")
                 state["allowed"] = _guard_url_allowed(navigation_url)
-            if not state.get("allowed"):
-                return
             request_id = None
             if inner_method == _NETWORK_REQUEST_METHOD:
                 request_id = inner_params.get("requestId") if isinstance(inner_params, dict) else None
+                request_url = inner_params.get("documentURL") if isinstance(inner_params, dict) else None
+                loader_id = inner_params.get("loaderId") if isinstance(inner_params, dict) else None
+                frame_id = inner_params.get("frameId") if isinstance(inner_params, dict) else None
                 if not isinstance(request_id, str) or not request_id:
                     return
-                self._request_provenance[(source, target_id, request_id)] = {
-                    "session_id": source,
-                    "target_id": target_id,
-                    "generation": state["generation"],
-                    "allowed": True,
-                }
-                while len(self._request_provenance) > BUF:
-                    self._request_provenance.pop(next(iter(self._request_provenance)))
+                request_allowed = bool(
+                    state.get("allowed")
+                    and isinstance(request_url, str)
+                    and _guard_url_allowed(request_url)
+                    and request_url == state.get("document_url")
+                    and isinstance(loader_id, str)
+                    and loader_id == state.get("loader_id")
+                    and isinstance(frame_id, str)
+                    and frame_id == state.get("frame_id")
+                )
+                self._remember_request(
+                    source, target_id, request_id, loader_id if isinstance(loader_id, str) else None,
+                    request_url if isinstance(request_url, str) else None,
+                    frame_id if isinstance(frame_id, str) else None,
+                    state["generation"], request_allowed,
+                )
+                if not request_allowed:
+                    return
+            if not state.get("allowed"):
+                return
             elif inner_method in _NETWORK_REQUEST_CORRELATED_METHODS:
                 request_id = inner_params.get("requestId") if isinstance(inner_params, dict) else None
-                record = self._request_provenance.get((source, target_id, request_id))
+                record = self._authorized_request(source, target_id, request_id)
                 if (
                     not isinstance(request_id, str) or not request_id
-                    or not isinstance(record, dict)
-                    or record.get("generation") != state["generation"]
-                    or record.get("allowed") is not True
-                    or record.get("target_id") != target_id
+                    or record is None
                 ):
+                    return
+            elif inner_method == "Runtime.executionContextCreated":
+                context = inner_params.get("context") if isinstance(inner_params, dict) else None
+                context_id = context.get("uniqueId") if isinstance(context, dict) else None
+                if not context_id:
+                    context_id = context.get("id") if isinstance(context, dict) else None
+                aux_data = context.get("auxData") if isinstance(context, dict) else None
+                context_frame_id = aux_data.get("frameId") if isinstance(aux_data, dict) else None
+                if (
+                    not isinstance(context_id, (int, str))
+                    or context_frame_id != state.get("frame_id")
+                    or not self._context_origin_allowed(context, state.get("document_url"))
+                ):
+                    return
+                context_key = (source, target_id, str(context_id))
+                self._execution_contexts[context_key] = {
+                    "session_id": source,
+                    "target_id": target_id,
+                    "context_id": str(context_id),
+                    "generation": state["generation"],
+                    "frame_id": context_frame_id,
+                    "document_url": state.get("document_url"),
+                    "allowed": True,
+                }
+            elif inner_method in {"Runtime.consoleAPICalled", "Runtime.executionContextDestroyed"}:
+                context_id = inner_params.get("executionContextId") if isinstance(inner_params, dict) else None
+                context_key = (source, target_id, str(context_id))
+                context_record = self._execution_contexts.get(context_key)
+                if (
+                    not isinstance(context_id, (int, str))
+                    or not isinstance(context_record, dict)
+                    or context_record.get("generation") != state.get("generation")
+                    or context_record.get("document_url") != state.get("document_url")
+                    or context_record.get("frame_id") != state.get("frame_id")
+                    or context_record.get("allowed") is not True
+                ):
+                    return
+            elif inner_method not in _GUARDED_PAGE_EVENT_METHODS | {_NETWORK_REQUEST_METHOD}:
+                is_response = (
+                    method == _GUARDED_RESPONSE_METHOD
+                    and isinstance(payload, dict)
+                    and isinstance(payload.get("id"), (int, str))
+                    and ("result" in payload or "error" in payload)
+                )
+                if not is_response:
                     return
             provenance = {
                 "session_id": source,
@@ -832,6 +968,8 @@ class Daemon:
             }
             if request_id is not None:
                 provenance["request_id"] = request_id
+            if inner_method in {"Runtime.consoleAPICalled", "Runtime.executionContextDestroyed"}:
+                provenance["execution_context_id"] = str(context_id)
         self.events.append(event)
         self._event_provenance.append(provenance)
         event_session = source_session if self._guard_policy_active else session_id
@@ -844,6 +982,8 @@ class Daemon:
                 self.dialog_session = None
         elif method in ("Page.loadEventFired", "Page.domContentEventFired"):
             self._schedule_tab_marker(event_session)
+        if self._guard_policy_active and inner_method == "Runtime.executionContextDestroyed":
+            self._execution_contexts.pop(context_key, None)
 
     async def _tab_guard_reset(self, req):
         run_id = req.get("tab_guard_run")
@@ -870,6 +1010,18 @@ class Daemon:
             }
             self._request_provenance = {
                 key: value for key, value in self._request_provenance.items()
+                if key[0] not in revoked_sessions and key[1] not in revoked_targets
+            }
+            self._request_index = {
+                key: value for key, value in self._request_index.items()
+                if key[0] not in revoked_sessions and key[1] not in revoked_targets
+            }
+            self._ambiguous_request_ids = {
+                key for key in self._ambiguous_request_ids
+                if key[0] not in revoked_sessions and key[1] not in revoked_targets
+            }
+            self._execution_contexts = {
+                key: value for key, value in self._execution_contexts.items()
                 if key[0] not in revoked_sessions and key[1] not in revoked_targets
             }
             if self.session in revoked_sessions or self.target_id in revoked_targets:
@@ -1056,6 +1208,9 @@ class Daemon:
                             "target_id": self.target_id,
                             "generation": 0,
                             "url": info.get("url"),
+                            "document_url": info.get("url"),
+                            "frame_id": None,
+                            "loader_id": None,
                             "allowed": True,
                         }
             # Run the old-session Network.disable (defense in depth — keeps

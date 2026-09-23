@@ -768,7 +768,8 @@ def daemon_bridge(owning, monkeypatch):
     d._guarded_targets = {"MINE"}
     d._document_state["SESSION-MINE"] = {
         "target_id": "MINE", "generation": 0,
-        "url": "https://owned.example/", "allowed": True,
+        "url": "https://owned.example/", "document_url": "https://owned.example/",
+        "frame_id": "FRAME-MINE", "loader_id": "LOADER-MINE", "allowed": True,
     }
     calls = []
     class CDP:
@@ -848,7 +849,9 @@ def test_event_drain_filters_owned_sessions_and_preserves_foreign_events(daemon_
     for sid in ("SESSION-MINE", "FOREIGN-SESSION", None):
         d._record_event(
             "Network.requestWillBeSent",
-            {"secret": sid, "requestId": f"request-{sid}"},
+            {"secret": sid, "requestId": f"request-{sid}",
+             "documentURL": "https://owned.example/", "loaderId": "LOADER-MINE",
+             "frameId": "FRAME-MINE"},
             sid,
         )
     # Even with a foreign current page, reading this run's own events is safe.
@@ -875,24 +878,32 @@ def test_event_provenance_drops_privileged_document_payloads_across_navigation(
     monkeypatch.setenv("BH_TAB_MARKER", "0")
     d._record_event(
         "Network.requestWillBeSent",
-        {"secret": "allowed-before", "requestId": "before"},
+        {"secret": "allowed-before", "requestId": "before",
+         "documentURL": "https://owned.example/", "loaderId": "LOADER-MINE",
+         "frameId": "FRAME-MINE"},
         "SESSION-MINE",
     )
     d._record_event(
-        "Page.frameNavigated", {"frame": {"url": "chrome://settings"}}, "SESSION-MINE"
+        "Page.frameNavigated", {"frame": {"id": "FRAME-PRIV", "loaderId": "LOADER-PRIV",
+                                             "url": "chrome://settings"}}, "SESSION-MINE"
     )
     d._record_event(
         "Network.requestWillBeSent",
-        {"secret": "privileged", "requestId": "privileged"},
+        {"secret": "privileged", "requestId": "privileged",
+         "documentURL": "chrome://settings", "loaderId": "LOADER-PRIV",
+         "frameId": "FRAME-PRIV"},
         "SESSION-MINE",
     )
     before = helpers.drain_events() if intermediate_drain else []
     d._record_event(
-        "Page.frameNavigated", {"frame": {"url": "https://allowed.example/"}}, "SESSION-MINE"
+        "Page.frameNavigated", {"frame": {"id": "FRAME-ALLOWED", "loaderId": "LOADER-ALLOWED",
+                                             "url": "https://allowed.example/"}}, "SESSION-MINE"
     )
     d._record_event(
         "Network.requestWillBeSent",
-        {"secret": "allowed-after", "requestId": "after"},
+        {"secret": "allowed-after", "requestId": "after",
+         "documentURL": "https://allowed.example/", "loaderId": "LOADER-ALLOWED",
+         "frameId": "FRAME-ALLOWED"},
         "SESSION-MINE",
     )
     after = helpers.drain_events()
@@ -913,7 +924,9 @@ def test_subframe_navigation_does_not_replace_top_document_provenance(daemon_bri
     assert d._document_state["SESSION-MINE"] == before
     d._record_event(
         "Network.requestWillBeSent",
-        {"requestId": "after-subframe", "secret": "owned-page-event"},
+        {"requestId": "after-subframe", "secret": "owned-page-event",
+         "documentURL": "https://owned.example/", "loaderId": "LOADER-MINE",
+         "frameId": "FRAME-MINE"},
         "SESSION-MINE",
     )
     events = helpers.drain_events()
@@ -938,14 +951,33 @@ def test_network_supplemental_events_require_same_document_authorized_request(
         else:
             d._record_event(method, params, outer_session)
 
+    record("Network.requestWillBeSentExtraInfo", {"requestId": "unresolved"})
     record("Network.loadingFinished", {"requestId": "unresolved"})
-    record("Network.requestWillBeSent", {"requestId": "request-1", "secret": "authorized"})
+    record("Network.requestWillBeSent", {
+        "requestId": "mismatched-document", "documentURL": "https://other.example/",
+        "loaderId": "LOADER-MINE", "frameId": "FRAME-MINE", "secret": "mismatched",
+    })
+    record("Network.loadingFinished", {"requestId": "mismatched-document"})
+    for field in ("loaderId", "frameId"):
+        params = {
+            "requestId": f"mismatched-{field}", "documentURL": "https://owned.example/",
+            "loaderId": "LOADER-MINE", "frameId": "FRAME-MINE", "secret": field,
+        }
+        params[field] = f"WRONG-{field}"
+        record("Network.requestWillBeSent", params)
+        record("Network.loadingFinished", {"requestId": params["requestId"]})
+    record("Network.requestWillBeSent", {
+        "requestId": "request-1", "secret": "authorized",
+        "documentURL": "https://owned.example/", "loaderId": "LOADER-MINE",
+        "frameId": "FRAME-MINE",
+    })
+    record("Network.requestWillBeSentExtraInfo", {"requestId": "request-1"})
     record("Network.responseReceivedExtraInfo", {"requestId": "request-1"})
     record("Network.loadingFinished", {"requestId": "request-1"})
     record("Network.loadingFinished", {"requestId": "request-2"})
     d._record_event(
         "Page.frameNavigated",
-        {"frame": {"url": "chrome://settings"}},
+        {"frame": {"id": "FRAME-PRIV", "loaderId": "LOADER-PRIV", "url": "chrome://settings"}},
         "SESSION-MINE",
     )
     record("Network.loadingFinished", {"requestId": "request-1"})
@@ -963,21 +995,151 @@ def test_network_supplemental_events_require_same_document_authorized_request(
         assert sum(event["method"] == "Network.loadingFinished" for event in events) == 1
 
 
-def test_network_supplemental_event_after_allowed_return_is_not_reauthorized(daemon_bridge):
+@pytest.mark.parametrize("legacy", [False, True])
+def test_network_supplemental_event_keeps_its_original_authorization_across_navigation(
+    daemon_bridge, legacy
+):
     d, _ = daemon_bridge
-    d._record_event(
-        "Network.requestWillBeSent", {"requestId": "delayed", "secret": "start"}, "SESSION-MINE"
-    )
-    d._record_event(
-        "Page.frameNavigated", {"frame": {"url": "chrome://settings"}}, "SESSION-MINE"
-    )
-    d._record_event(
-        "Page.frameNavigated", {"frame": {"url": "https://allowed-again.example/"}}, "SESSION-MINE"
-    )
-    d._record_event("Network.loadingFinished", {"requestId": "delayed"}, "SESSION-MINE")
+
+    def record(method, params):
+        if legacy:
+            d._record_event(
+                "Target.receivedMessageFromTarget",
+                {"sessionId": "SESSION-MINE", "message": json.dumps({
+                    "method": method, "params": params,
+                })},
+                "FOREIGN-OUTER-CARRIER",
+            )
+        else:
+            d._record_event(method, params, "SESSION-MINE")
+
+    record("Network.requestWillBeSent", {
+        "requestId": "delayed", "secret": "start",
+        "documentURL": "https://owned.example/", "loaderId": "LOADER-MINE",
+        "frameId": "FRAME-MINE",
+    })
+    record("Page.frameNavigated", {
+        "frame": {"id": "FRAME-PRIV", "loaderId": "LOADER-PRIV", "url": "chrome://settings"}
+    })
+    record("Page.frameNavigated", {
+        "frame": {"id": "FRAME-ALLOWED", "loaderId": "LOADER-ALLOWED",
+                   "url": "https://allowed-again.example/"}
+    })
+    record("Network.loadingFinished", {"requestId": "delayed"})
     events = helpers.drain_events()
-    assert any(event.get("params", {}).get("secret") == "start" for event in events)
-    assert not any(event["method"] == "Network.loadingFinished" for event in events)
+    assert "start" in json.dumps(events)
+    if legacy:
+        assert any(
+            event["method"] == "Target.receivedMessageFromTarget"
+            and json.loads(event["params"]["message"]).get("method") == "Network.loadingFinished"
+            for event in events
+        )
+    else:
+        assert any(event["method"] == "Network.loadingFinished" for event in events)
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_denied_request_stays_denied_after_return_to_allowed_document(daemon_bridge, legacy):
+    d, _ = daemon_bridge
+
+    def record(method, params):
+        if legacy:
+            d._record_event(
+                "Target.receivedMessageFromTarget",
+                {"sessionId": "SESSION-MINE", "message": json.dumps({
+                    "method": method, "params": params,
+                })},
+                "FOREIGN-OUTER-CARRIER",
+            )
+        else:
+            d._record_event(method, params, "SESSION-MINE")
+
+    record("Page.frameNavigated", {
+        "frame": {"id": "FRAME-PRIV", "loaderId": "LOADER-PRIV", "url": "chrome://settings"},
+    })
+    record("Network.requestWillBeSent", {
+        "requestId": "denied-request", "documentURL": "chrome://settings",
+        "loaderId": "LOADER-PRIV", "frameId": "FRAME-PRIV", "secret": "denied",
+    })
+    record("Page.frameNavigated", {
+        "frame": {"id": "FRAME-ALLOWED", "loaderId": "LOADER-ALLOWED",
+                   "url": "https://allowed-again.example/"},
+    })
+    record("Network.requestWillBeSent", {
+        "requestId": "denied-request", "documentURL": "https://allowed-again.example/",
+        "loaderId": "LOADER-ALLOWED", "frameId": "FRAME-ALLOWED", "secret": "revived",
+    })
+    record("Network.responseReceivedExtraInfo", {"requestId": "denied-request"})
+    record("Network.loadingFinished", {"requestId": "denied-request"})
+
+    events = helpers.drain_events()
+    encoded = json.dumps(events)
+    assert "revived" in encoded
+    secrets = []
+    for event in events:
+        params = event.get("params", {})
+        if event.get("method") == "Target.receivedMessageFromTarget":
+            params = json.loads(params["message"]).get("params", {})
+        if isinstance(params, dict) and "secret" in params:
+            secrets.append(params["secret"])
+    assert "denied" not in secrets
+    assert not any(
+        event.get("method") == "Network.loadingFinished"
+        or (event.get("method") == "Target.receivedMessageFromTarget"
+            and json.loads(event["params"]["message"]).get("method") == "Network.loadingFinished")
+        for event in events
+    )
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_unclassified_stream_and_console_events_require_provenance(daemon_bridge, legacy):
+    d, _ = daemon_bridge
+
+    def record(method, params):
+        if legacy:
+            d._record_event(
+                "Target.receivedMessageFromTarget",
+                {"sessionId": "SESSION-MINE", "message": json.dumps({
+                    "method": method, "params": params,
+                })},
+                "FOREIGN-OUTER-CARRIER",
+            )
+        else:
+            d._record_event(method, params, "SESSION-MINE")
+
+    record("Network.eventSourceMessageReceived", {"requestId": "missing", "data": "secret-stream"})
+    record("Runtime.consoleAPICalled", {"executionContextId": 999, "args": [{"value": "secret-console"}]})
+    record("Network.unknownEvent", {"secret": "unknown"})
+    record("Network.requestWillBeSent", {
+        "requestId": "stream-request", "documentURL": "https://owned.example/",
+        "loaderId": "LOADER-MINE", "frameId": "FRAME-MINE",
+    })
+    record("Network.eventSourceMessageReceived", {
+        "requestId": "stream-request", "data": "owned-stream",
+    })
+    record("Runtime.executionContextCreated", {
+        "context": {
+            "id": 7,
+            "origin": "https://owned.example",
+            "auxData": {"frameId": "FRAME-MINE"},
+        },
+    })
+    record("Runtime.consoleAPICalled", {"executionContextId": 7, "args": [{"value": "owned-console"}]})
+    record("Page.frameNavigated", {
+        "frame": {"id": "FRAME-NEXT", "loaderId": "LOADER-NEXT",
+                   "url": "https://next.example/"},
+    })
+    record("Runtime.consoleAPICalled", {
+        "executionContextId": 7, "args": [{"value": "stale-console"}],
+    })
+    events = helpers.drain_events()
+    encoded = json.dumps(events)
+    assert "secret-stream" not in encoded
+    assert "secret-console" not in encoded
+    assert "unknown" not in encoded
+    assert "owned-stream" in encoded
+    assert "owned-console" in encoded
+    assert "stale-console" not in encoded
 
 
 def test_event_drain_hides_owned_session_without_target_proof(daemon_bridge):
@@ -985,7 +1147,9 @@ def test_event_drain_hides_owned_session_without_target_proof(daemon_bridge):
     d._session_targets.pop("SESSION-MINE")
     d._record_event(
         "Network.requestWillBeSent",
-        {"secret": "owned", "requestId": "owned"},
+        {"secret": "owned", "requestId": "owned",
+         "documentURL": "https://owned.example/", "loaderId": "LOADER-MINE",
+         "frameId": "FRAME-MINE"},
         "SESSION-MINE",
     )
     assert helpers.drain_events() == []
