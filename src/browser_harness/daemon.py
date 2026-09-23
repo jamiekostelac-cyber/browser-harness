@@ -894,8 +894,86 @@ class Daemon:
             return None
         return record
 
+    def _revoke_event_ownership(self, sessions=(), targets=()):
+        """Revoke target state and buffered authorization tied to destroyed CDP objects."""
+        sessions, targets = set(sessions), set(targets)
+        for sid, target in self._session_targets.items():
+            if target in targets:
+                sessions.add(sid)
+        if not self._guard_policy_active:
+            return
+
+        self._guarded_sessions.difference_update(sessions)
+        self._guarded_targets.difference_update(targets)
+        self._revoked_sessions.update(sessions)
+        for sid in sessions:
+            self._session_targets.pop(sid, None)
+            self._document_state.pop(sid, None)
+        self._session_targets = {
+            sid: target for sid, target in self._session_targets.items()
+            if target not in targets
+        }
+        self._session_replacements = {
+            stale: replacement for stale, replacement in self._session_replacements.items()
+            if stale not in sessions and replacement not in sessions
+        }
+        self._legacy_commands = {
+            key: value for key, value in self._legacy_commands.items()
+            if value.get("session_id") not in sessions
+            and value.get("target_id") not in targets
+        }
+        self._request_provenance = {
+            key: value for key, value in self._request_provenance.items()
+            if key[0] not in sessions and key[1] not in targets
+        }
+        self._request_index = {
+            key: value for key, value in self._request_index.items()
+            if key[0] not in sessions and key[1] not in targets
+        }
+        self._ambiguous_request_ids = {
+            key for key in self._ambiguous_request_ids
+            if key[0] not in sessions and key[1] not in targets
+        }
+        self._execution_contexts = {
+            key: value for key, value in self._execution_contexts.items()
+            if key[0] not in sessions and key[1] not in targets
+        }
+        if self.session in sessions or self.target_id in targets:
+            self.session = None
+            self.target_id = None
+        if self.dialog_session in sessions:
+            self.dialog = None
+            self.dialog_session = None
+            self.dialog_generation = None
+            self.dialog_document_url = None
+
+        retained_events, retained_provenance = deque(maxlen=BUF), deque(maxlen=BUF)
+        for event, provenance in zip(self.events, self._event_provenance):
+            if (isinstance(provenance, dict)
+                    and provenance.get("session_id") not in sessions
+                    and provenance.get("target_id") not in targets):
+                retained_events.append(event)
+                retained_provenance.append(provenance)
+        self.events = retained_events
+        self._event_provenance = retained_provenance
+
+    def _record_browser_lifecycle_event(self, method, params):
+        """Handle browser-level lifecycle notifications with no source session."""
+        if not self._guard_policy_active or not isinstance(params, dict):
+            return
+        if method == "Target.detachedFromTarget":
+            sid = params.get("sessionId")
+            if isinstance(sid, str) and sid in self._guarded_sessions:
+                self._revoke_event_ownership({sid})
+        elif method == "Target.targetDestroyed":
+            target = params.get("targetId")
+            if isinstance(target, str) and target in self._guarded_targets:
+                self._revoke_event_ownership(targets={target})
+
     def _record_event(self, method, params, session_id=None):
         event = {"method": method, "params": params, "session_id": session_id}
+        if session_id is None:
+            self._record_browser_lifecycle_event(method, params)
         source_session, inner_method, inner_params, payload = self._event_details(event)
         provenance = None
         if self._guard_policy_active:

@@ -919,6 +919,45 @@ def test_event_drain_filters_owned_sessions_and_preserves_foreign_events(daemon_
     assert helpers.drain_events() == []
 
 
+@pytest.mark.parametrize("method,params", [
+    ("Target.detachedFromTarget", {"sessionId": "SESSION-MINE", "targetId": "MINE"}),
+    ("Target.targetDestroyed", {"targetId": "MINE"}),
+])
+def test_browser_lifecycle_revokes_ownership_and_discards_queued_events(
+    daemon_bridge, monkeypatch, method, params
+):
+    d, _ = daemon_bridge
+    monkeypatch.setenv("BH_TAB_MARKER", "0")
+    d._record_event("Network.requestWillBeSent", {
+        "requestId": "request-before-destroy", "documentURL": "https://owned.example/",
+        "loaderId": "LOADER-MINE", "frameId": "FRAME-MINE",
+    }, "SESSION-MINE")
+    d.events.append({"method": "unprovenanced"})
+    d._event_provenance.append(None)
+    assert len(d.events) == len(d._event_provenance) == 2
+
+    d._record_event(method, params)
+
+    assert not d.events
+    assert not d._event_provenance
+    assert "SESSION-MINE" not in d._guarded_sessions
+    assert "SESSION-MINE" not in d._session_targets
+    assert "SESSION-MINE" not in d._document_state
+    if method == "Target.targetDestroyed":
+        assert "MINE" not in d._guarded_targets
+    else:
+        assert "MINE" in d._guarded_targets
+    with pytest.raises(helpers.TabGuardRefused):
+        helpers.drain_events()
+
+
+def test_unowned_browser_lifecycle_event_does_not_revoke_owned_target(daemon_bridge):
+    d, _ = daemon_bridge
+    d._record_event("Target.targetDestroyed", {"targetId": "FOREIGN"})
+    assert d._guarded_sessions == {"SESSION-MINE"}
+    assert d._guarded_targets == {"MINE"}
+
+
 @pytest.mark.parametrize("method", ["Page.loadEventFired", "Page.domContentEventFired"])
 def test_guarded_timestamp_page_events_use_owned_document_provenance(
     daemon_bridge, monkeypatch, method
