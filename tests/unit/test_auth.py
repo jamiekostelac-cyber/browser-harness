@@ -43,6 +43,22 @@ def test_save_auth_record_does_not_harden_relative_parent(monkeypatch, tmp_path)
     auth.save_auth_record(auth.AuthRecord(api_key="x" * 24), path=Path("auth.json"))
 
     assert Path("auth.json").exists()
-    assert (Path("auth.json.tmp"), False) in calls
-    assert (Path("auth.json"), False) in calls
+    assert any(path.name.startswith("auth.json.") and path.name.endswith(".tmp") for path, _ in calls)
     assert (Path("."), True) not in calls
+
+
+def test_write_private_json_hardens_before_writing_and_fails_closed(monkeypatch, tmp_path):
+    path = tmp_path / "auth.json.tmp"
+    key = "secret-api-key-that-must-not-be-written"
+
+    def fail_hardening(path, *, directory=False):
+        assert path.exists()
+        assert path.read_bytes() == b""
+        raise PermissionError("ACL hardening failed")
+
+    monkeypatch.setattr(auth, "_chmod_private", fail_hardening)
+
+    with pytest.raises(PermissionError, match="ACL hardening failed"):
+        auth._write_private_json(path, {"api_key": key})
+
+    assert not path.exists()

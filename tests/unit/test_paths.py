@@ -1,3 +1,4 @@
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -14,6 +15,8 @@ def _set_windows_identity(monkeypatch):
 def _successful_icacls(calls):
     def fake_run(args, **kwargs):
         calls.append((args, kwargs))
+        if "/save" in args:
+            Path(args[args.index("/save") + 1]).write_bytes(b"saved dacl")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     return fake_run
@@ -31,9 +34,8 @@ def test_ensure_private_dir_replaces_windows_acl_recursively(monkeypatch, tmp_pa
     assert argv[0][:3] == ["icacls", str(target), "/save"]
     assert argv[0][-1] == "/T"
     assert argv[1:] == [
-        ["icacls", str(target), "/reset", "/T"],
-        ["icacls", str(target), "/grant:r", "WORKSTATION\\alice:(OI)(CI)F", "/T"],
         ["icacls", str(target), "/inheritance:r", "/T"],
+        ["icacls", str(target), "/grant:r", "WORKSTATION\\alice:(OI)(CI)F", "/T"],
     ]
     assert all(call[1] == {"capture_output": True, "text": True, "check": False} for call in calls)
 
@@ -53,9 +55,8 @@ def test_ensure_private_dir_rehardens_existing_windows_tree(monkeypatch, tmp_pat
     backup = argv[0][3]
     assert argv == [
         ["icacls", str(target), "/save", backup, "/T"],
-        ["icacls", str(target), "/reset", "/T"],
-        ["icacls", str(target), "/grant:r", "WORKSTATION\\alice:(OI)(CI)F", "/T"],
         ["icacls", str(target), "/inheritance:r", "/T"],
+        ["icacls", str(target), "/grant:r", "WORKSTATION\\alice:(OI)(CI)F", "/T"],
     ]
 
 
@@ -71,9 +72,8 @@ def test_harden_private_path_replaces_file_acl_on_windows(monkeypatch, tmp_path)
     assert len(argv[0]) == 4
     backup = argv[0][3]
     assert argv[1:] == [
-        ["icacls", str(target), "/reset"],
-        ["icacls", str(target), "/grant:r", "WORKSTATION\\alice:F"],
         ["icacls", str(target), "/inheritance:r"],
+        ["icacls", str(target), "/grant:r", "WORKSTATION\\alice:F"],
     ]
     assert argv[0] == ["icacls", str(target), "/save", backup]
 
@@ -86,26 +86,31 @@ def test_harden_private_path_restores_acl_after_partial_failure(monkeypatch, tmp
 
     def fake_run(args, **kwargs):
         calls.append(args)
+        if "/save" in args:
+            Path(args[args.index("/save") + 1]).write_bytes(b"saved dacl")
         if "/grant:r" in args:
             return SimpleNamespace(returncode=5, stdout="", stderr="Access is denied.")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(paths.subprocess, "run", fake_run)
 
-    with pytest.warns(RuntimeWarning, match="icacls exited with 5"):
+    with pytest.raises(PermissionError, match="icacls exited with 5"):
         paths.harden_private_path(target, directory=True)
 
     backup = calls[0][3]
-    assert calls == [
+    assert calls[:4] == [
         ["icacls", str(target), "/save", backup, "/T"],
-        ["icacls", str(target), "/reset", "/T"],
+        ["icacls", str(target), "/inheritance:r", "/T"],
         ["icacls", str(target), "/grant:r", "WORKSTATION\\alice:(OI)(CI)F", "/T"],
         ["icacls", str(target.parent), "/restore", backup],
     ]
-    assert not any("/inheritance:r" in call for call in calls)
+    assert calls[4][:3] == ["icacls", str(target), "/save"]
+    assert calls[4][-1] == "/T"
+    assert len(calls) == 5
+    assert all("/reset" not in call for call in calls)
 
 
-def test_harden_private_path_warns_when_icacls_fails(monkeypatch, tmp_path):
+def test_harden_private_path_raises_when_icacls_fails(monkeypatch, tmp_path):
     _set_windows_identity(monkeypatch)
 
     def fake_run(args, **kwargs):
@@ -113,7 +118,7 @@ def test_harden_private_path_warns_when_icacls_fails(monkeypatch, tmp_path):
 
     monkeypatch.setattr(paths.subprocess, "run", fake_run)
 
-    with pytest.warns(RuntimeWarning, match="icacls exited with 5"):
+    with pytest.raises(PermissionError, match="icacls exited with 5"):
         paths.harden_private_path(tmp_path / "private", directory=True)
 
 
@@ -122,7 +127,7 @@ def test_harden_private_path_warns_without_windows_username(monkeypatch, tmp_pat
     monkeypatch.delenv("USERNAME", raising=False)
     monkeypatch.delenv("USERDOMAIN", raising=False)
 
-    with pytest.warns(RuntimeWarning, match="USERNAME is not set"):
+    with pytest.raises(PermissionError, match="USERNAME is not set"):
         paths.harden_private_path(tmp_path / "private", directory=True)
 
 
@@ -134,8 +139,31 @@ def test_harden_private_path_warns_when_icacls_is_unavailable(monkeypatch, tmp_p
 
     monkeypatch.setattr(paths.subprocess, "run", fake_run)
 
-    with pytest.warns(RuntimeWarning, match="icacls"):
+    with pytest.raises(PermissionError, match="icacls"):
         paths.harden_private_path(tmp_path / "private", directory=True)
+
+
+def test_harden_private_path_propagates_acl_restore_failure(monkeypatch, tmp_path):
+    _set_windows_identity(monkeypatch)
+    target = tmp_path / "auth.json"
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        if "/save" in args:
+            Path(args[args.index("/save") + 1]).write_bytes(b"saved dacl")
+        if "/grant:r" in args:
+            return SimpleNamespace(returncode=5, stdout="", stderr="Access denied")
+        if "/restore" in args:
+            return SimpleNamespace(returncode=5, stdout="", stderr="Restore denied")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(paths.subprocess, "run", fake_run)
+
+    with pytest.raises(PermissionError, match="Restore denied"):
+        paths.harden_private_path(target)
+
+    assert calls[-1][0:3] == ["icacls", str(target.parent), "/restore"]
 
 
 def test_posix_private_modes(monkeypatch, tmp_path):

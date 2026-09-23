@@ -3,9 +3,8 @@ from __future__ import annotations
 
 import os
 import subprocess
-import tempfile
 import sys
-import warnings
+import tempfile
 from pathlib import Path
 
 
@@ -36,35 +35,22 @@ def _run_icacls(path: Path, *args: str) -> bool:
             check=False,
         )
     except OSError as exc:
-        warnings.warn(
-            f"could not restrict permissions for {path}: {exc}",
-            RuntimeWarning,
-            stacklevel=3,
-        )
-        return False
+        raise PermissionError(f"could not restrict permissions for {path}: {exc}") from exc
 
     if result.returncode == 0:
         return True
 
     detail = (result.stderr or result.stdout or "").strip()
     suffix = f": {detail}" if detail else ""
-    warnings.warn(
-        f"could not restrict permissions for {path}: icacls exited with {result.returncode}{suffix}",
-        RuntimeWarning,
-        stacklevel=3,
+    raise PermissionError(
+        f"could not restrict permissions for {path}: icacls exited with {result.returncode}{suffix}"
     )
-    return False
 
 
 def _harden_windows_acl(path: Path, *, directory: bool) -> None:
     principal = _windows_principal()
     if not principal:
-        warnings.warn(
-            f"could not restrict permissions for {path}: USERNAME is not set",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        return
+        raise PermissionError(f"could not restrict permissions for {path}: USERNAME is not set")
 
     recursive = ("/T",) if directory else ()
     inheritance = "(OI)(CI)" if directory else ""
@@ -76,22 +62,27 @@ def _harden_windows_acl(path: Path, *, directory: bool) -> None:
     backup_path.unlink(missing_ok=True)
 
     try:
-        # Keep the ACL transition failure-safe. If any restrictive update fails
-        # after /reset, restore the exact pre-change DACL before returning.
-        if not _run_icacls(path, "/save", str(backup_path), *recursive):
-            return
+        _run_icacls(path, "/save", str(backup_path), *recursive)
 
         for args in (
-            ("/reset", *recursive),
-            ("/grant:r", grant, *recursive),
             ("/inheritance:r", *recursive),
+            ("/grant:r", grant, *recursive),
         ):
-            if _run_icacls(path, *args):
-                continue
-
-            restore_root = path.parent if path.parent != Path("") else Path(".")
-            _run_icacls(restore_root, "/restore", str(backup_path))
-            return
+            try:
+                _run_icacls(path, *args)
+            except PermissionError:
+                restore_root = path.parent if path.parent != Path("") else Path(".")
+                _run_icacls(restore_root, "/restore", str(backup_path))
+                with tempfile.NamedTemporaryFile(prefix="browser-harness-acl-check-", delete=False) as f:
+                    verify_path = Path(f.name)
+                verify_path.unlink()
+                try:
+                    _run_icacls(path, "/save", str(verify_path), *recursive)
+                    if verify_path.read_bytes() != backup_path.read_bytes():
+                        raise PermissionError(f"could not verify restored permissions for {path}")
+                finally:
+                    verify_path.unlink(missing_ok=True)
+                raise
     finally:
         backup_path.unlink(missing_ok=True)
 

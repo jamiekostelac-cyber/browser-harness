@@ -5,26 +5,26 @@ or tells the agent to run `browser-harness auth login`. OAuth details live here.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from http.server import BaseHTTPRequestHandler, HTTPServer
 import argparse
 import base64
 import getpass
 import hashlib
 import json
 import os
-from pathlib import Path
 import secrets
 import stat
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
+from dataclasses import dataclass, field
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
 from . import paths
-
 
 AUTH_BASE = "https://api.browser-use.com"
 # Browser Use currently exposes this registered CLI OAuth client. Keep an env
@@ -150,11 +150,9 @@ def save_auth_record(record: AuthRecord, path: Path | None = None) -> None:
         _chmod_private(path.parent, directory=True)
     existing = load_auth_file(path)
     existing["browser_use"] = record.to_storage()
-    tmp = path.with_name(path.name + ".tmp")
+    tmp = _new_auth_temp(path)
     _write_private_json(tmp, existing)
-    _chmod_private(tmp)
     os.replace(tmp, path)
-    _chmod_private(path)
 
 
 def clear_auth(path: Path | None = None) -> bool:
@@ -163,11 +161,9 @@ def clear_auth(path: Path | None = None) -> bool:
     existed = bool(data.get("browser_use"))
     data.pop("browser_use", None)
     if data:
-        tmp = path.with_name(path.name + ".tmp")
+        tmp = _new_auth_temp(path)
         _write_private_json(tmp, data)
-        _chmod_private(tmp)
         os.replace(tmp, path)
-        _chmod_private(path)
     else:
         try:
             path.unlink()
@@ -470,24 +466,30 @@ def _read_manual_api_key(input_stream=None) -> str:
 
 def _write_private_json(path: Path, data: dict) -> None:
     raw = (json.dumps(data, indent=2) + "\n").encode()
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    flags = os.O_WRONLY | os.O_CREAT
     fd = os.open(path, flags, stat.S_IRUSR | stat.S_IWUSR)
+    os.close(fd)
     try:
+        _chmod_private(path)
+        fd = os.open(path, os.O_WRONLY | os.O_TRUNC)
         with os.fdopen(fd, "wb") as f:
             f.write(raw)
     except BaseException:
         try:
-            os.close(fd)
+            path.unlink(missing_ok=True)
         except OSError:
             pass
         raise
 
 
+def _new_auth_temp(path: Path) -> Path:
+    fd, name = tempfile.mkstemp(prefix=f"{path.name}.", suffix=".tmp", dir=path.parent)
+    os.close(fd)
+    return Path(name)
+
+
 def _chmod_private(path: Path, *, directory=False) -> None:
-    try:
-        paths.harden_private_path(path, directory=directory)
-    except OSError:
-        pass
+    paths.harden_private_path(path, directory=directory)
 
 
 def _one(qs: dict[str, list[str]], key: str) -> str | None:
