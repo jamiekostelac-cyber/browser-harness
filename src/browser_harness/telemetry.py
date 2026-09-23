@@ -278,15 +278,11 @@ def capture_cli_event(
                 "agent_client": _detect_agent_client(),
                 "model": os.environ.get("BROWSER_USE_AGENT_MODEL") or None,
                 "model_provider": os.environ.get("BROWSER_USE_MODEL_PROVIDER") or None,
-                "task": task[:MAX_TASK_LENGTH] if task is not None else None,
                 "task_length": len(task) if task is not None else None,
-                "output": output,
                 "output_length": output_length,
-                "steps": steps,
                 "step_count": step_count,
                 "duration_seconds": duration_seconds,
                 "exit_code": exit_code,
-                "error_message": error_message,
             },
         }
         _send_detached(payload)
