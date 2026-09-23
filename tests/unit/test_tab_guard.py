@@ -204,6 +204,26 @@ def test_guard_rejects_explicit_owned_session_on_privileged_current_target(ownin
     assert not any(req.get("method") for req in calls)
 
 
+@pytest.mark.parametrize("nested", [False, True])
+def test_guard_rejects_explicit_owned_session_mismatch_before_dispatch(owning, monkeypatch, nested):
+    calls = []
+    fake = _fake_send(current={"targetId": "MINE", "url": "https://current.example/"}, session="OTHER-SESSION")
+    def send(req, **kwargs):
+        calls.append(req)
+        return fake(req, **kwargs)
+    monkeypatch.setattr(helpers, "_send", send)
+    with pytest.raises(helpers.TabGuardRefused, match="does not match"):
+        if nested:
+            helpers.cdp(
+                "Target.sendMessageToTarget",
+                sessionId="SESSION-MINE",
+                message=json.dumps({"id": 1, "method": "Page.navigate", "params": {"url": "https://next.example/"}}),
+            )
+        else:
+            helpers.cdp("Page.navigate", session_id="SESSION-MINE", url="https://next.example/")
+    assert not any(req.get("method") for req in calls)
+
+
 def test_refuses_non_page_targets_without_owned_ancestry(owning, monkeypatch):
     monkeypatch.setattr(helpers, "_send", _fake_send(
         current={"targetId": "MINE"}, target_type="iframe"))
@@ -457,7 +477,7 @@ def test_nested_owned_page_method_remains_allowed(owning):
     )
 
 
-def test_owned_iframe_js_proves_ancestry_and_detaches(owning, monkeypatch):
+def test_owned_iframe_session_fails_closed_without_target_mapping(owning, monkeypatch):
     calls = []
     base = _fake_send(current={"targetId": "MINE", "url": "https://example.com/"}, target_type="iframe")
     def send(req, **kw):
@@ -468,13 +488,11 @@ def test_owned_iframe_js_proves_ancestry_and_detaches(owning, monkeypatch):
                 {"frame": {"id": "CHILD"}, "childFrames": [{"frame": {"id": "IFRAME"}}]}]}}}
         if req.get("method") == "Target.attachToTarget":
             return {"result": {"sessionId": "IFRAME-SESSION"}}
-        if req.get("method") == "Runtime.evaluate":
-            return {"result": {"result": {"value": 42}}}
         return base(req, **kw)
     monkeypatch.setattr(helpers, "_send", send)
-    assert helpers.js("42", target_id="IFRAME") == 42
-    assert calls[-1]["params"] == {"sessionId": "IFRAME-SESSION"}
-    assert "IFRAME-SESSION" not in helpers._owned_sessions()
+    with pytest.raises(helpers.TabGuardRefused, match="does not match"):
+        helpers.js("42", target_id="IFRAME")
+    assert not any(req.get("method") == "Runtime.evaluate" for req in calls)
 
 
 @pytest.mark.parametrize("target_type", ["iframe", "worker", "service_worker", "browser", None])

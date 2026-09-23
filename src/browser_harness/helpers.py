@@ -170,8 +170,12 @@ def _url_scope_check(method, params):
 
 
 def _validate_context_url(method, params, session_id, context):
-    if not isinstance(context, dict) or context.get("session_id") != session_id:
-        return
+    if not isinstance(context, dict):
+        _refuse(method, f"session:{session_id}", params.get("url", ""),
+                "attached target/session could not be resolved (failing closed)")
+    if context.get("session_id") != session_id:
+        _refuse(method, f"session:{session_id}", params.get("url", ""),
+                "session does not match the daemon current session and has no target ownership mapping")
     if "url" not in context:
         _refuse(method, f"session:{session_id}", params.get("url", ""),
                 "daemon did not provide the attached target URL (failing closed)")
