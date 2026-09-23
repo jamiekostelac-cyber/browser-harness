@@ -17,7 +17,7 @@ PY
 Install the test dependency and run the unit suite with:
 
 ```bash
-python -m pip install -e ".[test]"
+python -m pip install -e ".[test,mcp]"
 python -m pytest tests/unit
 ```
 
