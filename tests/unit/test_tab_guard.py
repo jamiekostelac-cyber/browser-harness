@@ -12,6 +12,9 @@ from browser_harness import daemon, helpers
 
 
 FOREIGN = {"targetId": "FOREIGN", "url": "https://mail.example.com/", "title": "Inbox"}
+RUN_ID = "123e4567-e89b-42d3-a456-426614174000"
+RUN_ID_2 = "123e4567-e89b-42d3-a456-426614174001"
+RUN_ID_3 = "123e4567-e89b-42d3-a456-426614174002"
 
 
 def _fake_send(current=FOREIGN, created="MINE", session="SESSION-MINE", target_type="page"):
@@ -36,7 +39,7 @@ def guard(tmp_path, monkeypatch):
     """Guard on, ownership isolated to tmp_path, daemon attached to a tab this
     run did not open."""
     monkeypatch.setenv("BH_TAB_GUARD", "1")
-    monkeypatch.setenv("BH_TAB_GUARD_RUN", "test-run")
+    monkeypatch.setenv("BH_TAB_GUARD_RUN", RUN_ID)
     monkeypatch.delenv("BH_TAB_GUARD_LOG", raising=False)
     monkeypatch.setattr(helpers.ipc, "_TMP", tmp_path)
     helpers.tab_guard_reset()
@@ -89,7 +92,7 @@ def test_fails_closed_when_the_attached_tab_cannot_be_read(tmp_path, monkeypatch
     """"Unknown" must not mean "permitted": treating an unreadable current tab
     as nothing-to-refuse turns any daemon hiccup into a bypass."""
     monkeypatch.setenv("BH_TAB_GUARD", "1")
-    monkeypatch.setenv("BH_TAB_GUARD_RUN", "test-run")
+    monkeypatch.setenv("BH_TAB_GUARD_RUN", RUN_ID)
     monkeypatch.setattr(helpers.ipc, "_TMP", tmp_path)
     helpers.tab_guard_reset()
 
@@ -111,6 +114,13 @@ def test_allows_everything_on_a_tab_the_run_opened(owning):
     helpers.js("document.title")
     helpers.type_text("hi")
     helpers.cdp("Target.closeTarget", targetId="MINE")
+
+
+@pytest.mark.parametrize("method", [
+    "Emulation.setEmulatedMedia", "Network.enable", "Page.bringToFront", "Page.reload",
+])
+def test_owned_page_scope_allowlist_remains_allowed(owning, method):
+    helpers.cdp(method)
 
 
 def test_allows_enumerating_tabs_without_attaching(guard):
@@ -157,10 +167,10 @@ def test_guard_off_by_default_leaves_every_tab_reachable(tmp_path, monkeypatch):
 # --- ownership bookkeeping ------------------------------------------------
 
 def test_ownership_is_scoped_to_the_run_id(guard, monkeypatch):
-    monkeypatch.setenv("BH_TAB_GUARD_RUN", "run-1")
+    monkeypatch.setenv("BH_TAB_GUARD_RUN", RUN_ID)
     helpers.cdp("Target.createTarget", url="about:blank")
     assert helpers._owned_ids() == {"MINE"}
-    monkeypatch.setenv("BH_TAB_GUARD_RUN", "run-2")
+    monkeypatch.setenv("BH_TAB_GUARD_RUN", RUN_ID_2)
     assert helpers._owned_ids() == set()
     with pytest.raises(helpers.TabGuardRefused):
         helpers.cdp("Target.closeTarget", targetId="MINE")
@@ -176,7 +186,7 @@ def test_a_concurrent_run_cannot_consume_this_run_s_ownership(guard, monkeypatch
     monkeypatch.delenv("BH_TAB_GUARD")
     helpers._own_tab("THEIRS")
     monkeypatch.setenv("BH_TAB_GUARD", "1")
-    monkeypatch.setenv("BH_TAB_GUARD_RUN", "test-run")
+    monkeypatch.setenv("BH_TAB_GUARD_RUN", RUN_ID)
     assert helpers._owned_ids() == {"MINE"}
 
 
@@ -190,7 +200,7 @@ def test_ownership_crosses_a_process_boundary(guard, tmp_path):
         f"helpers.ipc._TMP = pathlib.Path({str(tmp_path)!r})\n"
         "print(json.dumps(sorted(helpers._owned_ids())))\n"
     )
-    env = {**os.environ, "BH_TAB_GUARD": "1", "BH_TAB_GUARD_RUN": "test-run"}
+    env = {**os.environ, "BH_TAB_GUARD": "1", "BH_TAB_GUARD_RUN": RUN_ID}
     out = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, env=env)
     assert out.returncode == 0, out.stderr
     assert json.loads(out.stdout) == ["MINE"]
@@ -229,7 +239,7 @@ def test_an_unwritable_log_does_not_swallow_the_refusal(guard, monkeypatch):
         helpers.goto_url("https://example.com/")
 
 
-@pytest.mark.parametrize("run_id", [None, "", " \t\n"])
+@pytest.mark.parametrize("run_id", [None, "", " \t\n", "test-run", "job-42"])
 def test_guard_requires_nonempty_run_before_any_dispatch(guard, monkeypatch, run_id):
     if run_id is None:
         monkeypatch.delenv("BH_TAB_GUARD_RUN")
@@ -243,17 +253,25 @@ def test_guard_requires_nonempty_run_before_any_dispatch(guard, monkeypatch, run
     assert calls == []
 
 
-@pytest.mark.parametrize("first,second", [
-    ("job/a", "job_a"), ("x" * 64 + "a", "x" * 64 + "b"),
-    ("é", "e\u0301"), ("run", " run"),
-])
-def test_lossy_run_names_cannot_share_ownership(guard, monkeypatch, first, second):
+@pytest.mark.parametrize("first,second", [(RUN_ID, RUN_ID_2), (RUN_ID, RUN_ID_3)])
+def test_distinct_valid_run_ids_cannot_share_ownership(guard, monkeypatch, first, second):
     monkeypatch.setenv("BH_TAB_GUARD_RUN", first)
     helpers._own_tab("MINE")
     first_path = helpers._owned_path()
     monkeypatch.setenv("BH_TAB_GUARD_RUN", second)
     assert helpers._owned_path() != first_path
     assert helpers._owned_ids() == set()
+
+
+@pytest.mark.parametrize("run_id", [
+    "test-run", "job-42", "12345678-1234-1234-1234-123456789abc",
+    "123e4567-e89b-42d3-0456-426614174000",
+])
+def test_low_entropy_run_ids_are_rejected_before_ownership_path_access(guard, monkeypatch, run_id):
+    monkeypatch.setenv("BH_TAB_GUARD_RUN", run_id)
+    monkeypatch.setattr(helpers, "_owned_path", lambda: pytest.fail("invalid run IDs must not resolve a path"))
+    with pytest.raises(helpers.TabGuardRefused, match="canonical UUID4"):
+        helpers.cdp("Target.getTargets")
 
 
 def test_daemon_names_are_part_of_ownership_key_even_in_custom_tmp(guard, monkeypatch):
@@ -317,6 +335,8 @@ def test_nested_message_cannot_route_to_foreign_target(owning):
 
 @pytest.mark.parametrize("method", [
     "Target.exposeDevToolsProtocol",
+    "ServiceWorker.enable",
+    "Storage.trackIndexedDBForOrigin",
     "Network.getAllCookies",
     "Network.clearBrowserCookies",
     "Network.clearBrowserCache",
@@ -339,7 +359,11 @@ def test_guard_refuses_browser_and_context_wide_methods_before_dispatch(owning, 
     assert calls == []
 
 
-@pytest.mark.parametrize("method", ["Network.getAllCookies", "Network.clearBrowserCookies", "Target.exposeDevToolsProtocol"])
+@pytest.mark.parametrize("method", [
+    "Network.getAllCookies", "Network.clearBrowserCookies",
+    "ServiceWorker.enable", "Storage.trackIndexedDBForOrigin",
+    "Target.exposeDevToolsProtocol",
+])
 def test_nested_message_applies_browser_scope_policy_before_dispatch(owning, monkeypatch, method):
     calls = []
     monkeypatch.setattr(helpers, "_send", lambda req, **kwargs: calls.append(req) or {"result": {}})
@@ -460,7 +484,7 @@ def test_ownership_update_lock_covers_cross_process_read_modify_replace(guard, t
     env = {
         **os.environ,
         "BH_TAB_GUARD": "1",
-        "BH_TAB_GUARD_RUN": "test-run",
+        "BH_TAB_GUARD_RUN": RUN_ID,
         "BH_TMP_DIR": str(tmp_path),
         "BH_RUNTIME_DIR": str(runtime),
     }
@@ -495,7 +519,7 @@ def test_reset_uses_the_same_ownership_lock(guard, tmp_path, monkeypatch):
     env = {
         **os.environ,
         "BH_TAB_GUARD": "1",
-        "BH_TAB_GUARD_RUN": "test-run",
+        "BH_TAB_GUARD_RUN": RUN_ID,
         "BH_TMP_DIR": str(tmp_path),
         "BH_RUNTIME_DIR": str(helpers.ipc._RUNTIME),
     }
@@ -598,6 +622,18 @@ def test_event_drain_filters_owned_sessions_and_preserves_foreign_events(daemon_
     assert [e["session_id"] for e in helpers.drain_events()] == ["SESSION-MINE"]
     assert [e["session_id"] for e in d.events] == ["FOREIGN-SESSION", None]
     assert helpers.drain_events() == []
+
+
+def test_context_wide_event_subscription_is_refused_and_foreign_events_stay_hidden(daemon_bridge):
+    d, calls = daemon_bridge
+    helpers.cdp("Network.enable")
+    d._record_event("ServiceWorker.workerVersionUpdated", {"secret": "foreign"}, "FOREIGN-SESSION")
+    with pytest.raises(helpers.TabGuardRefused):
+        helpers.cdp("ServiceWorker.enable")
+    assert helpers.drain_events() == []
+    assert len(d.events) == 1
+    assert d.events[0]["session_id"] == "FOREIGN-SESSION"
+    assert calls[-1] == ("Network.enable", {}, "SESSION-MINE")
 
 
 def test_older_daemon_cannot_silently_return_unguarded_metadata(owning, monkeypatch):

@@ -58,10 +58,13 @@ PY
   It fails closed — if the attached tab cannot be read, the call is refused.
   Leave it unset for interactive work, where driving a tab the human already
   opened is the point.
-  `BH_TAB_GUARD_RUN` is required and must be non-empty and unique per run (a job
-  id). Ownership is scoped to its full value and the daemon, so distinct runs
-  cannot consume each other's list. Ownership is recorded only while the guard
-  is enabled, in private files. Enabling it later does not claim earlier tabs.
+  `BH_TAB_GUARD_RUN` is required and must be a fresh canonical UUID4 generated
+  for each run. Human-readable job IDs and reused IDs are refused before any
+  ownership file is opened. Callers must generate a fresh UUID4 for each run.
+  Ownership is scoped to its full value and the daemon,
+  so distinct runs cannot consume each other's list. Ownership is recorded only
+  while the guard is enabled, in private files. Enabling it later does not claim
+  earlier tabs.
   Call `tab_guard_reset()` after the run's last invocation to remove its record.
   Reload an older daemon before guarded use. Requests pin the checked session;
   if it expires, use `switch_tab()` on an owned tab to attach again.

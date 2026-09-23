@@ -3,7 +3,7 @@
 Core helpers live here. Agent-editable helpers live in
 BH_AGENT_WORKSPACE/agent_helpers.py.
 """
-import base64, hashlib, importlib.util, json, math, os, sys, tempfile, time, urllib.request
+import base64, hashlib, importlib.util, json, math, os, sys, tempfile, time, urllib.request, uuid
 from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlparse
@@ -109,6 +109,18 @@ _TARGET_SCOPED_METHODS = {
     "Target.getTargetInfo",
 }
 # Other Target methods are refused; session calls must use an owned session.
+_GUARD_TAB_SCOPED_METHODS = {
+    "DOM.getDocument", "DOM.querySelector", "DOM.querySelectorAll", "DOM.setFileInputFiles",
+    "Emulation.setEmulatedMedia", "Emulation.setFocusEmulationEnabled",
+    "Input.dispatchKeyEvent", "Input.dispatchMouseEvent", "Input.insertText",
+    "Network.disable", "Network.enable", "Network.setBlockedURLs",
+    "Network.setBypassServiceWorker", "Network.setCacheDisabled",
+    "Network.setExtraHTTPHeaders", "Network.setUserAgentOverride",
+    "Page.bringToFront", "Page.reload",
+    "Page.captureScreenshot", "Page.createIsolatedWorld", "Page.getFrameTree",
+    "Page.handleJavaScriptDialog", "Page.navigate", "Page.setDocumentContent",
+    "Runtime.evaluate",
+}
 _GUARD_CONTEXT_WIDE_METHODS = {
     "Network.canClearBrowserCache", "Network.canClearBrowserCookies",
     "Network.clearBrowserCache", "Network.clearBrowserCookies",
@@ -122,10 +134,16 @@ _GUARD_CONTEXT_WIDE_METHODS = {
 def _guard_scope_reason(method):
     if method == "Target.exposeDevToolsProtocol":
         return "Target.exposeDevToolsProtocol exposes unrestricted target commands"
+    if method.startswith("ServiceWorker."):
+        return "ServiceWorker methods are not tab-scoped"
+    if method.startswith("Storage."):
+        return "Storage methods are origin/context-wide and unavailable under the tab guard"
     if method.startswith(("Browser.", "SystemInfo.")):
         return "browser-wide method is unavailable under the tab guard"
     if method in _GUARD_CONTEXT_WIDE_METHODS:
         return "browser/context-wide method is unavailable under the tab guard"
+    if not method.startswith("Target.") and method not in _GUARD_TAB_SCOPED_METHODS:
+        return "method is not in the tab-scoped allowlist"
     return None
 
 
@@ -138,8 +156,13 @@ def _run_id():
     job id): ownership is scoped to it, so a run starts owning nothing and two
     concurrent runs cannot consume each other's list."""
     run_id = os.environ.get("BH_TAB_GUARD_RUN", "")
-    if not run_id.strip():
-        _refuse("run", None, "", "BH_TAB_GUARD_RUN must be non-empty")
+    try:
+        parsed = uuid.UUID(run_id)
+    except (ValueError, AttributeError):
+        parsed = None
+    if (parsed is None or parsed.version != 4 or parsed.variant != uuid.RFC_4122
+            or str(parsed) != run_id):
+        _refuse("run", None, "", "BH_TAB_GUARD_RUN must be a fresh canonical UUID4")
     return run_id
 
 
@@ -541,8 +564,11 @@ def _select_all_modifier():
     """Select-all modifier by the browser's OS (not this process's): 4=Meta on macOS, else 2=Ctrl."""
     global _SELECT_ALL_MODIFIER
     if _SELECT_ALL_MODIFIER is None:
-        ua = cdp("Browser.getVersion").get("userAgent", "")
-        _SELECT_ALL_MODIFIER = 4 if "Mac OS X" in ua or "Macintosh" in ua else 2
+        if _tab_guard_on():
+            _SELECT_ALL_MODIFIER = 4 if sys.platform == "darwin" else 2
+        else:
+            ua = cdp("Browser.getVersion").get("userAgent", "")
+            _SELECT_ALL_MODIFIER = 4 if "Mac OS X" in ua or "Macintosh" in ua else 2
     return _SELECT_ALL_MODIFIER
 
 def fill_input(selector, text, clear_first=True, timeout=0.0):
