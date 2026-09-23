@@ -34,6 +34,7 @@ def blocked_profile(monkeypatch):
         raise OSError("connection refused")
 
     monkeypatch.setattr(daemon.urllib.request, "urlopen", refused)
+    monkeypatch.setattr(daemon.platform, "system", lambda: "Darwin")
 
 
 def test_blocked_profile_falls_back_to_automation_chrome(blocked_profile, monkeypatch):
@@ -80,6 +81,24 @@ def test_one_readable_profile_prevents_tcc_fallback(blocked_profile, monkeypatch
 
     with pytest.raises(RuntimeError, match="chrome-not-running"):
         daemon.get_ws_url()
+    assert launch == []
+
+
+@pytest.mark.parametrize("system", ["Windows", "Linux"])
+def test_permission_error_on_non_macos_uses_normal_profile_error(
+    blocked_profile, monkeypatch, system
+):
+    monkeypatch.setattr(daemon.platform, "system", lambda: system)
+    monkeypatch.setattr(daemon, "supported_browser_running", lambda: True)
+    monkeypatch.setattr(daemon, "NO_TOGGLE_GRACE", -1)
+    monkeypatch.setattr(daemon, "remote_debugging_user_enabled", lambda: None)
+    launch = []
+    monkeypatch.setattr(daemon, "launch_automation_chrome", lambda: launch.append(True))
+
+    with pytest.raises(RuntimeError, match="DevToolsActivePort not found") as exc:
+        daemon.get_ws_url()
+
+    assert "Full Disk Access" not in str(exc.value)
     assert launch == []
 
 

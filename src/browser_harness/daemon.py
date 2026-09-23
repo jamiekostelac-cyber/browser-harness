@@ -398,6 +398,7 @@ def get_ws_url():
     next_liveness_check = 0.0
     candidate_profiles = set()
     tcc_blocked_profiles = set()
+    is_macos = platform.system() == "Darwin"
     while time.time() < deadline:
         for profile_index, base in enumerate(PROFILES):
             if base.exists():
@@ -408,7 +409,8 @@ def get_ws_url():
                 continue
             except PermissionError:
                 candidate_profiles.add(profile_index)
-                tcc_blocked_profiles.add(profile_index)
+                if is_macos:
+                    tcc_blocked_profiles.add(profile_index)
                 continue
             except OSError:
                 continue
@@ -455,7 +457,11 @@ def get_ws_url():
                 raise RuntimeError("permission-blocked: Chrome is reachable, but the per-session Allow remote debugging popup has not been accepted")
         except (OSError, KeyError, ValueError):
             continue
-    all_profiles_tcc_blocked = bool(candidate_profiles) and tcc_blocked_profiles == candidate_profiles
+    all_profiles_tcc_blocked = (
+        is_macos
+        and bool(candidate_profiles)
+        and tcc_blocked_profiles == candidate_profiles
+    )
     if all_profiles_tcc_blocked:
         # No profile was readable (macOS TCC) and nothing answered on the probe
         # ports — launch a dedicated automation Chrome so the harness still works.
