@@ -307,6 +307,43 @@ def test_acl_parser_accepts_applicable_directory_inheritance_flags():
     ) == {APPROVED_SID}
 
 
+@pytest.mark.parametrize("control_flags", ["P", "PAI", "PAR", "PAIAR"])
+def test_acl_parser_keeps_dacl_control_flags_out_of_ace_parsing(control_flags):
+    assert paths._parse_acl_snapshot(
+        f"O:{APPROVED_SID}G:{APPROVED_SID}D:{control_flags}"
+        f"(A;;FA;;;{APPROVED_SID})".encode(),
+        approved_sid=APPROVED_SID,
+    ) == {APPROVED_SID}
+
+
+@pytest.mark.parametrize("control_flags", ["", "AI", "AR", "AIAR"])
+def test_acl_parser_still_requires_protected_dacl_with_auto_inherit_flags(control_flags):
+    with pytest.raises(PermissionError, match="protected DACL"):
+        paths._parse_acl_snapshot(
+            f"O:{APPROVED_SID}G:{APPROVED_SID}D:{control_flags}"
+            f"(A;;FA;;;{APPROVED_SID})".encode(),
+            approved_sid=APPROVED_SID,
+        )
+
+
+def test_read_sddl_quotes_paths_as_powershell_literals(monkeypatch, tmp_path):
+    target = tmp_path / "folder with spaces" / "owner's credentials.json"
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append((args, kwargs))
+        return SimpleNamespace(returncode=0, stdout="O:...", stderr="")
+
+    monkeypatch.setattr(paths.subprocess, "run", fake_run)
+
+    assert paths._read_sddl(target) == "O:..."
+    args, kwargs = calls[0]
+    command = args[args.index("-Command") + 1]
+    assert f"-LiteralPath '{str(target).replace(chr(39), chr(39) * 2)}'" in command
+    assert str(target) not in args[args.index("-Command") + 2:]
+    assert kwargs == {"capture_output": True, "text": True, "check": False}
+
+
 def test_acl_parser_requires_protected_dacl_trusted_owner_and_no_deny():
     valid_prefix = f"O:{APPROVED_SID}G:{APPROVED_SID}D:"
     for sddl in (
@@ -485,6 +522,48 @@ def test_recursive_hardening_rejects_replacement_during_descriptor_read(
 
     assert calls == []
     assert child.read_text(encoding="utf-8") == "replacement"
+
+
+def test_recursive_hardening_rechecks_siblings_and_refuses_unsafe_rollback(
+    monkeypatch, tmp_path
+):
+    _set_windows_identity(monkeypatch)
+    target = tmp_path / "private"
+    target.mkdir()
+    child = target / "credential.json"
+    child.write_text("credential", encoding="utf-8")
+    sibling = target / "sibling.json"
+    sibling.write_text("original sibling", encoding="utf-8")
+    replacement = tmp_path / "replacement.json"
+    replacement.write_text("replacement sibling", encoding="utf-8")
+    valid = f"O:{APPROVED_SID}G:{APPROVED_SID}D:P(A;;FA;;;{APPROVED_SID})"
+    calls = []
+    mutated = False
+
+    def read_sddl(item):
+        if mutated and item == child and sibling.exists():
+            replacement.replace(sibling)
+        return valid
+
+    def fake_run(args, **kwargs):
+        nonlocal mutated
+        calls.append(args)
+        if "/save" in args:
+            Path(args[args.index("/save") + 1]).write_bytes(
+                f"D:(A;;FA;;;{APPROVED_SID})".encode()
+            )
+        if "/grant:r" in args:
+            mutated = True
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(paths, "_read_sddl", read_sddl)
+    monkeypatch.setattr(paths.subprocess, "run", fake_run)
+
+    with pytest.raises(PermissionError, match="filesystem objects changed"):
+        paths.harden_private_path(target, directory=True)
+
+    assert sibling.read_text(encoding="utf-8") == "replacement sibling"
+    assert not any("/restore" in call for call in calls)
 
 
 def test_recursive_hardening_accepts_inherited_acl_before_hardening(

@@ -155,14 +155,21 @@ def _acl_principals(snapshot: bytes) -> set[str]:
 def _parse_acl_snapshot(snapshot: bytes, *, approved_sid: str) -> set[str]:
     """Parse only simple, explicit allow/deny ACEs; reject ambiguous SDDL."""
     text = snapshot.decode("utf-8")
-    if not text.startswith("O:") or "G:" not in text or "D:P" not in text:
+    if not text.startswith("O:") or "G:" not in text or "D:" not in text:
         raise PermissionError("ACL must have a trusted owner and protected DACL")
     owner = text[2:text.index("G:")]
     if owner.upper() != approved_sid.upper():
         raise PermissionError(f"ACL owner is not the effective user SID: {owner}")
-    dacl_start = text.index("D:P") + 3
-    dacl_end = text.find("S:", dacl_start)
-    dacl = text[dacl_start:] if dacl_end < 0 else text[dacl_start:dacl_end]
+    dacl_start = text.index("D:") + 2
+    ace_start = text.find("(", dacl_start)
+    if ace_start < 0:
+        ace_start = len(text)
+    control_flags = text[dacl_start:ace_start]
+    flags = re.findall(r"AI|AR|P", control_flags)
+    if "".join(flags) != control_flags or len(flags) != len(set(flags)) or "P" not in flags:
+        raise PermissionError("ACL must have a protected DACL")
+    dacl_end = text.find("S:", ace_start)
+    dacl = text[ace_start:] if dacl_end < 0 else text[ace_start:dacl_end]
     if not dacl:
         raise PermissionError("ACL has a null or empty DACL")
     ace_pattern = re.compile(
@@ -222,14 +229,15 @@ def reject_reparse_path(path: Path) -> None:
 
 
 def _read_sddl(path: Path) -> str:
+    literal_path = str(path).replace("'", "''")
     command = (
-        "$a = Get-Acl -LiteralPath $args[0]; "
+        f"$a = Get-Acl -LiteralPath '{literal_path}'; "
         "$s = [System.Security.AccessControl.AccessControlSections]::All; "
         "[Console]::Write($a.GetSecurityDescriptorSddlForm($s))"
     )
     try:
         result = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", command, str(path)],
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
             capture_output=True,
             text=True,
             check=False,
@@ -312,6 +320,16 @@ def _validate_acl_tree(
             _parse_acl_snapshot(snapshot, approved_sid=approved_sid)
         else:
             _validate_acl_owner(snapshot, approved_sid=approved_sid)
+    if read_descriptors:
+        # Re-enumerate after every descriptor read so a sibling replaced while
+        # another object's descriptor was being queried cannot pass validation.
+        _validate_acl_tree(
+            path,
+            directory=directory,
+            approved_sid=approved_sid,
+            expected_identities=identities,
+            read_descriptors=False,
+        )
     return identities
 
 
