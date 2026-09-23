@@ -427,6 +427,12 @@ def _profile_argument_matches(args, base):
             return False
         if arg == "--":
             break
+        if platform.system() == "Windows" and not profile_switches:
+            # Windows Chromium treats this switch specially and changes how
+            # subsequent command-line arguments are interpreted.
+            switch = arg.lstrip("-/").split("=", 1)[0].casefold()
+            if switch == "single-argument":
+                return False
         # Chromium recognizes Windows-style slash switches as well as dashes.
         # Reject case/spacing/prefix variants and the separate-value form too.
         prefix = arg.lstrip("-/")

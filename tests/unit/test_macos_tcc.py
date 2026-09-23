@@ -427,6 +427,75 @@ def test_windows_endpoint_ownership_uses_listener_pid_and_process_command(monkey
 
 
 @pytest.mark.parametrize(
+    "switch",
+    [
+        "--single-argument",
+        "-single-argument",
+        "/single-argument",
+        "--single-argument=value",
+        "-single-argument=value",
+        "/single-argument=value",
+    ],
+)
+def test_profile_argument_matches_rejects_preceding_windows_single_argument(
+    monkeypatch, tmp_path, switch
+):
+    monkeypatch.setattr(daemon.platform, "system", lambda: "Windows")
+    profile = tmp_path / "profile"
+
+    assert not daemon._profile_argument_matches(
+        [switch, f"--user-data-dir={profile}"], profile
+    )
+
+
+@pytest.mark.parametrize("system", ["Darwin", "Linux", "Windows"])
+def test_profile_argument_matches_preserves_canonical_argv(monkeypatch, tmp_path, system):
+    monkeypatch.setattr(daemon.platform, "system", lambda: system)
+    profile = tmp_path / "profile"
+
+    assert daemon._profile_argument_matches(
+        ["--remote-debugging-port=49231", f"--user-data-dir={profile}", "--headless"],
+        profile,
+    )
+
+
+@pytest.mark.parametrize(
+    "switch",
+    [
+        "--single-argument",
+        "-single-argument",
+        "/single-argument",
+        "--single-argument=value",
+        "-single-argument=value",
+        "/single-argument=value",
+    ],
+)
+def test_windows_endpoint_ownership_rejects_single_argument_before_profile(
+    monkeypatch, tmp_path, switch
+):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    (profile / "DevToolsActivePort").write_text("49231\n/devtools/browser/owned\n")
+    snapshot = daemon._devtools_active_port_snapshot(profile)
+    monkeypatch.setattr(daemon.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(daemon, "_listener_pids", lambda _port: {55})
+    monkeypatch.setattr(
+        daemon,
+        "_process_args",
+        lambda _pid: [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            switch,
+            f"--user-data-dir={profile}",
+        ],
+    )
+    monkeypatch.setattr(daemon, "_trusted_browser_executable", lambda _exe: True)
+
+    assert not daemon._endpoint_owned_by_profile(
+        profile, "49231", "ws://127.0.0.1:49231/devtools/browser/owned", snapshot
+    )
+
+
+@pytest.mark.parametrize(
     "endpoint",
     [
         "ws://127.0.0.1:49231/devtools/browser/owned/extra",
