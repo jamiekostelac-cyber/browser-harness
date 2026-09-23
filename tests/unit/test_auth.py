@@ -1,3 +1,4 @@
+import json
 import socket
 import threading
 import time
@@ -15,6 +16,35 @@ from browser_harness.auth import (
     _callback_server,
     complete_browser_auth,
 )
+
+
+@pytest.mark.parametrize("raw", ["[]", "null", '"token"', "123"])
+def test_load_auth_file_rejects_non_object_json(tmp_path, raw):
+    path = tmp_path / "auth.json"
+    path.write_text(raw, encoding="utf-8")
+    with pytest.raises(auth.AuthError):
+        auth.load_auth_file(path)
+
+
+def test_load_auth_file_accepts_object_and_missing(tmp_path):
+    path = tmp_path / "auth.json"
+    assert auth.load_auth_file(path) == {}
+    path.write_text(json.dumps({"browser_use": {"api_key": "k"}}), encoding="utf-8")
+    assert auth.load_auth_file(path) == {"browser_use": {"api_key": "k"}}
+
+
+def test_stored_auth_record_rejects_non_object_json(tmp_path):
+    path = tmp_path / "auth.json"
+    path.write_text("[]", encoding="utf-8")
+    with pytest.raises(auth.AuthError):
+        auth.stored_auth_record(path)
+
+
+def test_clear_auth_rejects_non_object_json(tmp_path):
+    path = tmp_path / "auth.json"
+    path.write_text("null", encoding="utf-8")
+    with pytest.raises(auth.AuthError):
+        auth.clear_auth(path)
 
 
 def test_callback_server_successful_oauth():
@@ -225,3 +255,29 @@ def test_callback_server_duplicate_requests_preserves_first():
     assert cb.error is None
     assert "Browser Use Cloud login complete" in body1
     assert "Browser Use Cloud login complete" in body2
+
+
+def test_callback_server_marks_complete_before_client_disconnects():
+    cb = PendingCallback(state="secret-state")
+    server = _callback_server(cb)
+    handler = object.__new__(server.RequestHandlerClass)
+    handler.path = "/browser-use-cloud/callback?state=secret-state&code=valid-code"
+    handler.send_response = lambda _status: None
+    handler.send_header = lambda _name, _value: None
+    handler.end_headers = lambda: None
+
+    class DisconnectedClient:
+        def write(self, _body):
+            raise ConnectionResetError("client disconnected")
+
+        def flush(self):
+            raise AssertionError("flush should not be reached")
+
+    handler.wfile = DisconnectedClient()
+    with pytest.raises(ConnectionResetError):
+        handler.do_GET()
+
+    server.server_close()
+
+    assert cb.complete is True
+    assert cb.code == "valid-code"
