@@ -15,6 +15,15 @@ FOREIGN = {"targetId": "FOREIGN", "url": "https://mail.example.com/", "title": "
 RUN_ID = "123e4567-e89b-42d3-a456-426614174000"
 RUN_ID_2 = "123e4567-e89b-42d3-a456-426614174001"
 RUN_ID_3 = "123e4567-e89b-42d3-a456-426614174002"
+SRC_DIR = pathlib.Path(__file__).resolve().parents[2] / "src"
+
+
+def _subprocess_env(**updates):
+    """Give src-layout subprocesses the same import path as the test runner."""
+    pythonpath = os.pathsep.join(
+        path for path in (str(SRC_DIR), os.environ.get("PYTHONPATH", "")) if path
+    )
+    return {**os.environ, "PYTHONPATH": pythonpath, **updates}
 
 
 def _fake_send(current=FOREIGN, created="MINE", session="SESSION-MINE", target_type="page"):
@@ -295,7 +304,7 @@ def test_ownership_crosses_a_process_boundary(guard, tmp_path):
         f"helpers.ipc._TMP = pathlib.Path({str(tmp_path)!r})\n"
         "print(json.dumps(sorted(helpers._owned_ids())))\n"
     )
-    env = {**os.environ, "BH_TAB_GUARD": "1", "BH_TAB_GUARD_RUN": RUN_ID}
+    env = _subprocess_env(BH_TAB_GUARD="1", BH_TAB_GUARD_RUN=RUN_ID)
     out = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, env=env)
     assert out.returncode == 0, out.stderr
     assert json.loads(out.stdout) == ["MINE"]
@@ -641,13 +650,12 @@ def test_ownership_update_lock_covers_cross_process_read_modify_replace(guard, t
         "helpers._own_tab('CHILD')\n"
         "print('done', flush=True)\n"
     )
-    env = {
-        **os.environ,
-        "BH_TAB_GUARD": "1",
-        "BH_TAB_GUARD_RUN": RUN_ID,
-        "BH_TMP_DIR": str(tmp_path),
-        "BH_RUNTIME_DIR": str(runtime),
-    }
+    env = _subprocess_env(
+        BH_TAB_GUARD="1",
+        BH_TAB_GUARD_RUN=RUN_ID,
+        BH_TMP_DIR=str(tmp_path),
+        BH_RUNTIME_DIR=str(runtime),
+    )
     with helpers._ownership_lock(path):
         process = subprocess.Popen(
             [sys.executable, "-c", script],
@@ -676,13 +684,12 @@ def test_reset_uses_the_same_ownership_lock(guard, tmp_path, monkeypatch):
         "helpers.tab_guard_reset()\n"
         "print('done', flush=True)\n"
     )
-    env = {
-        **os.environ,
-        "BH_TAB_GUARD": "1",
-        "BH_TAB_GUARD_RUN": RUN_ID,
-        "BH_TMP_DIR": str(tmp_path),
-        "BH_RUNTIME_DIR": str(helpers.ipc._RUNTIME),
-    }
+    env = _subprocess_env(
+        BH_TAB_GUARD="1",
+        BH_TAB_GUARD_RUN=RUN_ID,
+        BH_TMP_DIR=str(tmp_path),
+        BH_RUNTIME_DIR=str(helpers.ipc._RUNTIME),
+    )
     with helpers._ownership_lock(path):
         process = subprocess.Popen(
             [sys.executable, "-c", script],
