@@ -267,24 +267,42 @@ async def _silent(coro):
         pass
 
 
-def _ws_from_devtools_active_port(http_url: str) -> str | None:
-    """When /json/version returns 404 (Chrome 147+ default profile), match DevToolsActivePort by port."""
+def _ws_from_devtools_active_port(http_url: str, profile=None) -> str | None:
+    """Recover a 404 DevTools endpoint only when its profile process owns the endpoint."""
     p = urlparse(http_url)
     want_port = str(p.port) if p.port else ""
-    if not want_port:
+    host = p.hostname or ""
+    try:
+        loopback = ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        loopback = host.lower() == "localhost"
+    if (
+        p.scheme != "http"
+        or not loopback
+        or p.username is not None
+        or p.password is not None
+        or p.query
+        or p.fragment
+        or not want_port
+    ):
         return None
-    host = p.hostname or "127.0.0.1"
     if ":" in host:  # urlparse strips IPv6 brackets; restore them for the ws:// URL
         host = f"[{host}]"
-    for base in PROFILES:
+    for base in ([profile] if profile is not None else PROFILES):
         try:
             active = (base / "DevToolsActivePort").read_text(encoding="utf-8", errors="replace").splitlines()
         except OSError:
             continue
         port = active[0].strip() if active else ""
         ws_path = active[1].strip() if len(active) > 1 else ""
-        if port == want_port and ws_path:
-            return f"ws://{host}:{port}{ws_path}"
+        ws = f"ws://{host}:{port}{ws_path}"
+        if (
+            port == want_port
+            and ws_path.startswith("/devtools/browser/")
+            and _profile_process_owns(base)
+            and _ws_matches_devtools_active_port(base, port, ws)
+        ):
+            return ws
     return None
 
 
@@ -509,7 +527,10 @@ def get_ws_url():
                 # Chrome 147+ disables /json/* HTTP discovery on the default user-data-dir;
                 # the ws path Chrome wrote to DevToolsActivePort still works.
                 if e.code == 404 and ws_path:
-                    return f"ws://127.0.0.1:{port}{ws_path}"
+                    if ws := _ws_from_devtools_active_port(
+                        f"http://127.0.0.1:{port}", profile=base
+                    ):
+                        return ws
             except (OSError, KeyError, ValueError):
                 pass
         # Closed browser leaves stale DevToolsActivePort files

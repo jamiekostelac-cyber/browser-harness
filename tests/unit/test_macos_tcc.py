@@ -162,6 +162,42 @@ def test_json_version_reuse_requires_profile_endpoint_identity(
             daemon.get_ws_url()
 
 
+@pytest.mark.parametrize("process_owns_profile", [True, False])
+def test_json_version_404_fallback_requires_profile_process_identity(
+    monkeypatch, tmp_path, process_owns_profile
+):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    (profile / "DevToolsActivePort").write_text(
+        "49231\n/devtools/browser/profile-owner\n"
+    )
+    monkeypatch.setattr(daemon, "PROFILES", [profile])
+    monkeypatch.delenv("BU_CDP_WS", raising=False)
+    monkeypatch.delenv("BU_CDP_URL", raising=False)
+    monkeypatch.setattr(daemon, "REMOTE_ID", None)
+    monkeypatch.setattr(daemon, "supported_browser_running", lambda: True)
+    monkeypatch.setattr(daemon, "NO_TOGGLE_GRACE", -1)
+    monkeypatch.setattr(daemon, "remote_debugging_user_enabled", lambda: None)
+    monkeypatch.setattr(
+        daemon, "_profile_process_owns", lambda base: base == profile and process_owns_profile
+    )
+
+    def not_found(*_args, **_kwargs):
+        raise daemon.urllib.error.HTTPError(
+            "http://127.0.0.1:49231/json/version", 404, "Not Found", {}, None
+        )
+
+    monkeypatch.setattr(daemon.urllib.request, "urlopen", not_found)
+
+    if process_owns_profile:
+        assert daemon.get_ws_url() == (
+            "ws://127.0.0.1:49231/devtools/browser/profile-owner"
+        )
+    else:
+        with pytest.raises(RuntimeError, match="DevToolsActivePort not found"):
+            daemon.get_ws_url()
+
+
 def test_stale_automation_port_does_not_attach_to_unrelated_listener(monkeypatch, tmp_path):
     profile = tmp_path / "automation-profile"
     profile.mkdir()
