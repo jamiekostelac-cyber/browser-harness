@@ -14,7 +14,7 @@ import time
 import urllib.error
 import urllib.request
 from collections import deque
-from pathlib import Path, PureWindowsPath
+from pathlib import Path
 from urllib.parse import urlparse
 
 from cdp_use.client import CDPClient
@@ -319,68 +319,76 @@ def _process_args(pid):
 
 
 def _trusted_browser_executable(executable):
-    """Require a recognized browser installation layout and executable pair."""
-    path = Path(os.path.realpath(executable))
+    """Trust only browser binaries authenticated by the host's package/signing system."""
     system = platform.system()
-    if system == "Windows":
-        windows_path = PureWindowsPath(executable)
-        name = windows_path.name.casefold()
-        normalized = str(windows_path).replace("/", "\\").casefold()
-    else:
-        name = path.name.casefold()
+    path = Path(os.path.realpath(executable))
     if system == "Darwin":
-        app = next((part for part in path.parts if part.endswith(".app")), None)
-        pairs = {
-            ("Google Chrome.app", "Google Chrome"),
-            ("Google Chrome Canary.app", "Google Chrome Canary"),
-            ("Google Chrome Beta.app", "Google Chrome Beta"),
-            ("Google Chrome Dev.app", "Google Chrome Dev"),
-            ("Chromium.app", "Chromium"), ("Brave Browser.app", "Brave Browser"),
-            ("Microsoft Edge.app", "Microsoft Edge"), ("Microsoft Edge Beta.app", "Microsoft Edge Beta"),
-            ("Microsoft Edge Dev.app", "Microsoft Edge Dev"), ("Arc.app", "Arc"),
-            ("Dia.app", "Dia"), ("Comet.app", "Comet"), ("Opera.app", "Opera"),
-            ("Vivaldi.app", "Vivaldi"),
+        trusted_signers = {
+            "com.google.Chrome": "EQHXZ8M8AV",
+            "com.google.Chrome.beta": "EQHXZ8M8AV",
+            "com.google.Chrome.canary": "EQHXZ8M8AV",
+            "com.google.Chrome.dev": "EQHXZ8M8AV",
+            "com.microsoft.edgemac": "UBF8T346G9",
+            "com.microsoft.edgemac.beta": "UBF8T346G9",
+            "com.microsoft.edgemac.dev": "UBF8T346G9",
+            "com.brave.Browser": "K8S9R7G5K2",
         }
-        return (
-            app is not None and (app, path.name) in pairs
-            and path.parent.name == "MacOS"
-            and path.parent.parent.name == "Contents"
-            and path.parent.parent.parent.name == app
-        )
+        try:
+            subprocess.run(["/usr/bin/codesign", "--verify", "--deep", "--strict", str(path)],
+                           check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            details = subprocess.check_output(
+                ["/usr/bin/codesign", "-dv", "--verbose=4", str(path)],
+                text=True, stderr=subprocess.STDOUT, timeout=5,
+            )
+            fields = dict(line.split("=", 1) for line in details.splitlines() if "=" in line)
+            return trusted_signers.get(fields.get("Identifier")) == fields.get("TeamIdentifier")
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return False
     if system == "Windows":
-        pairs = {
-            "chrome.exe": ("\\google\\chrome\\application\\", "\\google\\chrome sxs\\application\\", "\\google\\chrome beta\\application\\", "\\google\\chrome dev\\application\\"),
-            "msedge.exe": ("\\microsoft\\edge\\application\\", "\\microsoft\\edge beta\\application\\", "\\microsoft\\edge dev\\application\\"),
-            "brave.exe": ("\\bravesoftware\\brave-browser\\application\\",),
-            "chromium.exe": ("\\chromium\\application\\",),
-        }
-        trusted_roots = (
-            "c:\\program files\\", "c:\\program files (x86)\\",
-            "c:\\users\\",
+        script = (
+            "$s=Get-AuthenticodeSignature -LiteralPath $args[0]; "
+            "if ($s.Status -eq 'Valid') { $s.SignerCertificate.GetNameInfo('SimpleName',$false) }"
         )
-        user_install = "\\appdata\\local\\" in normalized
-        return (normalized.startswith(trusted_roots)
-                and (not normalized.startswith("c:\\users\\") or user_install) and any(
-            root in normalized for root in pairs.get(name, ())
-        ))
-    trusted_locations = (
-        ("/opt/google/chrome/", {"chrome"}),
-        ("/opt/google/chrome-beta/", {"chrome"}),
-        ("/opt/google/chrome-unstable/", {"chrome"}),
-        ("/usr/lib/chromium/", {"chromium", "chrome"}),
-        ("/usr/lib64/chromium/", {"chromium", "chrome"}),
-        ("/usr/lib/brave/", {"brave", "brave-browser"}),
-        ("/opt/brave.com/brave/", {"brave", "brave-browser"}),
-        ("/usr/lib/microsoft-edge/", {"msedge"}),
-        ("/opt/microsoft/msedge/", {"msedge"}),
-        ("/usr/lib/opera/", {"opera"}),
-        ("/usr/lib/vivaldi/", {"vivaldi-bin"}),
-        ("/app/org.chromium.Chromium/", {"chromium", "chrome"}),
-        ("/app/com.google.Chrome/", {"chrome"}),
-        ("/app/com.brave.Browser/", {"brave", "brave-browser"}),
-    )
-    resolved = str(path)
-    return any(resolved.startswith(root) and name in names for root, names in trusted_locations)
+        try:
+            signer = subprocess.check_output(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", script, str(path)],
+                text=True, stderr=subprocess.DEVNULL, timeout=5,
+            ).strip().casefold()
+            return signer in {
+                "google llc", "microsoft corporation", "brave software, inc.",
+            }
+        except (OSError, subprocess.SubprocessError):
+            return False
+    if system == "Linux":
+        # Package ownership proves the resolved file belongs to an installed package.
+        for command, args, trusted in (
+            ("dpkg-query", ["-S", str(path)], ("google-chrome", "chromium", "brave-browser", "microsoft-edge")),
+            ("rpm", ["-qf", str(path)], ("google-chrome", "chromium", "brave-browser", "microsoft-edge")),
+        ):
+            try:
+                owner = subprocess.check_output([command, *args], text=True,
+                                                stderr=subprocess.DEVNULL, timeout=3).casefold()
+                if any(name in owner for name in trusted):
+                    return True
+            except (OSError, subprocess.SubprocessError):
+                continue
+    return False
+
+
+def _profile_argument_matches(args, base):
+    """Accept exactly one canonical profile switch before Chromium's terminator."""
+    profile_switches = []
+    for arg in args:
+        if arg == "--":
+            return False
+        if arg.startswith("--") and arg[2:].split("=", 1)[0].casefold() == "user-data-dir":
+            profile_switches.append(arg)
+        elif arg.startswith("-") and not arg.startswith("--") and arg[1:].split("=", 1)[0].casefold() == "user-data-dir":
+            return False
+    expected = str(Path(base).resolve())
+    return (len(profile_switches) == 1
+            and profile_switches[0].startswith("--user-data-dir=")
+            and profile_switches[0].split("=", 1)[1] == expected)
 
 
 def _listener_pids(port):
@@ -454,11 +462,7 @@ def _profile_browser_pid(base, expected_pid=None):
         return None
     if not _trusted_browser_executable(args[0]):
         return None
-    expected = str(Path(base).resolve())
-    profile_args = [arg for arg in args[1:] if arg == "--user-data-dir" or
-                    arg.startswith("--user-data-dir=")]
-    if (len(profile_args) != 1 or not profile_args[0].startswith("--user-data-dir=") or
-            profile_args[0].split("=", 1)[1] != expected):
+    if not _profile_argument_matches(args[1:], base):
         return None
     return pid
 

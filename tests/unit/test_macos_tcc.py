@@ -419,6 +419,7 @@ def test_windows_endpoint_ownership_uses_listener_pid_and_process_command(monkey
         lambda _pid: [r"C:\Program Files\Google\Chrome\Application\chrome.exe",
                       f"--user-data-dir={profile}"],
     )
+    monkeypatch.setattr(daemon, "_trusted_browser_executable", lambda _exe: True)
 
     assert daemon._endpoint_owned_by_profile(
         profile, "49231", "ws://127.0.0.1:49231/devtools/browser/owned", snapshot
@@ -447,6 +448,7 @@ def test_endpoint_identity_rejects_ambiguous_host_and_path(monkeypatch, tmp_path
     [("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "match", 77),
      ("/tmp/Google Chrome", "match", None),
      ("/Applications/Google Chrome.app/Contents/MacOS/renamed", "match", None),
+     ("/tmp/Google Chrome.app/Contents/MacOS/Google Chrome", "match", None),
      ("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "other", None)],
 )
 def test_profile_browser_pid_rejects_nonbrowser_and_profile_mismatch(
@@ -457,6 +459,10 @@ def test_profile_browser_pid_rejects_nonbrowser_and_profile_mismatch(
     (profile / "SingletonLock").symlink_to("host-77")
     argument = f"--user-data-dir={profile}" if profile_arg == "match" else f"--user-data-dir={tmp_path / 'other'}"
     monkeypatch.setattr(daemon, "_process_args", lambda _pid: [executable, argument])
+    monkeypatch.setattr(
+        daemon, "_trusted_browser_executable",
+        lambda exe: exe == "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    )
 
     assert daemon._profile_browser_pid(profile) == expected
 
@@ -468,6 +474,11 @@ def test_profile_browser_pid_rejects_nonbrowser_and_profile_mismatch(
         lambda profile: [f"--user-data-dir={profile}-suffix"],
         lambda profile: [f"--user-data-dir={profile}", f"--user-data-dir={profile}"],
         lambda profile: ["--user-data-dir", str(profile)],
+        lambda profile: [f"-user-data-dir={profile}"],
+        lambda profile: [f"--user-data-dir={profile}", "--", "--user-data-dir=/tmp/attacker"],
+        lambda profile: ["--", f"--user-data-dir={profile}"],
+        lambda profile: [f"--USER-DATA-DIR={profile}"],
+        lambda profile: [f"--user-data-dir={profile}", f"--USER-DATA-DIR={profile}"],
         lambda profile: [f"--app=--user-data-dir={profile}"],
         lambda profile: [f"--app=https://example.test/?profile=--user-data-dir={profile}"],
     ],
@@ -486,6 +497,7 @@ def test_profile_browser_pid_rejects_ambiguous_or_embedded_profile_switches(
             *arguments(profile),
         ],
     )
+    monkeypatch.setattr(daemon, "_trusted_browser_executable", lambda _exe: True)
 
     assert daemon._profile_browser_pid(profile) is None
 
@@ -500,8 +512,55 @@ def test_profile_browser_pid_rejects_expected_pid_mismatch(monkeypatch, tmp_path
             f"--user-data-dir={profile}",
         ]
     )
+    monkeypatch.setattr(daemon, "_trusted_browser_executable", lambda _exe: True)
 
     assert daemon._profile_browser_pid(profile, expected_pid=78) is None
+
+
+def test_linux_executable_trust_requires_package_ownership(monkeypatch):
+    monkeypatch.setattr(daemon.platform, "system", lambda: "Linux")
+
+    def package_owner(command, **_kwargs):
+        if command[0] == "dpkg-query" and command[-1] == "/usr/bin/google-chrome":
+            return "google-chrome-stable: /usr/bin/google-chrome"
+        raise daemon.subprocess.CalledProcessError(1, command)
+
+    monkeypatch.setattr(daemon.subprocess, "check_output", package_owner)
+    assert daemon._trusted_browser_executable("/usr/bin/google-chrome")
+    assert not daemon._trusted_browser_executable("/tmp/google-chrome")
+
+
+def test_macos_executable_trust_requires_valid_expected_signer(monkeypatch):
+    monkeypatch.setattr(daemon.platform, "system", lambda: "Darwin")
+
+    def codesign(command, **_kwargs):
+        if "--verify" in command:
+            return SimpleNamespace(returncode=0)
+        return "Identifier=com.google.Chrome\nTeamIdentifier=EQHXZ8M8AV\n"
+
+    monkeypatch.setattr(daemon.subprocess, "run", codesign)
+    monkeypatch.setattr(daemon.subprocess, "check_output", codesign)
+    assert daemon._trusted_browser_executable(
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    )
+    monkeypatch.setattr(
+        daemon.subprocess, "check_output",
+        lambda *_args, **_kwargs: "Identifier=com.google.Chrome\nTeamIdentifier=ATTACKER\n",
+    )
+    assert not daemon._trusted_browser_executable("/tmp/Google Chrome")
+
+
+def test_windows_executable_trust_requires_valid_publisher(monkeypatch):
+    monkeypatch.setattr(daemon.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(
+        daemon.subprocess, "check_output",
+        lambda *_args, **_kwargs: "Google LLC",
+    )
+    assert daemon._trusted_browser_executable(r"C:\Program Files\Google\Chrome\chrome.exe")
+    monkeypatch.setattr(
+        daemon.subprocess, "check_output", lambda *_args, **_kwargs: "Attacker LLC",
+    )
+    assert not daemon._trusted_browser_executable(r"C:\Chrome\chrome.exe")
 
 
 @pytest.mark.parametrize(
