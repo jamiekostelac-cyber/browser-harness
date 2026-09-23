@@ -197,6 +197,16 @@ def _parse_acl_snapshot(snapshot: bytes, *, approved_sid: str) -> set[str]:
     return principals
 
 
+def _validate_acl_owner(snapshot: bytes, *, approved_sid: str) -> None:
+    """Validate the stable owner independently of DACL hardening state."""
+    text = snapshot.decode("utf-8")
+    if not text.startswith("O:") or "G:" not in text:
+        raise PermissionError("ACL must have a trusted owner")
+    owner = text[2:text.index("G:")]
+    if owner.upper() != approved_sid.upper():
+        raise PermissionError(f"ACL owner is not the effective user SID: {owner}")
+
+
 def _reject_reparse_path(path: Path) -> None:
     try:
         info = path.lstat()
@@ -255,6 +265,8 @@ def _validate_acl_tree(
     directory: bool,
     approved_sid: str,
     expected_identities: dict[Path, tuple[int, int, int, int] | None] | None = None,
+    validate_dacl: bool = True,
+    read_descriptors: bool = True,
 ) -> dict[Path, tuple[int, int, int, int] | None]:
     """Validate all objects and, on readback, ensure the tree still names them."""
     objects = [path]
@@ -282,17 +294,69 @@ def _validate_acl_tree(
         except FileNotFoundError:
             identities[item] = None
     if expected_identities is not None and identities != expected_identities:
-        raise PermissionError(f"filesystem objects changed while hardening {path}")
-    for item in objects:
-        _parse_acl_snapshot(_read_sddl(item).encode("utf-8"), approved_sid=approved_sid)
+        raise PermissionError(
+            f"filesystem objects changed while hardening {path}: "
+            f"expected {expected_identities!r}, found {identities!r}"
+        )
+    for item in objects if read_descriptors else ():
+        # Descriptor APIs take a path, so bind each read to the object found in
+        # the enumeration. A replacement during the read must never validate.
+        before = _object_identity(item)
+        if before != identities[item]:
+            raise PermissionError(f"filesystem object changed while hardening {item}")
+        snapshot = _read_sddl(item).encode("utf-8")
+        after = _object_identity(item)
+        if before != after:
+            raise PermissionError(f"filesystem objects changed while hardening {path}")
+        if validate_dacl:
+            _parse_acl_snapshot(snapshot, approved_sid=approved_sid)
+        else:
+            _validate_acl_owner(snapshot, approved_sid=approved_sid)
     return identities
 
 
-def _restore_acl(path: Path, backup_path: Path, *, directory: bool) -> None:
+def _restore_acl(
+    path: Path,
+    backup_path: Path,
+    *,
+    directory: bool,
+    expected_identities: dict[Path, tuple[int, int, int, int] | None],
+) -> None:
+    _assert_acl_tree_identity(path, directory=directory, expected_identities=expected_identities)
     restore_root = path.parent if path.parent != Path("") else Path(".")
     _run_icacls(restore_root, "/restore", str(backup_path))
+    _assert_acl_tree_identity(path, directory=directory, expected_identities=expected_identities)
     if _read_acl_snapshot(path, directory=directory) != backup_path.read_bytes():
         raise PermissionError(f"could not verify restored permissions for {path}")
+    _assert_acl_tree_identity(path, directory=directory, expected_identities=expected_identities)
+
+
+def _assert_acl_tree_identity(
+    path: Path,
+    *,
+    directory: bool,
+    expected_identities: dict[Path, tuple[int, int, int, int] | None],
+) -> None:
+    current_identities = _validate_acl_tree(
+        path,
+        directory=directory,
+        approved_sid="",
+        expected_identities=expected_identities,
+        read_descriptors=False,
+    )
+    if current_identities != expected_identities:
+        raise PermissionError(f"filesystem objects changed; refusing ACL rollback for {path}")
+
+
+def _mutate_acl_tree(
+    path: Path,
+    *args: str,
+    directory: bool,
+    expected_identities: dict[Path, tuple[int, int, int, int] | None],
+) -> None:
+    _assert_acl_tree_identity(path, directory=directory, expected_identities=expected_identities)
+    _run_icacls(path, *args, *(("/T",) if directory else ()))
+    _assert_acl_tree_identity(path, directory=directory, expected_identities=expected_identities)
 
 
 def _harden_windows_acl(path: Path, *, directory: bool, resolve_sid=None) -> None:
@@ -300,7 +364,10 @@ def _harden_windows_acl(path: Path, *, directory: bool, resolve_sid=None) -> Non
     principal = _windows_principal(resolve_sid)
     approved = {principal.lstrip("*").upper()}
     original_identities = _validate_acl_tree(
-        path, directory=directory, approved_sid=next(iter(approved))
+        path,
+        directory=directory,
+        approved_sid=next(iter(approved)),
+        validate_dacl=False,
     )
 
     recursive = ("/T",) if directory else ()
@@ -314,15 +381,39 @@ def _harden_windows_acl(path: Path, *, directory: bool, resolve_sid=None) -> Non
 
     try:
         _run_icacls(path, "/save", str(backup_path), *recursive)
+        _assert_acl_tree_identity(path, directory=directory, expected_identities=original_identities)
         backup = backup_path.read_bytes()
         original_principals = _acl_principals(backup)
 
         try:
-            _run_icacls(path, "/inheritance:r", *recursive)
+            _mutate_acl_tree(
+                path,
+                "/inheritance:r",
+                directory=directory,
+                expected_identities=original_identities,
+            )
             for unapproved in sorted(original_principals - approved):
-                _run_icacls(path, "/remove:g", f"*{unapproved}", *recursive)
-                _run_icacls(path, "/remove:d", f"*{unapproved}", *recursive)
-            _run_icacls(path, "/grant:r", grant, *recursive)
+                _mutate_acl_tree(
+                    path,
+                    "/remove:g",
+                    f"*{unapproved}",
+                    directory=directory,
+                    expected_identities=original_identities,
+                )
+                _mutate_acl_tree(
+                    path,
+                    "/remove:d",
+                    f"*{unapproved}",
+                    directory=directory,
+                    expected_identities=original_identities,
+                )
+            _mutate_acl_tree(
+                path,
+                "/grant:r",
+                grant,
+                directory=directory,
+                expected_identities=original_identities,
+            )
             remaining = _read_acl_principals(
                 path, directory=directory, approved_sid=next(iter(approved))
             )
@@ -336,7 +427,12 @@ def _harden_windows_acl(path: Path, *, directory: bool, resolve_sid=None) -> Non
                 expected_identities=original_identities,
             )
         except Exception:
-            _restore_acl(path, backup_path, directory=directory)
+            _restore_acl(
+                path,
+                backup_path,
+                directory=directory,
+                expected_identities=original_identities,
+            )
             raise
     finally:
         backup_path.unlink(missing_ok=True)
