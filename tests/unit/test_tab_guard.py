@@ -983,6 +983,54 @@ def test_subframe_navigation_does_not_replace_top_document_provenance(daemon_bri
     assert any(event.get("params", {}).get("secret") == "owned-page-event" for event in events)
 
 
+def test_same_document_navigation_updates_url_without_advancing_generation(daemon_bridge):
+    d, calls = daemon_bridge
+    new_url = "https://owned.example/#section"
+    original = d.cdp.send_raw
+
+    async def current_url(method, params=None, session_id=None):
+        if method == "Target.getTargetInfo":
+            calls.append((method, params, session_id))
+            return {"targetInfo": {"type": "page", "targetId": "MINE", "url": new_url}}
+        if method == "Runtime.evaluate":
+            calls.append((method, params, session_id))
+            return {"result": {"value": "continued"}}
+        return await original(method, params, session_id)
+
+    d.cdp.send_raw = current_url
+    d._record_event("Page.navigatedWithinDocument", {
+        "frameId": "FRAME-MINE", "url": new_url,
+    }, "SESSION-MINE")
+
+    state = d._document_state["SESSION-MINE"]
+    assert state["generation"] == 0
+    assert state["url"] == new_url
+    assert state["document_url"] == new_url
+    assert state["allowed"] is True
+    assert helpers.cdp("Runtime.evaluate", session_id="SESSION-MINE", expression="1") == {
+        "result": {"value": "continued"},
+    }
+    assert any(call[0] == "Runtime.evaluate" for call in calls)
+
+
+def test_same_document_navigation_to_unauthorized_url_fails_closed(daemon_bridge):
+    d, calls = daemon_bridge
+    request = _guarded_dispatch_request(d, "Runtime.evaluate", {"expression": "1"})
+    d._record_event("Page.navigatedWithinDocument", {
+        "frameId": "FRAME-MINE", "url": "chrome://settings",
+    }, "SESSION-MINE")
+
+    state = d._document_state["SESSION-MINE"]
+    assert state["generation"] == 0
+    assert state["url"] == "chrome://settings"
+    assert state["document_url"] == "chrome://settings"
+    assert state["allowed"] is False
+    assert asyncio.run(d.handle(request)) == {
+        "error": "tab guard authorization is stale or invalid",
+    }
+    assert not any(call[0] == "Runtime.evaluate" for call in calls)
+
+
 @pytest.mark.parametrize("legacy", [False, True])
 def test_network_supplemental_events_require_same_document_authorized_request(
     daemon_bridge, legacy

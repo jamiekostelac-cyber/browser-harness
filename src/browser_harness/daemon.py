@@ -150,6 +150,7 @@ _NETWORK_REQUEST_CORRELATED_METHODS = frozenset({
 })
 _GUARDED_PAGE_EVENT_METHODS = frozenset({
     "Page.frameNavigated",
+    "Page.navigatedWithinDocument",
     "Page.loadEventFired",
     "Page.domContentEventFired",
     "Page.javascriptDialogOpening",
@@ -926,6 +927,18 @@ class Daemon:
                     if value.get("session_id") != source
                     or value.get("generation") == state["generation"]
                 }
+            elif inner_method == "Page.navigatedWithinDocument":
+                frame_id = inner_params.get("frameId") if isinstance(inner_params, dict) else None
+                navigation_url = inner_params.get("url") if isinstance(inner_params, dict) else None
+                if (not isinstance(state.get("frame_id"), str)
+                        or frame_id != state.get("frame_id")
+                        or not isinstance(navigation_url, str)):
+                    return
+                # This changes the active URL, not the document. Keep the
+                # generation and document-bound authorization provenance intact.
+                state["url"] = navigation_url
+                state["document_url"] = navigation_url
+                state["allowed"] = _guard_url_allowed(navigation_url)
             request_id = None
             if inner_method == _NETWORK_REQUEST_METHOD:
                 request_id = inner_params.get("requestId") if isinstance(inner_params, dict) else None
@@ -974,6 +987,11 @@ class Daemon:
                         or frame.get("parentId") is not None
                         or frame.get("id") != state.get("frame_id")
                         or frame.get("url") != state.get("document_url")):
+                    return
+            elif inner_method == "Page.navigatedWithinDocument":
+                frame_id = inner_params.get("frameId") if isinstance(inner_params, dict) else None
+                if (frame_id != state.get("frame_id")
+                        or inner_params.get("url") != state.get("document_url")):
                     return
             elif inner_method in {"Page.loadEventFired", "Page.domContentEventFired"}:
                 frame_id = inner_params.get("frameId") if isinstance(inner_params, dict) else None
