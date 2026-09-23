@@ -289,9 +289,10 @@ def _listener_pids(port):
             owners = set()
             for line in raw.splitlines():
                 fields = line.split()
-                if len(fields) >= 5 and fields[0].upper() == "TCP" and fields[3].upper() == "LISTENING":
-                    if fields[1].rsplit(":", 1)[-1] == str(int(port)):
-                        owners.add(int(fields[4]))
+                if (len(fields) >= 5 and fields[0].upper() == "TCP"
+                        and fields[3].upper() == "LISTENING"
+                        and fields[1].rsplit(":", 1)[-1] == str(int(port))):
+                    owners.add(int(fields[4]))
             return owners
         if platform.system() == "Linux":
             wanted = f"{int(port):04X}"
@@ -607,12 +608,12 @@ def launch_automation_chrome():
     snapshot = _devtools_active_port_snapshot(AUTOMATION_PROFILE)
     active = [snapshot[5], snapshot[6]] if snapshot else []
     port = active[0].strip() if active else ""
-    if port.isdigit() and 1 <= int(port) <= 65535 and snapshot:
-        # The port file can outlive Chrome. Reuse it only when the live browser
-        # process and OS listener still match the profile and endpoint snapshot.
-        if ((ws := _json_version_ws(int(port))) and
-                _endpoint_owned_by_profile(AUTOMATION_PROFILE, port, ws, snapshot)):
-            return ws
+    # The port file can outlive Chrome. Reuse it only when the live browser
+    # process and OS listener still match the profile and endpoint snapshot.
+    if (port.isdigit() and 1 <= int(port) <= 65535 and snapshot
+            and (ws := _json_version_ws(int(port)))
+            and _endpoint_owned_by_profile(AUTOMATION_PROFILE, port, ws, snapshot)):
+        return ws
     binary = _automation_chrome_binary()
     if not binary:
         return None
