@@ -165,6 +165,38 @@ def test_guard_policy_blocks_unregistered_marker_and_domain_authorization(monkey
     ]
 
 
+def test_guard_context_resolves_explicit_session_to_its_target(monkeypatch):
+    class _MappedCDP(_FakeCDP):
+        async def send_raw(self, method, params=None, session_id=None):
+            self.calls.append((method, params, session_id))
+            if method == "Target.getTargetInfo":
+                return {"targetInfo": {
+                    "targetId": params["targetId"],
+                    "type": "iframe",
+                    "url": "https://frame.example/",
+                }}
+            return {}
+
+    d = daemon.Daemon()
+    d.cdp = _MappedCDP()
+    d._session_targets["iframe-session"] = "iframe-target"
+
+    context = asyncio.run(d.handle({"meta": "guard_context", "session_id": "iframe-session"}))
+    assert context == {
+        "target_id": "iframe-target",
+        "session_id": "iframe-session",
+        "url": "https://frame.example/",
+        "tab_guard": "ok",
+    }
+    mismatched = asyncio.run(d.handle({
+        "meta": "guard_context",
+        "session_id": "iframe-session",
+        "target_id": "other-target",
+    }))
+    assert mismatched["target_id"] is None
+    assert "url" not in mismatched
+
+
 def test_tab_marker_stays_enabled_by_default(monkeypatch):
     monkeypatch.delenv("BH_TAB_MARKER", raising=False)
     d = _fresh_daemon()

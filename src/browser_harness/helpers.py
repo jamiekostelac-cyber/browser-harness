@@ -176,6 +176,9 @@ def _validate_context_url(method, params, session_id, context):
     if context.get("session_id") != session_id:
         _refuse(method, f"session:{session_id}", params.get("url", ""),
                 "session does not match the daemon current session and has no target ownership mapping")
+    if not isinstance(context.get("target_id"), str) or not context["target_id"]:
+        _refuse(method, f"session:{session_id}", params.get("url", ""),
+                "session-to-target ownership mapping could not be resolved (failing closed)")
     if "url" not in context:
         _refuse(method, f"session:{session_id}", params.get("url", ""),
                 "daemon did not provide the attached target URL (failing closed)")
@@ -186,11 +189,14 @@ def _validate_context_url(method, params, session_id, context):
 
 def _check_session_target_url(method, params, session_id):
     try:
-        context = _send({"meta": "guard_context"})
+        context = _send({"meta": "guard_context", "session_id": session_id})
     except Exception:
         _refuse(method, f"session:{session_id}", params.get("url", ""),
                 "attached target URL could not be read (failing closed)")
     _validate_context_url(method, params, session_id, context)
+    if context["target_id"] not in _owned_ids():
+        _refuse(method, f"session:{session_id}", context.get("url", ""),
+                "session target was not opened by this run")
 
 
 def _tab_guard_on():

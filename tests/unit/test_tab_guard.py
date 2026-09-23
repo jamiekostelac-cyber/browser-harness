@@ -846,7 +846,11 @@ def test_foreign_dialog_close_cannot_clear_owned_dialog(daemon_bridge):
 def test_event_drain_filters_owned_sessions_and_preserves_foreign_events(daemon_bridge):
     d, _ = daemon_bridge
     for sid in ("SESSION-MINE", "FOREIGN-SESSION", None):
-        d._record_event("Network.requestWillBeSent", {"secret": sid}, sid)
+        d._record_event(
+            "Network.requestWillBeSent",
+            {"secret": sid, "requestId": f"request-{sid}"},
+            sid,
+        )
     # Even with a foreign current page, reading this run's own events is safe.
     d.target_id, d.session = "FOREIGN", "FOREIGN-SESSION"
     assert [e["session_id"] for e in helpers.drain_events()] == ["SESSION-MINE"]
@@ -869,16 +873,28 @@ def test_event_provenance_drops_privileged_document_payloads_across_navigation(
 ):
     d, _ = daemon_bridge
     monkeypatch.setenv("BH_TAB_MARKER", "0")
-    d._record_event("Network.requestWillBeSent", {"secret": "allowed-before"}, "SESSION-MINE")
+    d._record_event(
+        "Network.requestWillBeSent",
+        {"secret": "allowed-before", "requestId": "before"},
+        "SESSION-MINE",
+    )
     d._record_event(
         "Page.frameNavigated", {"frame": {"url": "chrome://settings"}}, "SESSION-MINE"
     )
-    d._record_event("Network.requestWillBeSent", {"secret": "privileged"}, "SESSION-MINE")
+    d._record_event(
+        "Network.requestWillBeSent",
+        {"secret": "privileged", "requestId": "privileged"},
+        "SESSION-MINE",
+    )
     before = helpers.drain_events() if intermediate_drain else []
     d._record_event(
         "Page.frameNavigated", {"frame": {"url": "https://allowed.example/"}}, "SESSION-MINE"
     )
-    d._record_event("Network.requestWillBeSent", {"secret": "allowed-after"}, "SESSION-MINE")
+    d._record_event(
+        "Network.requestWillBeSent",
+        {"secret": "allowed-after", "requestId": "after"},
+        "SESSION-MINE",
+    )
     after = helpers.drain_events()
     payload = json.dumps(before + after)
     assert "privileged" not in payload
@@ -886,10 +902,92 @@ def test_event_provenance_drops_privileged_document_payloads_across_navigation(
     assert "allowed-after" in payload
 
 
+def test_subframe_navigation_does_not_replace_top_document_provenance(daemon_bridge):
+    d, _ = daemon_bridge
+    before = dict(d._document_state["SESSION-MINE"])
+    d._record_event(
+        "Page.frameNavigated",
+        {"frame": {"id": "child-frame", "parentId": "root-frame", "url": "https://frame.example/"}},
+        "SESSION-MINE",
+    )
+    assert d._document_state["SESSION-MINE"] == before
+    d._record_event(
+        "Network.requestWillBeSent",
+        {"requestId": "after-subframe", "secret": "owned-page-event"},
+        "SESSION-MINE",
+    )
+    events = helpers.drain_events()
+    assert any(event.get("params", {}).get("secret") == "owned-page-event" for event in events)
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_network_supplemental_events_require_same_document_authorized_request(
+    daemon_bridge, legacy
+):
+    d, _ = daemon_bridge
+
+    def record(method, params, outer_session="SESSION-MINE"):
+        if legacy:
+            d._record_event(
+                "Target.receivedMessageFromTarget",
+                {"sessionId": "SESSION-MINE", "message": json.dumps({
+                    "method": method, "params": params,
+                })},
+                outer_session,
+            )
+        else:
+            d._record_event(method, params, outer_session)
+
+    record("Network.loadingFinished", {"requestId": "unresolved"})
+    record("Network.requestWillBeSent", {"requestId": "request-1", "secret": "authorized"})
+    record("Network.responseReceivedExtraInfo", {"requestId": "request-1"})
+    record("Network.loadingFinished", {"requestId": "request-1"})
+    record("Network.loadingFinished", {"requestId": "request-2"})
+    d._record_event(
+        "Page.frameNavigated",
+        {"frame": {"url": "chrome://settings"}},
+        "SESSION-MINE",
+    )
+    record("Network.loadingFinished", {"requestId": "request-1"})
+
+    events = helpers.drain_events()
+    encoded = json.dumps(events)
+    assert "authorized" in encoded
+    if legacy:
+        assert all(event["method"] == "Target.receivedMessageFromTarget" for event in events)
+        inner_methods = [
+            json.loads(event["params"]["message"])["method"] for event in events
+        ]
+        assert inner_methods.count("Network.loadingFinished") == 1
+    else:
+        assert sum(event["method"] == "Network.loadingFinished" for event in events) == 1
+
+
+def test_network_supplemental_event_after_allowed_return_is_not_reauthorized(daemon_bridge):
+    d, _ = daemon_bridge
+    d._record_event(
+        "Network.requestWillBeSent", {"requestId": "delayed", "secret": "start"}, "SESSION-MINE"
+    )
+    d._record_event(
+        "Page.frameNavigated", {"frame": {"url": "chrome://settings"}}, "SESSION-MINE"
+    )
+    d._record_event(
+        "Page.frameNavigated", {"frame": {"url": "https://allowed-again.example/"}}, "SESSION-MINE"
+    )
+    d._record_event("Network.loadingFinished", {"requestId": "delayed"}, "SESSION-MINE")
+    events = helpers.drain_events()
+    assert any(event.get("params", {}).get("secret") == "start" for event in events)
+    assert not any(event["method"] == "Network.loadingFinished" for event in events)
+
+
 def test_event_drain_hides_owned_session_without_target_proof(daemon_bridge):
     d, _ = daemon_bridge
     d._session_targets.pop("SESSION-MINE")
-    d._record_event("Network.requestWillBeSent", {"secret": "owned"}, "SESSION-MINE")
+    d._record_event(
+        "Network.requestWillBeSent",
+        {"secret": "owned", "requestId": "owned"},
+        "SESSION-MINE",
+    )
     assert helpers.drain_events() == []
     assert list(d.events) == []
 
@@ -1060,6 +1158,67 @@ def test_guarded_switch_rejects_foreign_session(daemon_bridge):
         helpers._read_meta("set_session", target_id="MINE", session_id="FOREIGN-SESSION")
     assert d.session == "SESSION-MINE"
     assert not any(sid == "FOREIGN-SESSION" for _, _, sid in calls)
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_explicit_owned_iframe_session_resolves_its_mapped_target_before_dispatch(
+    owning, monkeypatch, nested
+):
+    helpers._remember("tabs", "IFRAME-TARGET")
+    helpers._remember("sessions", "IFRAME-SESSION")
+    calls = []
+
+    def send(req, **kwargs):
+        calls.append(req)
+        if req.get("meta") == "guard_context":
+            assert req.get("session_id") == "IFRAME-SESSION"
+            return {
+                "target_id": "IFRAME-TARGET",
+                "session_id": "IFRAME-SESSION",
+                "url": "https://frame.example/",
+            }
+        return {"result": {}}
+
+    monkeypatch.setattr(helpers, "_send", send)
+    if nested:
+        helpers.cdp(
+            "Target.sendMessageToTarget",
+            sessionId="IFRAME-SESSION",
+            message=json.dumps({"id": 1, "method": "Runtime.evaluate", "params": {"expression": "1"}}),
+        )
+        dispatched = calls[-1]
+        assert dispatched["params"]["sessionId"] == "IFRAME-SESSION"
+    else:
+        helpers.cdp("Runtime.evaluate", session_id="IFRAME-SESSION", expression="1")
+        dispatched = calls[-1]
+        assert dispatched["session_id"] == "IFRAME-SESSION"
+    assert dispatched.get("method") in {"Runtime.evaluate", "Target.sendMessageToTarget"}
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_explicit_session_with_unknown_mapped_target_fails_closed_before_dispatch(
+    owning, monkeypatch, nested
+):
+    helpers._remember("sessions", "IFRAME-SESSION")
+    calls = []
+
+    def send(req, **kwargs):
+        calls.append(req)
+        if req.get("meta") == "guard_context":
+            return {"target_id": "UNKNOWN-TARGET", "session_id": "IFRAME-SESSION", "url": "https://frame.example/"}
+        return {"result": {}}
+
+    monkeypatch.setattr(helpers, "_send", send)
+    with pytest.raises(helpers.TabGuardRefused):
+        if nested:
+            helpers.cdp(
+                "Target.sendMessageToTarget",
+                sessionId="IFRAME-SESSION",
+                message=json.dumps({"id": 1, "method": "Runtime.evaluate", "params": {"expression": "1"}}),
+            )
+        else:
+            helpers.cdp("Runtime.evaluate", session_id="IFRAME-SESSION", expression="1")
+    assert not any(req.get("method") for req in calls)
 
 
 def test_old_daemon_refused_before_session_switch(owning, monkeypatch):
