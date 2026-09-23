@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import tempfile
 import sys
 import warnings
 from pathlib import Path
@@ -69,15 +70,30 @@ def _harden_windows_acl(path: Path, *, directory: bool) -> None:
     inheritance = "(OI)(CI)" if directory else ""
     grant = f"{principal}:{inheritance}F"
 
-    # Reset removes stale explicit ACEs. Grant our principal before disabling
-    # inheritance so the path stays accessible throughout the transition.
-    for args in (
-        ("/reset", *recursive),
-        ("/grant:r", grant, *recursive),
-        ("/inheritance:r", *recursive),
-    ):
-        if not _run_icacls(path, *args):
+    fd, backup_name = tempfile.mkstemp(prefix="browser-harness-acl-", suffix=".txt")
+    os.close(fd)
+    backup_path = Path(backup_name)
+    backup_path.unlink(missing_ok=True)
+
+    try:
+        # Keep the ACL transition failure-safe. If any restrictive update fails
+        # after /reset, restore the exact pre-change DACL before returning.
+        if not _run_icacls(path, "/save", str(backup_path), *recursive):
             return
+
+        for args in (
+            ("/reset", *recursive),
+            ("/grant:r", grant, *recursive),
+            ("/inheritance:r", *recursive),
+        ):
+            if _run_icacls(path, *args):
+                continue
+
+            restore_root = path.parent if path.parent != Path("") else Path(".")
+            _run_icacls(restore_root, "/restore", str(backup_path))
+            return
+    finally:
+        backup_path.unlink(missing_ok=True)
 
 
 def harden_private_path(path: Path, *, directory: bool = False) -> None:
