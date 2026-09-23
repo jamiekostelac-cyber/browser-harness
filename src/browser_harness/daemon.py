@@ -285,11 +285,14 @@ def _process_args(pid):
             return [actual_executable, *argv[1:]]
         if platform.system() == "Windows":
             command = (
-                "$p=Get-CimInstance Win32_Process -Filter 'ProcessId=" + str(pid) +
-                "'; ConvertTo-Json -Compress @{exe=$p.ExecutablePath; command=$p.CommandLine}"
+                "$p=Get-CimInstance Win32_Process -Filter \"ProcessId=$env:BH_PROCESS_PID\"; "
+                "ConvertTo-Json -Compress @{exe=$p.ExecutablePath; command=$p.CommandLine}"
             )
+            process_env = os.environ.copy()
+            process_env["BH_PROCESS_PID"] = str(int(pid))
             record = json.loads(subprocess.check_output(
                 ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
+                env=process_env,
                 text=True, stderr=subprocess.DEVNULL, timeout=3,
             ))
             if not record.get("exe") or not record.get("command"):
@@ -341,26 +344,63 @@ def _trusted_browser_executable(executable):
                 text=True, stderr=subprocess.STDOUT, timeout=5,
             )
             fields = dict(line.split("=", 1) for line in details.splitlines() if "=" in line)
-            return trusted_signers.get(fields.get("Identifier")) == fields.get("TeamIdentifier")
+            identifier = fields.get("Identifier")
+            image_names = {
+                "com.google.Chrome": {"google chrome"},
+                "com.google.Chrome.beta": {"google chrome"},
+                "com.google.Chrome.canary": {"google chrome"},
+                "com.google.Chrome.dev": {"google chrome"},
+                "com.microsoft.edgemac": {"microsoft edge"},
+                "com.microsoft.edgemac.beta": {"microsoft edge"},
+                "com.microsoft.edgemac.dev": {"microsoft edge"},
+                "com.brave.Browser": {"brave browser"},
+            }
+            return (trusted_signers.get(identifier) == fields.get("TeamIdentifier")
+                    and path.name.casefold() in image_names.get(identifier, set()))
         except (OSError, ValueError, subprocess.SubprocessError):
             return False
     if system == "Windows":
         script = (
-            "$s=Get-AuthenticodeSignature -LiteralPath $args[0]; "
-            "if ($s.Status -eq 'Valid') { $s.SignerCertificate.GetNameInfo('SimpleName',$false) }"
+            "$p=$env:BH_BROWSER_EXE; $s=Get-AuthenticodeSignature -LiteralPath $p; "
+            "$v=(Get-Item -LiteralPath $p).VersionInfo; "
+            "$signer=''; if($s.SignerCertificate) "
+            "{$signer=$s.SignerCertificate.GetNameInfo('SimpleName',$false)}; "
+            "ConvertTo-Json -Compress @{status=$s.Status; signer=$signer; "
+            "product=$v.ProductName; description=$v.FileDescription}"
         )
         try:
-            signer = subprocess.check_output(
-                ["powershell", "-NoProfile", "-NonInteractive", "-Command", script, str(path)],
+            identity_env = os.environ.copy()
+            identity_env["BH_BROWSER_EXE"] = str(path)
+            identity = json.loads(subprocess.check_output(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                env=identity_env,
                 text=True, stderr=subprocess.DEVNULL, timeout=5,
-            ).strip().casefold()
-            return signer in {
-                "google llc", "microsoft corporation", "brave software, inc.",
+            ))
+            image = path.name.casefold()
+            product = str(identity.get("product") or "").strip().casefold()
+            signer = str(identity.get("signer") or "").strip().casefold()
+            supported = {
+                "chrome.exe": ("google chrome", "google llc"),
+                "chromium.exe": ("chromium", "google llc"),
+                "brave.exe": ("brave", "brave software, inc."),
+                "msedge.exe": ("microsoft edge", "microsoft corporation"),
             }
-        except (OSError, subprocess.SubprocessError):
+            expected = supported.get(image)
+            return bool(
+                identity.get("status") == "Valid" and expected
+                and product == expected[0] and signer == expected[1]
+            )
+        except (OSError, ValueError, TypeError, subprocess.SubprocessError):
             return False
     if system == "Linux":
-        # Package ownership proves the resolved file belongs to an installed package.
+        # Require both package ownership and the package's recognized browser image.
+        browser_images = {
+            "google-chrome": {"chrome", "google-chrome", "google-chrome-stable"},
+            "chromium": {"chromium", "chromium-browser"},
+            "brave-browser": {"brave-browser"},
+            "microsoft-edge": {"microsoft-edge", "msedge"},
+        }
+        image = path.name.casefold()
         for command, args, trusted in (
             ("dpkg-query", ["-S", str(path)], ("google-chrome", "chromium", "brave-browser", "microsoft-edge")),
             ("rpm", ["-qf", str(path)], ("google-chrome", "chromium", "brave-browser", "microsoft-edge")),
@@ -368,7 +408,10 @@ def _trusted_browser_executable(executable):
             try:
                 owner = subprocess.check_output([command, *args], text=True,
                                                 stderr=subprocess.DEVNULL, timeout=3).casefold()
-                if any(name in owner for name in trusted):
+                if any(name in owner for name in trusted) and any(
+                    image in images for package, images in browser_images.items()
+                    if package in owner
+                ):
                     return True
             except (OSError, subprocess.SubprocessError):
                 continue

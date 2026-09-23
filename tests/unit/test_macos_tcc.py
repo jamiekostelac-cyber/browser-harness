@@ -530,6 +530,19 @@ def test_linux_executable_trust_requires_package_ownership(monkeypatch):
     assert not daemon._trusted_browser_executable("/tmp/google-chrome")
 
 
+def test_linux_resolved_chrome_image_requires_google_chrome_package(monkeypatch):
+    monkeypatch.setattr(daemon.platform, "system", lambda: "Linux")
+
+    def package_owner(command, **_kwargs):
+        if command[0] == "dpkg-query" and command[-1] == "/opt/google/chrome/chrome":
+            return "google-chrome-stable: /opt/google/chrome/chrome"
+        raise daemon.subprocess.CalledProcessError(1, command)
+
+    monkeypatch.setattr(daemon.subprocess, "check_output", package_owner)
+    assert daemon._trusted_browser_executable("/opt/google/chrome/chrome")
+    assert not daemon._trusted_browser_executable("/opt/google/chrome/powershell")
+
+
 def test_macos_executable_trust_requires_valid_expected_signer(monkeypatch):
     monkeypatch.setattr(daemon.platform, "system", lambda: "Darwin")
 
@@ -550,17 +563,70 @@ def test_macos_executable_trust_requires_valid_expected_signer(monkeypatch):
     assert not daemon._trusted_browser_executable("/tmp/Google Chrome")
 
 
-def test_windows_executable_trust_requires_valid_publisher(monkeypatch):
+@pytest.mark.parametrize(
+    ("image", "product", "publisher", "expected"),
+    [
+        ("chrome.exe", "Google Chrome", "Google LLC", True),
+        ("chromium.exe", "Chromium", "Google LLC", True),
+        ("brave.exe", "Brave", "Brave Software, Inc.", True),
+        ("msedge.exe", "Microsoft Edge", "Microsoft Corporation", True),
+        ("powershell.exe", "Windows PowerShell", "Microsoft Corporation", False),
+        ("chrome.exe", "Windows PowerShell", "Google LLC", False),
+        ("chrome.exe", "Google Chrome", "Attacker LLC", False),
+        ("chrome.exe", "Google Chrome", "Google LLC", False),
+    ],
+)
+def test_windows_executable_trust_requires_browser_product_and_valid_publisher(
+    monkeypatch, tmp_path, image, product, publisher, expected
+):
     monkeypatch.setattr(daemon.platform, "system", lambda: "Windows")
-    monkeypatch.setattr(
-        daemon.subprocess, "check_output",
-        lambda *_args, **_kwargs: "Google LLC",
-    )
-    assert daemon._trusted_browser_executable(r"C:\Program Files\Google\Chrome\chrome.exe")
-    monkeypatch.setattr(
-        daemon.subprocess, "check_output", lambda *_args, **_kwargs: "Attacker LLC",
-    )
-    assert not daemon._trusted_browser_executable(r"C:\Chrome\chrome.exe")
+    browser_path = tmp_path / "quotes ' backtick ` semicolon ; pipe |" / image
+    observed = {}
+
+    def inspect(command, **kwargs):
+        observed["command"] = command
+        observed["env_path"] = kwargs["env"]["BH_BROWSER_EXE"]
+        return daemon.json.dumps({
+            "status": "Valid" if expected else "Invalid",
+            "signer": publisher,
+            "product": product,
+            "description": product,
+        })
+
+    monkeypatch.setattr(daemon.subprocess, "check_output", inspect)
+    assert daemon._trusted_browser_executable(str(browser_path)) is expected
+    assert observed["env_path"] == str(browser_path)
+    assert len(observed["command"]) == 5
+    assert str(browser_path) not in observed["command"][-1]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        r"C:\Program Files\Google\Chrome\chrome 'quoted'.exe",
+        r"C:\Program Files\Google\Chrome\chrome`&|;().exe",
+        r"C:\Browser (Stable)\chrome.exe",
+    ],
+)
+def test_windows_process_lookup_keeps_pid_out_of_powershell_source(monkeypatch, path):
+    monkeypatch.setattr(daemon.platform, "system", lambda: "Windows")
+    seen = {}
+
+    def query(command, **kwargs):
+        seen["command"] = command
+        seen["env"] = kwargs["env"]
+        return daemon.json.dumps({"exe": path, "command": f'"{path}" --user-data-dir=C:\\profile'})
+
+    # Win32 argument parsing is unavailable here; the lookup must fail closed.
+    monkeypatch.setattr(daemon.subprocess, "check_output", query)
+    def unavailable_win32(*_args, **_kwargs):
+        raise OSError("Win32 APIs unavailable on this host")
+
+    monkeypatch.setattr(daemon.ctypes, "WinDLL", unavailable_win32, raising=False)
+    assert daemon._process_args(4242) is None
+    assert seen["env"]["BH_PROCESS_PID"] == "4242"
+    assert "4242" not in seen["command"]
+    assert path not in seen["command"]
 
 
 @pytest.mark.parametrize(
@@ -575,6 +641,7 @@ def test_profile_process_identity_matches_user_data_dir(monkeypatch, tmp_path, c
     profile.mkdir()
     monkeypatch.setattr(daemon.platform, "system", lambda: "Darwin")
     monkeypatch.setattr(daemon.os, "readlink", lambda _path: "host-1234")
+    monkeypatch.setattr(daemon, "_trusted_browser_executable", lambda _exe: True)
     observed = command.replace("/tmp/automation-profile", str(profile))
     monkeypatch.setattr(
         daemon, "_process_args",
