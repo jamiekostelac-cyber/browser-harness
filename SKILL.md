@@ -266,8 +266,8 @@ If you get stuck on a browser mechanic, check https://github.com/browser-use/bro
 
 ## Gotchas
 
-- `chrome://inspect/#remote-debugging` must be enabled for local Chrome or Brave control.
-- On macOS, if local Chrome or Brave shows an "Allow remote debugging?" popup, call `mac-approve` once with the same `BU_NAME` while the original browser command waits. Do not poll or rerun the browser command; remote and cloud browsers do not use this helper.
+- `chrome://inspect/#remote-debugging` must be enabled for local Chrome control.
+- On macOS, if local Chrome shows an "Allow remote debugging?" popup, call `mac-approve` once with the same `BU_NAME` while the original browser command waits. Do not poll or rerun the browser command; remote and cloud browsers do not use this helper. Brave may be controlled through an available CDP endpoint, but `mac-approve` supports Chrome only.
 - Omnibox popups are not real work tabs.
 - CDP target order is not Chrome's visible tab-strip order.
 - `BU_CDP_URL` is an HTTP DevTools endpoint; the daemon resolves it to WebSocket.

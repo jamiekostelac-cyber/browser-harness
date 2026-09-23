@@ -38,7 +38,24 @@ def test_helper_success_remains_a_normal_tool_result(monkeypatch):
     assert result.content[0].text == '{"url": "https://example.com"}'
 
 
-def test_browser_new_tab_exposes_background_window_option(monkeypatch):
+def test_browser_new_tab_forwards_default_window_option(monkeypatch):
+    monkeypatch.setattr(mcp_server, "ensure_daemon", lambda: None)
+    calls = []
+
+    def fake_new_tab(url, new_window=False):
+        calls.append((url, new_window))
+        return "target-window"
+
+    monkeypatch.setattr(mcp_server, "new_tab", fake_new_tab)
+
+    result = _call_tool("browser_new_tab", {"url": "https://example.com"})
+
+    assert result.is_error is False
+    assert result.content[0].text == '{"targetId": "target-window"}'
+    assert calls == [("https://example.com", False)]
+
+
+def test_browser_new_tab_forwards_background_window_option(monkeypatch):
     monkeypatch.setattr(mcp_server, "ensure_daemon", lambda: None)
     calls = []
 
