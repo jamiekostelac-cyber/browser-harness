@@ -229,9 +229,8 @@ def reject_reparse_path(path: Path) -> None:
 
 
 def _read_sddl(path: Path) -> str:
-    literal_path = str(path).replace("'", "''")
     command = (
-        f"$a = Get-Acl -LiteralPath '{literal_path}'; "
+        "$a = Get-Acl -LiteralPath $env:BH_SDDL_PATH; "
         "$s = [System.Security.AccessControl.AccessControlSections]::All; "
         "[Console]::Write($a.GetSecurityDescriptorSddlForm($s))"
     )
@@ -241,6 +240,7 @@ def _read_sddl(path: Path) -> str:
             capture_output=True,
             text=True,
             check=False,
+            env={**os.environ, "BH_SDDL_PATH": str(path)},
         )
     except OSError as exc:
         raise PermissionError(f"could not read security descriptor for {path}: {exc}") from exc

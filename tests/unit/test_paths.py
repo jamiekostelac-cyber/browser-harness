@@ -326,22 +326,42 @@ def test_acl_parser_still_requires_protected_dacl_with_auto_inherit_flags(contro
         )
 
 
-def test_read_sddl_quotes_paths_as_powershell_literals(monkeypatch, tmp_path):
-    target = tmp_path / "folder with spaces" / "owner's credentials.json"
+@pytest.mark.parametrize("filename", [
+    "owner's credentials.json",
+    'owner"s credentials.json',
+    "owner’s credentials.json",
+    "owner’s ` credentials; & | < > $(Write-Output INJECTED).json",
+])
+def test_read_sddl_passes_path_as_data_without_interpolating_powershell_source(
+    monkeypatch, tmp_path, filename
+):
+    target = tmp_path / "folder with spaces" / filename
     calls = []
+    descriptor = "O:S-1-5-21-123456789-123456789-123456789-1001G:BAD:P(A;;FA;;;SY)"
 
     def fake_run(args, **kwargs):
         calls.append((args, kwargs))
-        return SimpleNamespace(returncode=0, stdout="O:...", stderr="")
+        return SimpleNamespace(returncode=0, stdout=descriptor, stderr="")
 
     monkeypatch.setattr(paths.subprocess, "run", fake_run)
 
-    assert paths._read_sddl(target) == "O:..."
+    assert paths._read_sddl(target) == descriptor
     args, kwargs = calls[0]
     command = args[args.index("-Command") + 1]
-    assert f"-LiteralPath '{str(target).replace(chr(39), chr(39) * 2)}'" in command
-    assert str(target) not in args[args.index("-Command") + 2:]
-    assert kwargs == {"capture_output": True, "text": True, "check": False}
+    assert command == (
+        "$a = Get-Acl -LiteralPath $env:BH_SDDL_PATH; "
+        "$s = [System.Security.AccessControl.AccessControlSections]::All; "
+        "[Console]::Write($a.GetSecurityDescriptorSddlForm($s))"
+    )
+    assert str(target) not in command
+    assert "INJECTED" not in command
+    assert kwargs["env"]["BH_SDDL_PATH"] == str(target)
+    assert {key: kwargs[key] for key in ("capture_output", "text", "check")} == {
+        "capture_output": True,
+        "text": True,
+        "check": False,
+    }
+    assert "shell" not in kwargs
 
 
 def test_acl_parser_requires_protected_dacl_trusted_owner_and_no_deny():
