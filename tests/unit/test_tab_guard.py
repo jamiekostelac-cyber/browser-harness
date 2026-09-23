@@ -271,6 +271,29 @@ def test_detach_checks_parameter_session_and_forgets_it(owning):
         helpers.cdp("Runtime.evaluate", session_id="SESSION-MINE", expression="1")
 
 
+def test_create_and_attach_record_new_ownership(guard):
+    assert helpers._owned_ids() == set()
+    assert helpers._owned_sessions() == set()
+    assert helpers.cdp("Target.createTarget")["targetId"] == "MINE"
+    assert helpers._owned_ids() == {"MINE"}
+    assert helpers.cdp("Target.attachToTarget", targetId="MINE")["sessionId"] == "SESSION-MINE"
+    assert helpers._owned_sessions() == {"SESSION-MINE"}
+
+
+def test_removal_is_noop_only_when_value_is_absent(guard):
+    helpers._own_tab("MINE")
+    helpers._remember("tabs", "MINE", remove=True)
+    assert helpers._owned_ids() == set()
+    helpers._remember("tabs", "MINE", remove=True)
+    assert helpers._owned_ids() == set()
+
+
+def test_addition_is_noop_only_when_value_is_present(guard):
+    helpers._own_tab("MINE")
+    helpers._own_tab("MINE")
+    assert helpers._owned_ids() == {"MINE"}
+
+
 @pytest.mark.parametrize("params", [
     {}, {"sessionId": "FOREIGN"}, {"targetId": "MINE"},
     {"sessionId": "FOREIGN", "targetId": "MINE"},
@@ -365,6 +388,12 @@ def test_guard_off_performs_no_ownership_io(guard, monkeypatch, capsys):
         helpers.cdp("Target.attachToTarget", targetId="FOREIGN")
         helpers.cdp("Target.detachFromTarget", sessionId="SESSION-MINE")
     assert capsys.readouterr().err == ""
+
+
+def test_removal_guard_off_does_not_resolve_ownership_path(guard, monkeypatch):
+    monkeypatch.delenv("BH_TAB_GUARD")
+    monkeypatch.setattr(helpers, "_owned_path", lambda: pytest.fail("path must not be resolved"))
+    helpers._remember("tabs", "MINE", remove=True)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")

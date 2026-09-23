@@ -164,7 +164,8 @@ def _remember(kind, value, remove=False):
     if not _tab_guard_on() or not value:
         return
     state = _owned_state()
-    if (value in state[kind]) != remove:
+    present = value in state[kind]
+    if (not remove and present) or (remove and not present):
         return
     state[kind] = sorted(set(state[kind]) - {value} if remove else set(state[kind]) | {value})
     temporary = None
