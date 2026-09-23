@@ -1723,6 +1723,77 @@ def test_guarded_bootstrap_latches_policy_before_transport_yields(daemon_bridge)
     assert not any(call[0] == "Runtime.evaluate" for call in calls)
 
 
+def test_guard_enabled_daemon_rejects_guardless_dispatch_and_metadata_before_bootstrap(
+    monkeypatch,
+):
+    monkeypatch.setenv("BH_TAB_GUARD", "1")
+    d = daemon.Daemon()
+    calls = []
+
+    class CDP:
+        async def send_raw(self, method, params=None, session_id=None):
+            calls.append((method, params, session_id))
+            return {"result": {"value": "foreign"}}
+
+    d.cdp = CDP()
+
+    async def run():
+        dispatch = await d.handle({
+            "method": "Runtime.evaluate", "params": {"expression": "1"},
+            "session_id": "FOREIGN-SESSION",
+        })
+        metadata = await d.handle({"meta": "connection_status"})
+        return dispatch, metadata
+
+    dispatch, metadata = asyncio.run(run())
+
+    assert d._guard_policy_active is True
+    assert dispatch == {"error": "tab guard authorization is stale or invalid"}
+    assert metadata == {"tab_guard": "refused"}
+    assert calls == []
+
+
+def test_unguarded_inflight_dispatch_result_is_suppressed_after_guarded_bootstrap(
+    monkeypatch,
+):
+    monkeypatch.delenv("BH_TAB_GUARD", raising=False)
+    d = daemon.Daemon()
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class CDP:
+        async def send_raw(self, method, params=None, session_id=None):
+            if method == "Runtime.evaluate":
+                entered.set()
+                await release.wait()
+                return {"result": {"value": "private foreign result"}}
+            if method == "Target.createBrowserContext":
+                return {"browserContextId": "CTX-MINE"}
+            raise AssertionError(f"unexpected CDP call: {method}")
+
+    d.cdp = CDP()
+    bootstrap = {
+        "method": "Target.createBrowserContext", "params": {}, "session_id": None,
+        "tab_guard": {"tabs": [], "sessions": [], "contexts": []},
+        "tab_guard_run": RUN_ID, "tab_guard_epoch": d._authorization_epoch,
+    }
+
+    async def run():
+        pending = asyncio.create_task(d.handle({
+            "method": "Runtime.evaluate", "params": {"expression": "1"},
+            "session_id": "FOREIGN-SESSION",
+        }))
+        await entered.wait()
+        started = await d.handle(bootstrap)
+        assert started == {"result": {"browserContextId": "CTX-MINE"}}
+        release.set()
+        return await pending
+
+    result = asyncio.run(run())
+
+    assert result == {"error": "tab guard authorization was revoked during dispatch"}
+    assert "private foreign result" not in json.dumps(result)
+
+
 @pytest.mark.parametrize("payload", [
     "{bad json", json.dumps({"id": 999, "result": {"secret": "unknown"}}),
     json.dumps({"id": 1, "result": {"secret": "malformed correlation"}}),

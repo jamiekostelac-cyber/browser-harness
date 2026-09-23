@@ -496,7 +496,7 @@ class Daemon:
         self._guarded_sessions = set()
         self._guarded_targets = set()
         self._guarded_contexts = set()
-        self._guard_policy_active = False
+        self._guard_policy_active = os.environ.get("BH_TAB_GUARD") == "1"
         self._guarded_run_id = None
         self._authorization_epoch = 0
         self._legacy_commands = {}
@@ -1252,6 +1252,17 @@ class Daemon:
         return {"tab_guard": "refused", "target_id": target_id}
 
     async def handle(self, req):
+        # A guardless request may already be awaiting CDP when a guarded
+        # bootstrap activates policy. Do not let that earlier request return
+        # data after the daemon has crossed into guarded operation.
+        policy_was_active = self._guard_policy_active
+        response = await self._handle(req)
+        if (not policy_was_active and self._guard_policy_active
+                and "tab_guard_run" not in req):
+            return {"error": "tab guard authorization was revoked during dispatch"}
+        return response
+
+    async def _handle(self, req):
         # Token guard for Windows TCP loopback: any local process can otherwise
         # connect and issue CDP commands. expected_token() is None on POSIX so
         # this check is a no-op there (AF_UNIX + chmod 600 is the boundary).
