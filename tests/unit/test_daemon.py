@@ -111,6 +111,59 @@ def test_tab_marker_can_be_disabled_before_set_session_schedules_it(monkeypatch,
     assert not [call for call in d.cdp.calls if call[0] == "Runtime.evaluate"]
 
 
+def test_guarded_startup_does_not_attach_existing_page(monkeypatch):
+    monkeypatch.setenv("BH_TAB_GUARD", "1")
+    d = _fresh_daemon()
+
+    assert asyncio.run(d.attach_first_page()) is None
+    assert d.session is None
+    assert d.target_id is None
+    assert d.cdp.calls == []
+
+
+def test_guard_policy_blocks_unregistered_marker_and_domain_authorization(monkeypatch):
+    monkeypatch.delenv("BH_TAB_GUARD", raising=False)
+    monkeypatch.setenv("BH_TAB_MARKER", "0")
+
+    class _PolicyCDP(_FakeCDP):
+        async def send_raw(self, method, params=None, session_id=None):
+            self.calls.append((method, params, session_id))
+            if method == "Target.getTargetInfo":
+                return {"targetInfo": {"type": "page", "url": "https://owned.example/"}}
+            return {}
+
+    d = daemon.Daemon()
+    d.cdp = _PolicyCDP()
+    d.session = "unguarded-session"
+    d.target_id = "unguarded-target"
+    d._session_targets["unguarded-session"] = "unguarded-target"
+
+    async def register():
+        return await d.handle({
+            "meta": "set_session",
+            "session_id": "owned-session",
+            "target_id": "owned-target",
+            "tab_guard": {"tabs": ["owned-target"], "sessions": ["owned-session"]},
+        })
+
+    assert asyncio.run(register()) == {"session_id": "owned-session", "tab_guard": "ok"}
+    monkeypatch.delenv("BH_TAB_MARKER")
+    d.cdp.calls.clear()
+
+    async def exercise():
+        d._record_event("Page.loadEventFired", {}, "foreign-session")
+        d._record_event("Page.loadEventFired", {}, "owned-session")
+        await d._enable_default_domains("foreign-session")
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+    asyncio.run(exercise())
+    assert not any(call[2] == "foreign-session" for call in d.cdp.calls)
+    assert [call for call in d.cdp.calls if call[0] == "Runtime.evaluate"] == [
+        ("Runtime.evaluate", {"expression": daemon.TAB_MARKER_JS}, "owned-session")
+    ]
+
+
 def test_tab_marker_stays_enabled_by_default(monkeypatch):
     monkeypatch.delenv("BH_TAB_MARKER", raising=False)
     d = _fresh_daemon()
@@ -158,7 +211,9 @@ def test_guarded_event_marker_uses_origin_session_and_owned_target(monkeypatch):
 
     d = daemon.Daemon()
     d.cdp = _MarkerCDP()
+    d._guard_policy_active = True
     d._guarded_sessions = {"event-session"}
+    d._guarded_targets = {"event-target"}
     d._session_targets = {"event-session": "event-target"}
     d.session = "current-session"
     d.target_id = "current-target"
@@ -194,6 +249,7 @@ def test_guarded_event_marker_fails_closed_for_foreign_or_privileged_source(
 
     d = daemon.Daemon()
     d.cdp = _MarkerCDP()
+    d._guard_policy_active = True
     d._guarded_sessions = {"event-session"}
     d._session_targets = {"event-session": "event-target"}
     d.session = "current-session"

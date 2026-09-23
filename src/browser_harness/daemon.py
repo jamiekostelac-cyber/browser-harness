@@ -448,6 +448,8 @@ class Daemon:
         self._session_replacements = {}
         self._session_targets = {}
         self._guarded_sessions = set()
+        self._guarded_targets = set()
+        self._guard_policy_active = False
         self.events = deque(maxlen=BUF)
         self.dialog_session = None
         self.dialog = None
@@ -455,6 +457,11 @@ class Daemon:
 
     async def attach_first_page(self, replaces_session=None, enable_domains=True):
         """Attach to a real page (or any page). Sets self.session. Returns attached target or None."""
+        if self._guard_policy_active or os.environ.get("BH_TAB_GUARD") == "1":
+            # Startup and automatic recovery have no helper-side ownership
+            # proof for a fresh session, so they must not attach to the
+            # focused user's tab. Use switch_tab() to reattach explicitly.
+            return None
         targets = (await self.cdp.send_raw("Target.getTargets"))["targetInfos"]
         # Named daemons (BU_NAME != "default") share one browser with other
         # daemons — attaching to the first page makes parallel daemons fight
@@ -568,6 +575,8 @@ class Daemon:
         important on the set_session path, where the helper's IPC socket has
         a 5s read timeout.
         """
+        if self._guard_policy_active and session_id not in self._guarded_sessions:
+            return
         async def enable_one(d):
             try:
                 await asyncio.wait_for(
@@ -633,8 +642,9 @@ class Daemon:
         target_id = self._session_targets.get(session_id)
 
         async def mark():
-            if os.environ.get("BH_TAB_GUARD") == "1":
-                if session_id not in self._guarded_sessions or not target_id:
+            if self._guard_policy_active:
+                if (session_id not in self._guarded_sessions
+                        or not target_id or target_id not in self._guarded_targets):
                     return
                 try:
                     info = (await self.cdp.send_raw(
@@ -644,6 +654,10 @@ class Daemon:
                     return
                 if not _guard_url_allowed(info.get("url")):
                     return
+            elif os.environ.get("BH_TAB_GUARD") == "1":
+                # Guarded startup has no explicit session policy yet. Stay
+                # inert until a guarded request registers one.
+                return
             await self.cdp.send_raw(
                 "Runtime.evaluate",
                 {"expression": TAB_MARKER_JS},
@@ -694,31 +708,50 @@ class Daemon:
             return await orig(method, params, session_id)
         self.cdp._event_registry.handle_event = tap
 
+    @staticmethod
+    def _event_source_session(event):
+        """Extract the transport source, never an untrusted outer carrier."""
+        if event.get("method") != "Target.receivedMessageFromTarget":
+            session_id = event.get("session_id")
+            return session_id if isinstance(session_id, str) and session_id else None
+        params = event.get("params")
+        if not isinstance(params, dict):
+            return None
+        session_id, message = params.get("sessionId"), params.get("message")
+        if not isinstance(session_id, str) or not session_id or not isinstance(message, str):
+            return None
+        try:
+            payload = json.loads(message)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        nested_session = payload.get("sessionId")
+        if nested_session is not None and nested_session != session_id:
+            return None
+        return session_id
+
     async def _guarded_read(self, req):
         """Validate and snapshot before yielding; never expose other sessions."""
         meta, owned = req["meta"], req["tab_guard"]
         tabs, sessions = set(owned.get("tabs", [])), set(owned.get("sessions", []))
-        self._guarded_sessions = sessions
         target_id, sid = self.target_id, self.session
         if meta == "drain_events":
             out, remaining = [], deque(maxlen=BUF)
+            target_allowed = {}
             for event in self.events:
-                if event.get("method") == "Target.receivedMessageFromTarget":
-                    event_session = None
-                    event_params = event.get("params")
-                    if isinstance(event_params, dict):
-                        candidate = event_params.get("sessionId")
-                        message = event_params.get("message")
-                        if isinstance(candidate, str) and candidate and isinstance(message, str):
-                            try:
-                                payload = json.loads(message)
-                            except (TypeError, ValueError):
-                                payload = None
-                            if isinstance(payload, dict):
-                                event_session = candidate
-                else:
-                    event_session = event.get("session_id")
-                if isinstance(event_session, str) and event_session in sessions:
+                event_session = self._event_source_session(event)
+                event_target = self._session_targets.get(event_session)
+                allowed = bool(event_session in sessions and event_target in tabs)
+                if allowed and event_target not in target_allowed:
+                    try:
+                        info = (await self.cdp.send_raw(
+                            "Target.getTargetInfo", {"targetId": event_target}
+                        )).get("targetInfo", {})
+                        target_allowed[event_target] = _guard_url_allowed(info.get("url"))
+                    except Exception:
+                        target_allowed[event_target] = False
+                if allowed and target_allowed.get(event_target, False):
                     out.append(event)
                 else:
                     remaining.append(event)
@@ -826,6 +859,9 @@ class Daemon:
                     if not _guard_url_allowed(info.get("url")):
                         return {"tab_guard": "refused", "target_id": req.get("target_id"),
                                 "url": info.get("url", "")}
+                    self._guard_policy_active = True
+                    self._guarded_sessions = set(owned.get("sessions", []))
+                    self._guarded_targets = set(owned.get("tabs", []))
                 old_session = self.session
                 self.session = req.get("session_id")
                 self.target_id = req.get("target_id") or self.target_id

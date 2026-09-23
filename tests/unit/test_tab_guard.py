@@ -726,6 +726,10 @@ def daemon_bridge(owning, monkeypatch):
     """Exercise helpers against the actual daemon handler, without a browser."""
     d = daemon.Daemon()
     d.target_id, d.session = "MINE", "SESSION-MINE"
+    d._session_targets["SESSION-MINE"] = "MINE"
+    d._guard_policy_active = True
+    d._guarded_sessions = {"SESSION-MINE"}
+    d._guarded_targets = {"MINE"}
     calls = []
     class CDP:
         async def send_raw(self, method, params=None, session_id=None):
@@ -808,6 +812,31 @@ def test_event_drain_filters_owned_sessions_and_preserves_foreign_events(daemon_
     assert [e["session_id"] for e in helpers.drain_events()] == ["SESSION-MINE"]
     assert [e["session_id"] for e in d.events] == ["FOREIGN-SESSION", None]
     assert helpers.drain_events() == []
+
+
+def test_event_drain_hides_owned_session_after_privileged_navigation(daemon_bridge, monkeypatch):
+    d, calls = daemon_bridge
+    monkeypatch.setenv("BH_TAB_MARKER", "0")
+    original = d.cdp.send_raw
+
+    async def privileged_info(method, params=None, session_id=None):
+        if method == "Target.getTargetInfo":
+            calls.append((method, params, session_id))
+            return {"targetInfo": {"type": "page", "targetId": "MINE", "url": "chrome://settings"}}
+        return await original(method, params, session_id)
+
+    d.cdp.send_raw = privileged_info
+    d._record_event("Page.loadEventFired", {}, "SESSION-MINE")
+    assert helpers.drain_events() == []
+    assert d.events
+
+
+def test_event_drain_hides_owned_session_without_target_proof(daemon_bridge):
+    d, _ = daemon_bridge
+    d._session_targets.pop("SESSION-MINE")
+    d._record_event("Network.requestWillBeSent", {"secret": "owned"}, "SESSION-MINE")
+    assert helpers.drain_events() == []
+    assert d.events
 
 
 def test_legacy_target_reply_uses_params_session_id_for_guarded_event_filter(daemon_bridge):
