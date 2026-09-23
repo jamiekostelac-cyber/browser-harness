@@ -340,11 +340,13 @@ def _profile_browser_pid(base, expected_pid=None):
     args = _process_args(pid)
     if not args:
         return None
-    executable = "".join(char for char in Path(args[0]).name.lower() if char.isalnum())
-    if not executable.startswith((
-        "chrome", "googlechrome", "chromium", "brave", "msedge", "microsoftedge",
-        "arc", "dia", "comet", "opera", "vivaldi", "thorium", "helium",
-    )):
+    executable = "".join(char for char in Path(args[0]).stem.lower() if char.isalnum())
+    if executable not in {
+        "chrome", "googlechrome", "googlechromecanary", "googlechromebeta", "googlechromedev",
+        "chromium", "chromiumbrowser", "brave", "bravebrowser", "msedge", "microsoftedge",
+        "microsoftedgebeta", "microsoftedgedev", "microsoftedgecanary", "arc", "dia",
+        "comet", "opera", "vivaldi", "thorium", "helium",
+    }:
         return None
     expected = str(Path(base).resolve())
     if platform.system() == "Darwin":
