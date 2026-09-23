@@ -416,7 +416,8 @@ def test_windows_endpoint_ownership_uses_listener_pid_and_process_command(monkey
     monkeypatch.setattr(daemon, "_listener_pids", lambda _port: {55})
     monkeypatch.setattr(
         daemon, "_process_args",
-        lambda _pid: ["chrome.exe", f"--user-data-dir={profile}"],
+        lambda _pid: [r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                      f"--user-data-dir={profile}"],
     )
 
     assert daemon._endpoint_owned_by_profile(
@@ -425,10 +426,28 @@ def test_windows_endpoint_ownership_uses_listener_pid_and_process_command(monkey
 
 
 @pytest.mark.parametrize(
+    "endpoint",
+    [
+        "ws://127.0.0.1:49231/devtools/browser/owned/extra",
+        "ws://127.0.0.1.evil:49231/devtools/browser/owned",
+        "ws://127.0.0.1@evil:49231/devtools/browser/owned",
+        "ws://127.0.0.1:49231/devtools/browser/owned?next=/devtools/browser/owned",
+        "ws://127.0.0.1:49231/devtools/browser/owned#fragment",
+    ],
+)
+def test_endpoint_identity_rejects_ambiguous_host_and_path(monkeypatch, tmp_path, endpoint):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    (profile / "DevToolsActivePort").write_text("49231\n/devtools/browser/owned\n")
+
+    assert not daemon._ws_matches_devtools_active_port(profile, "49231", endpoint)
+
+@pytest.mark.parametrize(
     ("executable", "profile_arg", "expected"),
-    [("Google Chrome", "match", 77),
-     ("python", "match", None),
-     ("Google Chrome", "other", None)],
+    [("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "match", 77),
+     ("/tmp/Google Chrome", "match", None),
+     ("/Applications/Google Chrome.app/Contents/MacOS/renamed", "match", None),
+     ("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "other", None)],
 )
 def test_profile_browser_pid_rejects_nonbrowser_and_profile_mismatch(
     monkeypatch, tmp_path, executable, profile_arg, expected
@@ -442,12 +461,44 @@ def test_profile_browser_pid_rejects_nonbrowser_and_profile_mismatch(
     assert daemon._profile_browser_pid(profile) == expected
 
 
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        lambda profile: [f"--title=--user-data-dir={profile}"],
+        lambda profile: [f"--user-data-dir={profile}-suffix"],
+        lambda profile: [f"--user-data-dir={profile}", f"--user-data-dir={profile}"],
+        lambda profile: ["--user-data-dir", str(profile)],
+        lambda profile: [f"--app=--user-data-dir={profile}"],
+        lambda profile: [f"--app=https://example.test/?profile=--user-data-dir={profile}"],
+    ],
+)
+def test_profile_browser_pid_rejects_ambiguous_or_embedded_profile_switches(
+    monkeypatch, tmp_path, arguments
+):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    (profile / "SingletonLock").symlink_to("host-77")
+    monkeypatch.setattr(daemon.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(
+        daemon, "_process_args",
+        lambda _pid: [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            *arguments(profile),
+        ],
+    )
+
+    assert daemon._profile_browser_pid(profile) is None
+
+
 def test_profile_browser_pid_rejects_expected_pid_mismatch(monkeypatch, tmp_path):
     profile = tmp_path / "profile"
     profile.mkdir()
     (profile / "SingletonLock").symlink_to("host-77")
     monkeypatch.setattr(
-        daemon, "_process_args", lambda _pid: ["Google Chrome", f"--user-data-dir={profile}"]
+        daemon, "_process_args", lambda _pid: [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            f"--user-data-dir={profile}",
+        ]
     )
 
     assert daemon._profile_browser_pid(profile, expected_pid=78) is None
@@ -463,16 +514,16 @@ def test_profile_browser_pid_rejects_expected_pid_mismatch(monkeypatch, tmp_path
 def test_profile_process_identity_matches_user_data_dir(monkeypatch, tmp_path, command, expected):
     profile = tmp_path / "automation-profile"
     profile.mkdir()
-    (profile / "SingletonLock").symlink_to("host-1234")
     monkeypatch.setattr(daemon.platform, "system", lambda: "Darwin")
     monkeypatch.setattr(daemon.os, "readlink", lambda _path: "host-1234")
     observed = command.replace("/tmp/automation-profile", str(profile))
-    def check_output(args, **_kwargs):
-        if args[0] == "lsof":
-            return "p1234\nftxt\nn/Applications/Chrome"
-        return observed
-
-    monkeypatch.setattr(daemon.subprocess, "check_output", check_output)
+    monkeypatch.setattr(
+        daemon, "_process_args",
+        lambda _pid: [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            observed.split(" ", 1)[1],
+        ],
+    )
     assert daemon._profile_process_owns(profile) is expected
 
 

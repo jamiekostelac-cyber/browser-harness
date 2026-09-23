@@ -1,19 +1,20 @@
 """CDP WS holder + IPC relay (Unix socket on POSIX, TCP loopback on Windows). One daemon per BU_NAME."""
 import asyncio
+import ctypes
 import ipaddress
 import json
 import os
 import platform
-import re
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
 from collections import deque
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from urllib.parse import urlparse
 
 from cdp_use.client import CDPClient
@@ -235,19 +236,53 @@ def _process_args(pid):
     """Return live process arguments using the operating system, or fail closed."""
     try:
         if platform.system() == "Darwin":
-            raw = subprocess.check_output(
-                ["ps", "-ww", "-p", str(pid), "-o", "command="],
-                text=True, stderr=subprocess.DEVNULL, timeout=2,
+            # KERN_PROCARGS2 returns argc followed by NUL-delimited argv. `ps`
+            # prints a display string, which cannot distinguish real arguments
+            # from switch-like text embedded in another argument.
+            mib = (ctypes.c_int * 3)(1, 49, int(pid))  # CTL_KERN, KERN_PROCARGS2
+            size = ctypes.c_size_t(0)
+            libc = ctypes.CDLL(None, use_errno=True)
+            libc.sysctl.argtypes = (
+                ctypes.POINTER(ctypes.c_int), ctypes.c_uint, ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p, ctypes.c_size_t,
             )
+            libc.sysctl.restype = ctypes.c_int
+            if libc.sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0:
+                return None
+            buffer = ctypes.create_string_buffer(size.value)
+            if libc.sysctl(mib, 3, buffer, ctypes.byref(size), None, 0) != 0:
+                return None
+            raw = buffer.raw[:size.value]
+            argc = struct.unpack_from("i", raw)[0]
+            if argc < 1 or len(raw) < 5:
+                return None
+            offset = 4
+            executable_parts = raw[offset:].split(b"\0", 1)
+            if len(executable_parts) != 2:
+                return None
+            executable = executable_parts[0]
+            offset += len(executable) + 1
+            while offset < len(raw) and raw[offset] == 0:
+                offset += 1
+            argv = []
+            for _ in range(argc):
+                arg_parts = raw[offset:].split(b"\0", 1)
+                if len(arg_parts) != 2:
+                    return None
+                arg = arg_parts[0]
+                argv.append(os.fsdecode(arg))
+                offset += len(arg) + 1
             executable_info = subprocess.check_output(
                 ["lsof", "-a", "-p", str(pid), "-d", "txt", "-Fn"],
                 text=True, stderr=subprocess.DEVNULL, timeout=2,
             )
-            executable = next((line[1:] for line in executable_info.splitlines()
-                               if line.startswith("n") and line[1:].startswith("/")), None)
-            if not executable or "--user-data-dir=" not in raw:
+            actual_executable = next((line[1:] for line in executable_info.splitlines()
+                                      if line.startswith("n") and line[1:].startswith("/")), None)
+            if not actual_executable or os.path.realpath(actual_executable) != os.path.realpath(
+                os.fsdecode(executable)
+            ):
                 return None
-            return [executable, raw]
+            return [actual_executable, *argv[1:]]
         if platform.system() == "Windows":
             command = (
                 "$p=Get-CimInstance Win32_Process -Filter 'ProcessId=" + str(pid) +
@@ -257,19 +292,95 @@ def _process_args(pid):
                 ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
                 text=True, stderr=subprocess.DEVNULL, timeout=3,
             ))
-            profile_arg = re.search(
-                r"--user-data-dir=(?:\"([^\"]+)\"|(\S+))", record["command"], re.IGNORECASE
-            )
-            if not record.get("exe") or not profile_arg:
+            if not record.get("exe") or not record.get("command"):
                 return None
-            return [record["exe"], "--user-data-dir=" + next(v for v in profile_arg.groups() if v)]
+            shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+            shell32.CommandLineToArgvW.restype = ctypes.POINTER(ctypes.c_wchar_p)
+            shell32.CommandLineToArgvW.argtypes = (
+                ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_int),
+            )
+            argc = ctypes.c_int()
+            argv_ptr = shell32.CommandLineToArgvW(record["command"], ctypes.byref(argc))
+            if not argv_ptr:
+                return None
+            try:
+                argv = [argv_ptr[i] for i in range(argc.value)]
+            finally:
+                ctypes.windll.kernel32.LocalFree.argtypes = (ctypes.c_void_p,)
+                ctypes.windll.kernel32.LocalFree(argv_ptr)
+            return [record["exe"], *argv[1:]]
         if platform.system() == "Linux":
             executable = os.readlink(f"/proc/{pid}/exe")
             args = [arg for arg in Path(f"/proc/{pid}/cmdline").read_bytes().decode().split("\0") if arg]
             return [executable, *args[1:]] if executable and args else None
-    except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+    except (OSError, ValueError, KeyError, IndexError, struct.error, subprocess.SubprocessError):
         pass
     return None
+
+
+def _trusted_browser_executable(executable):
+    """Require a recognized browser installation layout and executable pair."""
+    path = Path(os.path.realpath(executable))
+    system = platform.system()
+    if system == "Windows":
+        windows_path = PureWindowsPath(executable)
+        name = windows_path.name.casefold()
+        normalized = str(windows_path).replace("/", "\\").casefold()
+    else:
+        name = path.name.casefold()
+    if system == "Darwin":
+        app = next((part for part in path.parts if part.endswith(".app")), None)
+        pairs = {
+            ("Google Chrome.app", "Google Chrome"),
+            ("Google Chrome Canary.app", "Google Chrome Canary"),
+            ("Google Chrome Beta.app", "Google Chrome Beta"),
+            ("Google Chrome Dev.app", "Google Chrome Dev"),
+            ("Chromium.app", "Chromium"), ("Brave Browser.app", "Brave Browser"),
+            ("Microsoft Edge.app", "Microsoft Edge"), ("Microsoft Edge Beta.app", "Microsoft Edge Beta"),
+            ("Microsoft Edge Dev.app", "Microsoft Edge Dev"), ("Arc.app", "Arc"),
+            ("Dia.app", "Dia"), ("Comet.app", "Comet"), ("Opera.app", "Opera"),
+            ("Vivaldi.app", "Vivaldi"),
+        }
+        return (
+            app is not None and (app, path.name) in pairs
+            and path.parent.name == "MacOS"
+            and path.parent.parent.name == "Contents"
+            and path.parent.parent.parent.name == app
+        )
+    if system == "Windows":
+        pairs = {
+            "chrome.exe": ("\\google\\chrome\\application\\", "\\google\\chrome sxs\\application\\", "\\google\\chrome beta\\application\\", "\\google\\chrome dev\\application\\"),
+            "msedge.exe": ("\\microsoft\\edge\\application\\", "\\microsoft\\edge beta\\application\\", "\\microsoft\\edge dev\\application\\"),
+            "brave.exe": ("\\bravesoftware\\brave-browser\\application\\",),
+            "chromium.exe": ("\\chromium\\application\\",),
+        }
+        trusted_roots = (
+            "c:\\program files\\", "c:\\program files (x86)\\",
+            "c:\\users\\",
+        )
+        user_install = "\\appdata\\local\\" in normalized
+        return (normalized.startswith(trusted_roots)
+                and (not normalized.startswith("c:\\users\\") or user_install) and any(
+            root in normalized for root in pairs.get(name, ())
+        ))
+    trusted_locations = (
+        ("/opt/google/chrome/", {"chrome"}),
+        ("/opt/google/chrome-beta/", {"chrome"}),
+        ("/opt/google/chrome-unstable/", {"chrome"}),
+        ("/usr/lib/chromium/", {"chromium", "chrome"}),
+        ("/usr/lib64/chromium/", {"chromium", "chrome"}),
+        ("/usr/lib/brave/", {"brave", "brave-browser"}),
+        ("/opt/brave.com/brave/", {"brave", "brave-browser"}),
+        ("/usr/lib/microsoft-edge/", {"msedge"}),
+        ("/opt/microsoft/msedge/", {"msedge"}),
+        ("/usr/lib/opera/", {"opera"}),
+        ("/usr/lib/vivaldi/", {"vivaldi-bin"}),
+        ("/app/org.chromium.Chromium/", {"chromium", "chrome"}),
+        ("/app/com.google.Chrome/", {"chrome"}),
+        ("/app/com.brave.Browser/", {"brave", "brave-browser"}),
+    )
+    resolved = str(path)
+    return any(resolved.startswith(root) and name in names for root, names in trusted_locations)
 
 
 def _listener_pids(port):
@@ -341,20 +452,13 @@ def _profile_browser_pid(base, expected_pid=None):
     args = _process_args(pid)
     if not args:
         return None
-    executable = "".join(char for char in Path(args[0]).stem.lower() if char.isalnum())
-    if executable not in {
-        "chrome", "googlechrome", "googlechromecanary", "googlechromebeta", "googlechromedev",
-        "chromium", "chromiumbrowser", "brave", "bravebrowser", "msedge", "microsoftedge",
-        "microsoftedgebeta", "microsoftedgedev", "microsoftedgecanary", "arc", "dia",
-        "comet", "opera", "vivaldi", "thorium", "helium",
-    }:
+    if not _trusted_browser_executable(args[0]):
         return None
     expected = str(Path(base).resolve())
-    if platform.system() == "Darwin":
-        if not re.search(re.escape(f"--user-data-dir={expected}") + r"(?=[\s\"']|$)", args[1]):
-            return None
-    elif not any(arg.startswith("--user-data-dir=") and
-                 str(Path(arg.split("=", 1)[1].strip("\"' ")).resolve()) == expected for arg in args):
+    profile_args = [arg for arg in args[1:] if arg == "--user-data-dir" or
+                    arg.startswith("--user-data-dir=")]
+    if (len(profile_args) != 1 or not profile_args[0].startswith("--user-data-dir=") or
+            profile_args[0].split("=", 1)[1] != expected):
         return None
     return pid
 
