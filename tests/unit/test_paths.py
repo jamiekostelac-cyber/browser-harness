@@ -5,18 +5,22 @@ import pytest
 
 from browser_harness import paths
 
+APPROVED_SID = "S-1-5-21-111"
+FOREIGN_SID = "S-1-5-21-999"
+
 
 def _set_windows_identity(monkeypatch):
     monkeypatch.setattr(paths.sys, "platform", "win32")
-    monkeypatch.setenv("USERNAME", "alice")
-    monkeypatch.setenv("USERDOMAIN", "WORKSTATION")
+    monkeypatch.setattr(paths, "_windows_user_sid", lambda: APPROVED_SID)
 
 
 def _successful_icacls(calls):
     def fake_run(args, **kwargs):
         calls.append((args, kwargs))
         if "/save" in args:
-            Path(args[args.index("/save") + 1]).write_bytes(b"saved dacl")
+            Path(args[args.index("/save") + 1]).write_bytes(
+                f"D:(A;;FA;;;{APPROVED_SID})".encode()
+            )
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     return fake_run
@@ -33,10 +37,12 @@ def test_ensure_private_dir_replaces_windows_acl_recursively(monkeypatch, tmp_pa
     argv = [call[0] for call in calls]
     assert argv[0][:3] == ["icacls", str(target), "/save"]
     assert argv[0][-1] == "/T"
-    assert argv[1:] == [
+    assert argv[1:-1] == [
         ["icacls", str(target), "/inheritance:r", "/T"],
-        ["icacls", str(target), "/grant:r", "WORKSTATION\\alice:(OI)(CI)F", "/T"],
+        ["icacls", str(target), "/grant:r", f"*{APPROVED_SID}:(OI)(CI)F", "/T"],
     ]
+    assert argv[-1][:3] == ["icacls", str(target), "/save"]
+    assert argv[-1][-1] == "/T"
     assert all(call[1] == {"capture_output": True, "text": True, "check": False} for call in calls)
 
 
@@ -53,11 +59,13 @@ def test_ensure_private_dir_rehardens_existing_windows_tree(monkeypatch, tmp_pat
     argv = [call[0] for call in calls]
     assert len(argv[0]) == 5
     backup = argv[0][3]
-    assert argv == [
+    assert argv[:3] == [
         ["icacls", str(target), "/save", backup, "/T"],
         ["icacls", str(target), "/inheritance:r", "/T"],
-        ["icacls", str(target), "/grant:r", "WORKSTATION\\alice:(OI)(CI)F", "/T"],
+        ["icacls", str(target), "/grant:r", f"*{APPROVED_SID}:(OI)(CI)F", "/T"],
     ]
+    assert argv[3][:3] == ["icacls", str(target), "/save"]
+    assert argv[3][-1] == "/T"
 
 
 def test_harden_private_path_replaces_file_acl_on_windows(monkeypatch, tmp_path):
@@ -71,10 +79,11 @@ def test_harden_private_path_replaces_file_acl_on_windows(monkeypatch, tmp_path)
     argv = [call[0] for call in calls]
     assert len(argv[0]) == 4
     backup = argv[0][3]
-    assert argv[1:] == [
+    assert argv[1:3] == [
         ["icacls", str(target), "/inheritance:r"],
-        ["icacls", str(target), "/grant:r", "WORKSTATION\\alice:F"],
+        ["icacls", str(target), "/grant:r", f"*{APPROVED_SID}:F"],
     ]
+    assert argv[3][:3] == ["icacls", str(target), "/save"]
     assert argv[0] == ["icacls", str(target), "/save", backup]
 
 
@@ -87,7 +96,9 @@ def test_harden_private_path_restores_acl_after_partial_failure(monkeypatch, tmp
     def fake_run(args, **kwargs):
         calls.append(args)
         if "/save" in args:
-            Path(args[args.index("/save") + 1]).write_bytes(b"saved dacl")
+            Path(args[args.index("/save") + 1]).write_bytes(
+                f"D:(A;;FA;;;{APPROVED_SID})".encode()
+            )
         if "/grant:r" in args:
             return SimpleNamespace(returncode=5, stdout="", stderr="Access is denied.")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -101,7 +112,7 @@ def test_harden_private_path_restores_acl_after_partial_failure(monkeypatch, tmp
     assert calls[:4] == [
         ["icacls", str(target), "/save", backup, "/T"],
         ["icacls", str(target), "/inheritance:r", "/T"],
-        ["icacls", str(target), "/grant:r", "WORKSTATION\\alice:(OI)(CI)F", "/T"],
+        ["icacls", str(target), "/grant:r", f"*{APPROVED_SID}:(OI)(CI)F", "/T"],
         ["icacls", str(target.parent), "/restore", backup],
     ]
     assert calls[4][:3] == ["icacls", str(target), "/save"]
@@ -122,16 +133,16 @@ def test_harden_private_path_raises_when_icacls_fails(monkeypatch, tmp_path):
         paths.harden_private_path(tmp_path / "private", directory=True)
 
 
-def test_harden_private_path_warns_without_windows_username(monkeypatch, tmp_path):
+def test_harden_private_path_uses_token_sid_instead_of_environment(monkeypatch, tmp_path):
     monkeypatch.setattr(paths.sys, "platform", "win32")
-    monkeypatch.delenv("USERNAME", raising=False)
-    monkeypatch.delenv("USERDOMAIN", raising=False)
+    monkeypatch.setenv("USERNAME", "untrusted-name")
+    monkeypatch.setenv("USERDOMAIN", "untrusted-domain")
+    monkeypatch.setattr(paths, "_windows_user_sid", lambda: APPROVED_SID)
 
-    with pytest.raises(PermissionError, match="USERNAME is not set"):
-        paths.harden_private_path(tmp_path / "private", directory=True)
+    assert paths._windows_principal() == f"*{APPROVED_SID}"
 
 
-def test_harden_private_path_warns_when_icacls_is_unavailable(monkeypatch, tmp_path):
+def test_harden_private_path_raises_when_icacls_is_unavailable(monkeypatch, tmp_path):
     _set_windows_identity(monkeypatch)
 
     def fake_run(args, **kwargs):
@@ -151,7 +162,9 @@ def test_harden_private_path_propagates_acl_restore_failure(monkeypatch, tmp_pat
     def fake_run(args, **kwargs):
         calls.append(args)
         if "/save" in args:
-            Path(args[args.index("/save") + 1]).write_bytes(b"saved dacl")
+            Path(args[args.index("/save") + 1]).write_bytes(
+                f"D:(A;;FA;;;{APPROVED_SID})".encode()
+            )
         if "/grant:r" in args:
             return SimpleNamespace(returncode=5, stdout="", stderr="Access denied")
         if "/restore" in args:
@@ -164,6 +177,69 @@ def test_harden_private_path_propagates_acl_restore_failure(monkeypatch, tmp_pat
         paths.harden_private_path(target)
 
     assert calls[-1][0:3] == ["icacls", str(target.parent), "/restore"]
+
+
+def test_harden_private_path_removes_foreign_explicit_grants(monkeypatch, tmp_path):
+    _set_windows_identity(monkeypatch)
+    target = tmp_path / "auth.json"
+    calls = []
+    saves = iter(
+        [
+            f"D:(A;;FA;;;{APPROVED_SID})(A;;FA;;;{FOREIGN_SID})(A;;FA;;;S-1-1-0)".encode(),
+            f"D:(A;;FA;;;{APPROVED_SID})".encode(),
+        ]
+    )
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        if "/save" in args:
+            Path(args[args.index("/save") + 1]).write_bytes(next(saves))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(paths.subprocess, "run", fake_run)
+
+    paths.harden_private_path(target)
+
+    assert [call[2] for call in calls] == [
+        "/save",
+        "/inheritance:r",
+        "/remove:g",
+        "/remove:d",
+        "/remove:g",
+        "/remove:d",
+        "/grant:r",
+        "/save",
+    ]
+    removed = {call[3] for call in calls if call[2] in {"/remove:g", "/remove:d"}}
+    assert removed == {f"*{FOREIGN_SID}", "*S-1-1-0"}
+
+
+def test_harden_private_path_rolls_back_when_acl_readback_has_foreign_principal(
+    monkeypatch, tmp_path
+):
+    _set_windows_identity(monkeypatch)
+    target = tmp_path / "auth.json"
+    calls = []
+    saves = iter(
+        [
+            f"D:(A;;FA;;;{APPROVED_SID})".encode(),
+            f"D:(A;;FA;;;{APPROVED_SID})(A;;FA;;;{FOREIGN_SID})".encode(),
+            f"D:(A;;FA;;;{APPROVED_SID})".encode(),
+        ]
+    )
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        if "/save" in args:
+            Path(args[args.index("/save") + 1]).write_bytes(next(saves))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(paths.subprocess, "run", fake_run)
+
+    with pytest.raises(PermissionError, match="ACL readback failed"):
+        paths.harden_private_path(target)
+
+    assert any("/restore" in call for call in calls)
 
 
 def test_posix_private_modes(monkeypatch, tmp_path):

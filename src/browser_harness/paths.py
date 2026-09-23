@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -18,12 +19,84 @@ def home_dir() -> Path:
     return (Path.home() / ".config" / "browser-harness").resolve()
 
 
-def _windows_principal() -> str | None:
-    username = os.environ.get("USERNAME")
-    if not username:
-        return None
-    domain = os.environ.get("USERDOMAIN")
-    return f"{domain}\\{username}" if domain else username
+def _windows_user_sid() -> str:
+    if sys.platform != "win32":
+        raise PermissionError("Windows user SID is only available on Windows")
+
+    import ctypes
+    from ctypes import wintypes
+
+    class _SidAndAttributes(ctypes.Structure):
+        _fields_ = [("Sid", wintypes.LPVOID), ("Attributes", wintypes.DWORD)]
+
+    class _TokenUser(ctypes.Structure):
+        _fields_ = [("User", _SidAndAttributes)]
+
+    token = wintypes.HANDLE()
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi32.OpenProcessToken.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.HANDLE),
+    ]
+    advapi32.OpenProcessToken.restype = wintypes.BOOL
+    advapi32.GetTokenInformation.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    advapi32.GetTokenInformation.restype = wintypes.BOOL
+    advapi32.IsValidSid.argtypes = [wintypes.LPVOID]
+    advapi32.IsValidSid.restype = wintypes.BOOL
+    advapi32.ConvertSidToStringSidW.argtypes = [
+        wintypes.LPVOID,
+        ctypes.POINTER(wintypes.LPWSTR),
+    ]
+    advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [wintypes.LPVOID]
+    kernel32.LocalFree.restype = wintypes.LPVOID
+    if not advapi32.OpenProcessToken(
+        kernel32.GetCurrentProcess(), 0x0008, ctypes.byref(token)
+    ):
+        raise PermissionError(f"could not open process token: {ctypes.get_last_error()}")
+
+    try:
+        token_user = 1
+        size = wintypes.DWORD()
+        advapi32.GetTokenInformation(token, token_user, None, 0, ctypes.byref(size))
+        if not size.value:
+            raise PermissionError(f"could not query process token: {ctypes.get_last_error()}")
+        buffer = ctypes.create_string_buffer(size.value)
+        if not advapi32.GetTokenInformation(
+            token, token_user, buffer, size, ctypes.byref(size)
+        ):
+            raise PermissionError(f"could not read process token: {ctypes.get_last_error()}")
+
+        sid = ctypes.cast(buffer, ctypes.POINTER(_TokenUser)).contents.User.Sid
+        if not advapi32.IsValidSid(sid):
+            raise PermissionError("process token contains an invalid user SID")
+        string_sid = wintypes.LPWSTR()
+        if not advapi32.ConvertSidToStringSidW(sid, ctypes.byref(string_sid)):
+            raise PermissionError(f"could not convert user SID: {ctypes.get_last_error()}")
+        try:
+            return string_sid.value
+        finally:
+            kernel32.LocalFree(string_sid)
+    finally:
+        kernel32.CloseHandle(token)
+
+
+def _windows_principal(resolve_sid=None) -> str:
+    sid = (resolve_sid or _windows_user_sid)()
+    if not sid:
+        raise PermissionError("could not resolve the effective Windows user SID")
+    return f"*{sid.lstrip('*')}"
 
 
 def _run_icacls(path: Path, *args: str) -> bool:
@@ -47,10 +120,51 @@ def _run_icacls(path: Path, *args: str) -> bool:
     )
 
 
-def _harden_windows_acl(path: Path, *, directory: bool) -> None:
-    principal = _windows_principal()
-    if not principal:
-        raise PermissionError(f"could not restrict permissions for {path}: USERNAME is not set")
+def _read_acl_snapshot(path: Path, *, directory: bool) -> bytes:
+    recursive = ("/T",) if directory else ()
+    fd, snapshot_name = tempfile.mkstemp(prefix="browser-harness-acl-read-", suffix=".txt")
+    os.close(fd)
+    snapshot_path = Path(snapshot_name)
+    snapshot_path.unlink(missing_ok=True)
+    try:
+        _run_icacls(path, "/save", str(snapshot_path), *recursive)
+        return snapshot_path.read_bytes()
+    finally:
+        snapshot_path.unlink(missing_ok=True)
+
+
+def _acl_principals(snapshot: bytes) -> set[str]:
+    if snapshot.startswith((b"\xff\xfe", b"\xfe\xff")):
+        text = snapshot.decode("utf-16")
+    else:
+        text = snapshot.decode("utf-8")
+    aliases = {
+        "AU": "S-1-5-11",
+        "BA": "S-1-5-32-544",
+        "BU": "S-1-5-32-545",
+        "SY": "S-1-5-18",
+        "WD": "S-1-1-0",
+    }
+    return {
+        aliases.get(match.upper().lstrip("*"), match.upper().lstrip("*"))
+        for match in re.findall(r"\([^)]*;;;([^;)]+)\)", text)
+    }
+
+
+def _read_acl_principals(path: Path, *, directory: bool) -> set[str]:
+    return _acl_principals(_read_acl_snapshot(path, directory=directory))
+
+
+def _restore_acl(path: Path, backup_path: Path, *, directory: bool) -> None:
+    restore_root = path.parent if path.parent != Path("") else Path(".")
+    _run_icacls(restore_root, "/restore", str(backup_path))
+    if _read_acl_snapshot(path, directory=directory) != backup_path.read_bytes():
+        raise PermissionError(f"could not verify restored permissions for {path}")
+
+
+def _harden_windows_acl(path: Path, *, directory: bool, resolve_sid=None) -> None:
+    principal = _windows_principal(resolve_sid)
+    approved = {principal.lstrip("*").upper()}
 
     recursive = ("/T",) if directory else ()
     inheritance = "(OI)(CI)" if directory else ""
@@ -63,33 +177,29 @@ def _harden_windows_acl(path: Path, *, directory: bool) -> None:
 
     try:
         _run_icacls(path, "/save", str(backup_path), *recursive)
+        backup = backup_path.read_bytes()
+        original_principals = _acl_principals(backup)
 
-        for args in (
-            ("/inheritance:r", *recursive),
-            ("/grant:r", grant, *recursive),
-        ):
-            try:
-                _run_icacls(path, *args)
-            except PermissionError:
-                restore_root = path.parent if path.parent != Path("") else Path(".")
-                _run_icacls(restore_root, "/restore", str(backup_path))
-                with tempfile.NamedTemporaryFile(prefix="browser-harness-acl-check-", delete=False) as f:
-                    verify_path = Path(f.name)
-                verify_path.unlink()
-                try:
-                    _run_icacls(path, "/save", str(verify_path), *recursive)
-                    if verify_path.read_bytes() != backup_path.read_bytes():
-                        raise PermissionError(f"could not verify restored permissions for {path}")
-                finally:
-                    verify_path.unlink(missing_ok=True)
-                raise
+        try:
+            _run_icacls(path, "/inheritance:r", *recursive)
+            for unapproved in sorted(original_principals - approved):
+                _run_icacls(path, "/remove:g", f"*{unapproved}", *recursive)
+                _run_icacls(path, "/remove:d", f"*{unapproved}", *recursive)
+            _run_icacls(path, "/grant:r", grant, *recursive)
+            remaining = _read_acl_principals(path, directory=directory)
+            if remaining != approved:
+                names = ", ".join(sorted(remaining - approved)) or "the approved SID is missing"
+                raise PermissionError(f"ACL readback failed for {path}: {names}")
+        except Exception:
+            _restore_acl(path, backup_path, directory=directory)
+            raise
     finally:
         backup_path.unlink(missing_ok=True)
 
 
-def harden_private_path(path: Path, *, directory: bool = False) -> None:
+def harden_private_path(path: Path, *, directory: bool = False, resolve_sid=None) -> None:
     if sys.platform == "win32":
-        _harden_windows_acl(path, directory=directory)
+        _harden_windows_acl(path, directory=directory, resolve_sid=resolve_sid)
         return
     os.chmod(path, 0o700 if directory else 0o600)
 

@@ -150,8 +150,8 @@ def save_auth_record(record: AuthRecord, path: Path | None = None) -> None:
         _chmod_private(path.parent, directory=True)
     existing = load_auth_file(path)
     existing["browser_use"] = record.to_storage()
-    tmp = _new_auth_temp(path)
-    _write_private_json(tmp, existing)
+    tmp, fd = _new_auth_temp(path)
+    _write_private_json(tmp, existing, fd=fd)
     os.replace(tmp, path)
 
 
@@ -161,8 +161,8 @@ def clear_auth(path: Path | None = None) -> bool:
     existed = bool(data.get("browser_use"))
     data.pop("browser_use", None)
     if data:
-        tmp = _new_auth_temp(path)
-        _write_private_json(tmp, data)
+        tmp, fd = _new_auth_temp(path)
+        _write_private_json(tmp, data, fd=fd)
         os.replace(tmp, path)
     else:
         try:
@@ -464,28 +464,37 @@ def _read_manual_api_key(input_stream=None) -> str:
     return key
 
 
-def _write_private_json(path: Path, data: dict) -> None:
+def _write_private_json(path: Path, data: dict, *, fd: int | None = None) -> None:
     raw = (json.dumps(data, indent=2) + "\n").encode()
-    flags = os.O_WRONLY | os.O_CREAT
-    fd = os.open(path, flags, stat.S_IRUSR | stat.S_IWUSR)
-    os.close(fd)
+    if fd is None:
+        fd = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            stat.S_IRUSR | stat.S_IWUSR,
+        )
     try:
         _chmod_private(path)
-        fd = os.open(path, os.O_WRONLY | os.O_TRUNC)
-        with os.fdopen(fd, "wb") as f:
+        os.ftruncate(fd, 0)
+        os.lseek(fd, 0, os.SEEK_SET)
+        with os.fdopen(fd, "wb", closefd=False) as f:
             f.write(raw)
+            f.flush()
     except BaseException:
         try:
             path.unlink(missing_ok=True)
         except OSError:
             pass
         raise
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
-def _new_auth_temp(path: Path) -> Path:
+def _new_auth_temp(path: Path) -> tuple[Path, int]:
     fd, name = tempfile.mkstemp(prefix=f"{path.name}.", suffix=".tmp", dir=path.parent)
-    os.close(fd)
-    return Path(name)
+    return Path(name), fd
 
 
 def _chmod_private(path: Path, *, directory=False) -> None:

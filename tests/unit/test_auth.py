@@ -62,3 +62,30 @@ def test_write_private_json_hardens_before_writing_and_fails_closed(monkeypatch,
         auth._write_private_json(path, {"api_key": key})
 
     assert not path.exists()
+
+
+def test_write_private_json_keeps_creation_handle_through_hardening(monkeypatch, tmp_path):
+    final_path = tmp_path / "auth.json"
+    path, creation_fd = auth._new_auth_temp(final_path)
+    ordering = []
+    original_ftruncate = auth.os.ftruncate
+
+    def harden(private_path, *, directory=False):
+        assert auth.os.fstat(creation_fd)
+        assert private_path.stat().st_ino == auth.os.fstat(creation_fd).st_ino
+        assert private_path.read_bytes() == b""
+        ordering.append(("harden", creation_fd))
+
+    def tracking_ftruncate(fd, size):
+        ordering.append(("write", fd))
+        return original_ftruncate(fd, size)
+
+    monkeypatch.setattr(auth, "_chmod_private", harden)
+    monkeypatch.setattr(auth.os, "ftruncate", tracking_ftruncate)
+
+    auth._write_private_json(path, {"api_key": "secret"}, fd=creation_fd)
+
+    assert ordering == [("harden", creation_fd), ("write", creation_fd)]
+    with pytest.raises(OSError):
+        auth.os.fstat(creation_fd)
+    assert json.loads(path.read_text(encoding="utf-8")) == {"api_key": "secret"}
