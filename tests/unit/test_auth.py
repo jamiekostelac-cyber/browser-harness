@@ -32,3 +32,16 @@ def test_clear_auth_rejects_non_object_json(tmp_path):
     path.write_text("null", encoding="utf-8")
     with pytest.raises(auth.AuthError):
         auth.clear_auth(path)
+
+
+def test_save_auth_record_does_not_harden_relative_parent(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    calls = []
+    monkeypatch.setattr(auth, "_chmod_private", lambda path, directory=False: calls.append((path, directory)))
+
+    auth.save_auth_record(auth.AuthRecord(api_key="x" * 24), path=auth.Path("auth.json"))
+
+    assert auth.Path("auth.json").exists()
+    assert (auth.Path("auth.json.tmp"), False) in calls
+    assert (auth.Path("auth.json"), False) in calls
+    assert (auth.Path("."), True) not in calls
