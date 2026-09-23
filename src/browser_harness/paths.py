@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -201,7 +202,7 @@ def _reject_reparse_path(path: Path) -> None:
         info = path.lstat()
     except FileNotFoundError:
         return
-    if path.is_symlink() or getattr(info, "st_file_attributes", 0) & 0x400:
+    if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
         raise PermissionError(f"refusing to harden reparse point: {path}")
 
 
@@ -237,6 +238,31 @@ def _read_acl_principals(path: Path, *, directory: bool, approved_sid: str) -> s
     return _parse_acl_snapshot(_read_sddl(path).encode("utf-8"), approved_sid=approved_sid)
 
 
+def _validate_acl_tree(path: Path, *, directory: bool, approved_sid: str) -> None:
+    """Validate every object before a recursive ACL update can touch the tree."""
+    objects = [path]
+    if directory:
+        pending = [path]
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            pending.clear()
+        while pending:
+            parent = pending.pop()
+            for child in parent.iterdir():
+                _reject_reparse_path(child)
+                objects.append(child)
+                info = child.lstat()
+                if stat.S_ISDIR(info.st_mode):
+                    pending.append(child)
+
+    # Finish the path/reparse-point pass before invoking ACL readers for any object.
+    for item in objects:
+        _reject_reparse_path(item)
+    for item in objects:
+        _parse_acl_snapshot(_read_sddl(item).encode("utf-8"), approved_sid=approved_sid)
+
+
 def _restore_acl(path: Path, backup_path: Path, *, directory: bool) -> None:
     restore_root = path.parent if path.parent != Path("") else Path(".")
     _run_icacls(restore_root, "/restore", str(backup_path))
@@ -248,12 +274,7 @@ def _harden_windows_acl(path: Path, *, directory: bool, resolve_sid=None) -> Non
     _reject_reparse_path(path)
     principal = _windows_principal(resolve_sid)
     approved = {principal.lstrip("*").upper()}
-    initial_sddl = _read_sddl(path)
-    if not initial_sddl.startswith("O:") or "G:" not in initial_sddl:
-        raise PermissionError(f"security descriptor has no verifiable owner: {path}")
-    owner = initial_sddl[2:initial_sddl.index("G:")]
-    if owner.upper() != next(iter(approved)):
-        raise PermissionError(f"refusing to harden path owned by untrusted SID {owner}: {path}")
+    _validate_acl_tree(path, directory=directory, approved_sid=next(iter(approved)))
 
     recursive = ("/T",) if directory else ()
     inheritance = "(OI)(CI)" if directory else ""

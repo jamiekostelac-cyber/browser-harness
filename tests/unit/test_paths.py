@@ -320,3 +320,65 @@ def test_hardening_rejects_reparse_points_before_acl_commands(monkeypatch, tmp_p
     with pytest.raises(PermissionError, match="reparse point"):
         paths.harden_private_path(target)
     assert calls == []
+
+
+@pytest.mark.parametrize("child_sddl, message", [
+    (f"O:{FOREIGN_SID}G:{APPROVED_SID}D:P(A;;FA;;;{APPROVED_SID})", "owner"),
+    (
+        f"O:{APPROVED_SID}G:{APPROVED_SID}D:P"
+        f"(XA;;FA;;;{APPROVED_SID};(@User.x==1))",
+        "conditional or unsupported",
+    ),
+    (f"O:{APPROVED_SID}G:{APPROVED_SID}D:(A;;FA;;;{APPROVED_SID})", "protected DACL"),
+])
+def test_recursive_hardening_rejects_invalid_child_acl_before_mutation(
+    monkeypatch, tmp_path, child_sddl, message
+):
+    _set_windows_identity(monkeypatch)
+    target = tmp_path / "private"
+    target.mkdir()
+    child = target / "credential.json"
+    child.write_text("secret", encoding="utf-8")
+    valid = f"O:{APPROVED_SID}G:{APPROVED_SID}D:P(A;;FA;;;{APPROVED_SID})"
+    acl_reads = []
+    calls = []
+    monkeypatch.setattr(
+        paths, "_read_sddl", lambda item: acl_reads.append(item) or (child_sddl if item == child else valid)
+    )
+    monkeypatch.setattr(paths.subprocess, "run", lambda *args, **kwargs: calls.append(args))
+
+    with pytest.raises(PermissionError, match=message):
+        paths.harden_private_path(target, directory=True)
+
+    assert child in acl_reads
+    assert calls == []
+    assert child.read_text(encoding="utf-8") == "secret"
+
+
+def test_recursive_hardening_rejects_child_junction_before_acl_reads_or_mutation(
+    monkeypatch, tmp_path
+):
+    _set_windows_identity(monkeypatch)
+    target = tmp_path / "private"
+    target.mkdir()
+    junction = target / "linked"
+    junction.mkdir()
+    original_lstat = Path.lstat
+
+    def mock_lstat(item):
+        if item == junction:
+            actual = original_lstat(item)
+            return SimpleNamespace(st_mode=actual.st_mode, st_file_attributes=0x400)
+        return original_lstat(item)
+
+    acl_reads = []
+    calls = []
+    monkeypatch.setattr(Path, "lstat", mock_lstat)
+    monkeypatch.setattr(paths, "_read_sddl", lambda item: acl_reads.append(item))
+    monkeypatch.setattr(paths.subprocess, "run", lambda *args, **kwargs: calls.append(args))
+
+    with pytest.raises(PermissionError, match="reparse point"):
+        paths.harden_private_path(target, directory=True)
+
+    assert acl_reads == []
+    assert calls == []
