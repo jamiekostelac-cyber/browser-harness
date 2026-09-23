@@ -281,6 +281,24 @@ def test_acl_parser_rejects_conditional_and_insufficient_aces(ace):
         )
 
 
+@pytest.mark.parametrize("flags", ["IO", "OIIO", "ID", "ZZ", "NP", "OIOI"])
+def test_acl_parser_rejects_non_applicable_or_invalid_approved_ace_flags(flags):
+    with pytest.raises(PermissionError):
+        paths._parse_acl_snapshot(
+            f"O:{APPROVED_SID}G:{APPROVED_SID}D:P"
+            f"(A;{flags};FA;;;{APPROVED_SID})".encode(),
+            approved_sid=APPROVED_SID,
+        )
+
+
+def test_acl_parser_accepts_applicable_directory_inheritance_flags():
+    assert paths._parse_acl_snapshot(
+        f"O:{APPROVED_SID}G:{APPROVED_SID}D:P"
+        f"(A;OICI;FA;;;{APPROVED_SID})".encode(),
+        approved_sid=APPROVED_SID,
+    ) == {APPROVED_SID}
+
+
 def test_acl_parser_requires_protected_dacl_trusted_owner_and_no_deny():
     valid_prefix = f"O:{APPROVED_SID}G:{APPROVED_SID}D:"
     for sddl in (

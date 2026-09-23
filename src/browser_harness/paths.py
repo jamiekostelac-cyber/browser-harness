@@ -164,7 +164,9 @@ def _parse_acl_snapshot(snapshot: bytes, *, approved_sid: str) -> set[str]:
     dacl = text[dacl_start:] if dacl_end < 0 else text[dacl_start:dacl_end]
     if not dacl:
         raise PermissionError("ACL has a null or empty DACL")
-    ace_pattern = re.compile(r"\((A|D);[^;]*;(FA|[0-9A-Fa-f]+);[^;]*;[^;]*;([^;)]+)\)")
+    ace_pattern = re.compile(
+        r"\((A|D);([^;]*);(FA|[0-9A-Fa-f]+);[^;]*;[^;]*;([^;)]+)\)"
+    )
     principals: set[str] = set()
     offset = 0
     full_control = 0x1F01FF
@@ -172,7 +174,14 @@ def _parse_acl_snapshot(snapshot: bytes, *, approved_sid: str) -> set[str]:
         match = ace_pattern.match(dacl, offset)
         if not match:
             raise PermissionError("ACL contains a conditional or unsupported ACE")
-        ace_type, mask_text, sid = match.groups()
+        ace_type, flags_text, mask_text, sid = match.groups()
+        flags = re.findall(r"OI|CI|NP|IO|ID|SA|FA", flags_text)
+        if "".join(flags) != flags_text or len(flags) != len(set(flags)):
+            raise PermissionError("ACL contains unsupported or malformed ACE flags")
+        if {"IO", "ID", "SA", "FA"}.intersection(flags):
+            raise PermissionError("ACL contains a non-applicable or non-explicit allow ACE")
+        if "NP" in flags and not {"OI", "CI"}.intersection(flags):
+            raise PermissionError("ACL contains non-applicable ACE inheritance flags")
         if ace_type == "D":
             raise PermissionError(f"ACL contains an applicable deny ACE for {sid}")
         if sid.upper() != approved_sid.upper():
