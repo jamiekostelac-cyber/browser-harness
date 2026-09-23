@@ -1638,7 +1638,6 @@ class Daemon:
                else session_id)
         target_id = (self._session_targets.get(sid) if sid else
                      params.get("targetId") or identity["target_id"])
-        state = self._document_state.get(sid)
         bootstrap = {"Target.createBrowserContext", "Target.createTarget", "Target.getTargets"}
         if not isinstance(owned, dict) or not isinstance(identity["run_id"], str):
             return None
@@ -1702,16 +1701,29 @@ class Daemon:
         if sid is None and method in target_document_methods:
             sid = next((mapped for mapped, target in self._session_targets.items()
                         if target == target_id), None)
-            mapped_state = self._document_state.get(sid)
-            if (not sid or identity["session_id"] != sid
-                    or not isinstance(mapped_state, dict)
-                    or identity["generation"] != mapped_state.get("generation")
-                    or identity["document_url"] != mapped_state.get("document_url")
-                    or mapped_state.get("allowed") is not True):
-                return None
-            identity["session_id"] = sid
-            identity["generation"] = mapped_state["generation"]
-            identity["document_url"] = mapped_state.get("document_url")
+            if sid is None and method == "Target.attachToTarget":
+                # A run-created target is owned before its first session exists.
+                # Permit that initial attach only from the daemon's ownership
+                # record, with an empty caller snapshot; the live target URL
+                # check below establishes the current document state.
+                if (identity["session_id"] is not None
+                        or identity["generation"] is not None
+                        or identity["document_url"] != req.get("tab_guard_url")):
+                    return None
+            else:
+                mapped_state = self._document_state.get(sid)
+                if (not sid or identity["session_id"] != sid
+                        or not isinstance(mapped_state, dict)
+                        or identity["generation"] != mapped_state.get("generation")
+                        or identity["document_url"] != mapped_state.get("document_url")
+                        or mapped_state.get("allowed") is not True):
+                    return None
+                identity["session_id"] = sid
+                identity["generation"] = mapped_state["generation"]
+                identity["document_url"] = mapped_state.get("document_url")
+        # Resolve the session first, then read its current document snapshot.
+        # The mapping may have been found by targetId above.
+        state = self._document_state.get(sid)
         if sid:
             if (identity["session_id"] != sid or sid not in self._guarded_sessions
                     or not isinstance(state, dict)

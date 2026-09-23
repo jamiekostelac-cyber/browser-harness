@@ -828,6 +828,8 @@ def daemon_bridge(owning, monkeypatch):
                                        "url": "https://owned.example/", "title": "Owned"}}
             if method == "Runtime.evaluate":
                 return {"result": {"value": '{"url":"https://owned.example/"}'}}
+            if method == "Target.attachToTarget":
+                return {"sessionId": "SESSION-MINE"}
             return {}
     d.cdp = CDP()
     def send(req, **kwargs):
@@ -1999,6 +2001,51 @@ def test_target_scoped_dispatch_revalidates_document_after_target_lookup(daemon_
         return identity
 
     d._validate_dispatch_identity = validate_then_navigate
+    before = len(calls)
+    response = asyncio.run(d.handle(request))
+    assert response == {"error": "tab guard authorization is stale or invalid"}
+    assert not any(call[0] == method for call in calls[before:])
+
+
+@pytest.mark.parametrize("method", [
+    "Target.closeTarget", "Target.activateTarget", "Target.attachToTarget",
+])
+def test_target_scoped_handler_allows_owned_current_document(daemon_bridge, method):
+    d, calls = daemon_bridge
+    request = _guarded_dispatch_request(d, method, {"targetId": "MINE"})
+    request["session_id"] = None
+    if method == "Target.attachToTarget":
+        request["tab_guard_session_id"] = None
+        request["tab_guard_document_generation"] = None
+        # Exercise first attachment: the daemon knows this run created the
+        # target, but no session mapping exists yet.
+        d._session_targets.clear()
+        d._guarded_sessions.clear()
+        d._document_state.clear()
+        request["tab_guard_url"] = "https://owned.example/"
+        request["tab_guard"]["sessions"] = []
+    response = asyncio.run(d.handle(request))
+    assert "error" not in response
+    assert any(call[0] == method for call in calls)
+    if method == "Target.attachToTarget":
+        assert response["result"]["sessionId"] == "SESSION-MINE"
+        assert d._session_targets["SESSION-MINE"] == "MINE"
+
+
+@pytest.mark.parametrize("method", [
+    "Target.closeTarget", "Target.activateTarget", "Target.attachToTarget",
+])
+@pytest.mark.parametrize("failure", ["foreign", "stale"])
+def test_target_scoped_handler_refuses_foreign_or_stale_document(daemon_bridge, method, failure):
+    d, calls = daemon_bridge
+    request = _guarded_dispatch_request(d, method, {"targetId": "MINE"})
+    request["session_id"] = None
+    if failure == "foreign":
+        request["params"]["targetId"] = "FOREIGN"
+        request["tab_guard"]["tabs"] = ["FOREIGN"]
+        request["tab_guard_target_id"] = "FOREIGN"
+    else:
+        d._document_state["SESSION-MINE"]["document_url"] = "https://next.example/"
     before = len(calls)
     response = asyncio.run(d.handle(request))
     assert response == {"error": "tab guard authorization is stale or invalid"}
