@@ -151,8 +151,81 @@ def _acl_principals(snapshot: bytes) -> set[str]:
     }
 
 
-def _read_acl_principals(path: Path, *, directory: bool) -> set[str]:
-    return _acl_principals(_read_acl_snapshot(path, directory=directory))
+def _parse_acl_snapshot(snapshot: bytes, *, approved_sid: str) -> set[str]:
+    """Parse only simple, explicit allow/deny ACEs; reject ambiguous SDDL."""
+    text = snapshot.decode("utf-8")
+    if not text.startswith("O:") or "G:" not in text or "D:P" not in text:
+        raise PermissionError("ACL must have a trusted owner and protected DACL")
+    owner = text[2:text.index("G:")]
+    if owner.upper() != approved_sid.upper():
+        raise PermissionError(f"ACL owner is not the effective user SID: {owner}")
+    dacl_start = text.index("D:P") + 3
+    dacl_end = text.find("S:", dacl_start)
+    dacl = text[dacl_start:] if dacl_end < 0 else text[dacl_start:dacl_end]
+    if not dacl:
+        raise PermissionError("ACL has a null or empty DACL")
+    ace_pattern = re.compile(r"\((A|D);[^;]*;(FA|[0-9A-Fa-f]+);[^;]*;[^;]*;([^;)]+)\)")
+    principals: set[str] = set()
+    offset = 0
+    full_control = 0x1F01FF
+    while offset < len(dacl):
+        match = ace_pattern.match(dacl, offset)
+        if not match:
+            raise PermissionError("ACL contains a conditional or unsupported ACE")
+        ace_type, mask_text, sid = match.groups()
+        if ace_type == "D":
+            raise PermissionError(f"ACL contains an applicable deny ACE for {sid}")
+        if sid.upper() != approved_sid.upper():
+            raise PermissionError(f"ACL contains an unapproved principal: {sid}")
+        mask = full_control if mask_text == "FA" else int(mask_text, 16)
+        if sid.upper() == approved_sid.upper() and mask != full_control:
+            raise PermissionError("ACL does not grant explicit Full Control to the effective user")
+        principals.add(sid.upper())
+        offset = match.end()
+    if approved_sid.upper() not in principals:
+        raise PermissionError("ACL does not grant explicit Full Control to the effective user")
+    return principals
+
+
+def _reject_reparse_path(path: Path) -> None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return
+    if path.is_symlink() or getattr(info, "st_file_attributes", 0) & 0x400:
+        raise PermissionError(f"refusing to harden reparse point: {path}")
+
+
+def reject_reparse_path(path: Path) -> None:
+    """Public guard for callers that read or replace credential paths."""
+    _reject_reparse_path(path)
+
+
+def _read_sddl(path: Path) -> str:
+    command = (
+        "$a = Get-Acl -LiteralPath $args[0]; "
+        "$s = [System.Security.AccessControl.AccessControlSections]::All; "
+        "[Console]::Write($a.GetSecurityDescriptorSddlForm($s))"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", command, str(path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        raise PermissionError(f"could not read security descriptor for {path}: {exc}") from exc
+    if result.returncode:
+        raise PermissionError(f"could not read security descriptor for {path}: {result.stderr.strip()}")
+    return result.stdout
+
+
+def _read_acl_principals(path: Path, *, directory: bool, approved_sid: str) -> set[str]:
+    # Keep the canonical icacls readback used for rollback verification, and
+    # independently inspect the full descriptor because ACL-only output omits owner.
+    _read_acl_snapshot(path, directory=directory)
+    return _parse_acl_snapshot(_read_sddl(path).encode("utf-8"), approved_sid=approved_sid)
 
 
 def _restore_acl(path: Path, backup_path: Path, *, directory: bool) -> None:
@@ -163,8 +236,15 @@ def _restore_acl(path: Path, backup_path: Path, *, directory: bool) -> None:
 
 
 def _harden_windows_acl(path: Path, *, directory: bool, resolve_sid=None) -> None:
+    _reject_reparse_path(path)
     principal = _windows_principal(resolve_sid)
     approved = {principal.lstrip("*").upper()}
+    initial_sddl = _read_sddl(path)
+    if not initial_sddl.startswith("O:") or "G:" not in initial_sddl:
+        raise PermissionError(f"security descriptor has no verifiable owner: {path}")
+    owner = initial_sddl[2:initial_sddl.index("G:")]
+    if owner.upper() != next(iter(approved)):
+        raise PermissionError(f"refusing to harden path owned by untrusted SID {owner}: {path}")
 
     recursive = ("/T",) if directory else ()
     inheritance = "(OI)(CI)" if directory else ""
@@ -186,7 +266,9 @@ def _harden_windows_acl(path: Path, *, directory: bool, resolve_sid=None) -> Non
                 _run_icacls(path, "/remove:g", f"*{unapproved}", *recursive)
                 _run_icacls(path, "/remove:d", f"*{unapproved}", *recursive)
             _run_icacls(path, "/grant:r", grant, *recursive)
-            remaining = _read_acl_principals(path, directory=directory)
+            remaining = _read_acl_principals(
+                path, directory=directory, approved_sid=next(iter(approved))
+            )
             if remaining != approved:
                 names = ", ".join(sorted(remaining - approved)) or "the approved SID is missing"
                 raise PermissionError(f"ACL readback failed for {path}: {names}")
@@ -199,12 +281,14 @@ def _harden_windows_acl(path: Path, *, directory: bool, resolve_sid=None) -> Non
 
 def harden_private_path(path: Path, *, directory: bool = False, resolve_sid=None) -> None:
     if sys.platform == "win32":
+        _reject_reparse_path(path)
         _harden_windows_acl(path, directory=directory, resolve_sid=resolve_sid)
         return
     os.chmod(path, 0o700 if directory else 0o600)
 
 
 def ensure_private_dir(path: Path) -> Path:
+    _reject_reparse_path(path)
     existed = path.exists()
     path.mkdir(parents=True, exist_ok=True)
     if sys.platform == "win32" or not existed:

@@ -12,6 +12,10 @@ FOREIGN_SID = "S-1-5-21-999"
 def _set_windows_identity(monkeypatch):
     monkeypatch.setattr(paths.sys, "platform", "win32")
     monkeypatch.setattr(paths, "_windows_user_sid", lambda: APPROVED_SID)
+    monkeypatch.setattr(
+        paths, "_read_sddl",
+        lambda path: f"O:{APPROVED_SID}G:{APPROVED_SID}D:P(A;;FA;;;{APPROVED_SID})",
+    )
 
 
 def _successful_icacls(calls):
@@ -220,23 +224,23 @@ def test_harden_private_path_rolls_back_when_acl_readback_has_foreign_principal(
     _set_windows_identity(monkeypatch)
     target = tmp_path / "auth.json"
     calls = []
-    saves = iter(
-        [
-            f"D:(A;;FA;;;{APPROVED_SID})".encode(),
-            f"D:(A;;FA;;;{APPROVED_SID})(A;;FA;;;{FOREIGN_SID})".encode(),
-            f"D:(A;;FA;;;{APPROVED_SID})".encode(),
-        ]
-    )
+    snapshots = iter([
+        f"O:{APPROVED_SID}G:{APPROVED_SID}D:P(A;;FA;;;{APPROVED_SID})",
+        f"O:{APPROVED_SID}G:{APPROVED_SID}D:P(A;;FA;;;{APPROVED_SID})(A;;FA;;;{FOREIGN_SID})",
+    ])
+    monkeypatch.setattr(paths, "_read_sddl", lambda path: next(snapshots))
 
     def fake_run(args, **kwargs):
         calls.append(args)
         if "/save" in args:
-            Path(args[args.index("/save") + 1]).write_bytes(next(saves))
+            Path(args[args.index("/save") + 1]).write_bytes(
+                f"D:(A;;FA;;;{APPROVED_SID})".encode()
+            )
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(paths.subprocess, "run", fake_run)
 
-    with pytest.raises(PermissionError, match="ACL readback failed"):
+    with pytest.raises(PermissionError, match="unapproved principal"):
         paths.harden_private_path(target)
 
     assert any("/restore" in call for call in calls)
@@ -261,3 +265,40 @@ def test_posix_private_modes(monkeypatch, tmp_path):
         (new_dir, 0o700),
         (private_file, 0o600),
     ]
+
+
+@pytest.mark.parametrize("ace", [
+    f"(XA;;FA;;;{APPROVED_SID};(@User.x==1))",
+        f"(A;;FA;;;{APPROVED_SID};(@User.x==1))",
+        f"(A;;FR;;;{APPROVED_SID})",
+        f"(A;;FA;;;{FOREIGN_SID})",
+])
+def test_acl_parser_rejects_conditional_and_insufficient_aces(ace):
+    with pytest.raises(PermissionError):
+        paths._parse_acl_snapshot(
+            f"O:{APPROVED_SID}G:{APPROVED_SID}D:P{ace}".encode(),
+            approved_sid=APPROVED_SID,
+        )
+
+
+def test_acl_parser_requires_protected_dacl_trusted_owner_and_no_deny():
+    valid_prefix = f"O:{APPROVED_SID}G:{APPROVED_SID}D:"
+    for sddl in (
+        valid_prefix + f"(A;;FA;;;{APPROVED_SID})",
+        f"O:{FOREIGN_SID}G:{APPROVED_SID}D:P(A;;FA;;;{APPROVED_SID})",
+        f"O:{APPROVED_SID}G:{APPROVED_SID}D:P(D;;FA;;;{FOREIGN_SID})(A;;FA;;;{APPROVED_SID})",
+        f"O:{APPROVED_SID}G:{APPROVED_SID}D:P",
+    ):
+        with pytest.raises(PermissionError):
+            paths._parse_acl_snapshot(sddl.encode(), approved_sid=APPROVED_SID)
+
+
+def test_hardening_rejects_reparse_points_before_acl_commands(monkeypatch, tmp_path):
+    _set_windows_identity(monkeypatch)
+    target = tmp_path / "link"
+    target.symlink_to(tmp_path, target_is_directory=True)
+    calls = []
+    monkeypatch.setattr(paths.subprocess, "run", lambda *args, **kwargs: calls.append(args))
+    with pytest.raises(PermissionError, match="reparse point"):
+        paths.harden_private_path(target)
+    assert calls == []

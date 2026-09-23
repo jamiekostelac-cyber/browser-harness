@@ -89,3 +89,18 @@ def test_write_private_json_keeps_creation_handle_through_hardening(monkeypatch,
     with pytest.raises(OSError):
         auth.os.fstat(creation_fd)
     assert json.loads(path.read_text(encoding="utf-8")) == {"api_key": "secret"}
+
+
+def test_save_auth_record_rejects_existing_symlink_before_parent_hardening(monkeypatch, tmp_path):
+    target = tmp_path / "auth.json"
+    secret_target = tmp_path / "outside.json"
+    secret_target.write_text("{}", encoding="utf-8")
+    target.symlink_to(secret_target)
+    calls = []
+    monkeypatch.setattr(auth, "_chmod_private", lambda *args, **kwargs: calls.append(args))
+
+    with pytest.raises(PermissionError, match="reparse point"):
+        auth.save_auth_record(auth.AuthRecord(api_key="x" * 24), path=target)
+
+    assert calls == []
+    assert secret_target.read_text(encoding="utf-8") == "{}"

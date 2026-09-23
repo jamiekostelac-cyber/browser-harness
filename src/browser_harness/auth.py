@@ -145,6 +145,8 @@ def load_auth_file(path: Path | None = None) -> dict:
 
 def save_auth_record(record: AuthRecord, path: Path | None = None) -> None:
     path = path or auth_path()
+    paths.reject_reparse_path(path)
+    paths.reject_reparse_path(path.parent)
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.parent != Path("."):
         _chmod_private(path.parent, directory=True)
@@ -157,6 +159,7 @@ def save_auth_record(record: AuthRecord, path: Path | None = None) -> None:
 
 def clear_auth(path: Path | None = None) -> bool:
     path = path or auth_path()
+    paths.reject_reparse_path(path)
     data = load_auth_file(path)
     existed = bool(data.get("browser_use"))
     data.pop("browser_use", None)
@@ -473,7 +476,16 @@ def _write_private_json(path: Path, data: dict, *, fd: int | None = None) -> Non
             stat.S_IRUSR | stat.S_IWUSR,
         )
     try:
+        paths.reject_reparse_path(path)
+        opened = os.fstat(fd)
+        current = path.lstat()
+        if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+            raise PermissionError(f"auth temp path changed before ACL hardening: {path}")
         _chmod_private(path)
+        current = path.lstat()
+        opened = os.fstat(fd)
+        if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+            raise PermissionError(f"auth temp path changed during ACL hardening: {path}")
         os.ftruncate(fd, 0)
         os.lseek(fd, 0, os.SEEK_SET)
         with os.fdopen(fd, "wb", closefd=False) as f:
