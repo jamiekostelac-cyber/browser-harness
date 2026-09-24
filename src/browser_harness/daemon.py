@@ -1731,17 +1731,21 @@ class Daemon:
                             return _guard_refusal(
                                 "Target.attachToTarget session was detached before registration"
                             )
+                        # Record the session before awaiting detach so cancellation
+                        # cannot lose the only retry handle for a known attachment.
+                        if len(self._overflow_cleanup_sessions) < MAX_OVERFLOW_CLEANUP_RETRIES:
+                            self._overflow_cleanup_sessions[attached_session] = None
                         try:
                             await self.cdp.send_raw(
                                 "Target.detachFromTarget", {"sessionId": attached_session}
                             )
                         except Exception as exc:
-                            if len(self._overflow_cleanup_sessions) < MAX_OVERFLOW_CLEANUP_RETRIES:
-                                self._overflow_cleanup_sessions[attached_session] = None
                             log(
                                 "tab guard failed to detach overflow-refused session "
                                 f"{attached_session}: {exc}"
                             )
+                        else:
+                            self._overflow_cleanup_sessions.pop(attached_session, None)
                         if overflow_attach_lock_held:
                             self._overflow_attach_lock.release()
                             overflow_attach_lock_held = False
