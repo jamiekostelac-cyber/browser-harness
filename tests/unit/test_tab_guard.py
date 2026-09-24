@@ -2314,6 +2314,66 @@ def test_pending_detach_overflow_detaches_repeated_refused_sessions_without_grow
     assert d._revoked_sessions == revoked_before
 
 
+def test_failed_overflow_detach_is_retained_bounded_and_retried_on_reset(daemon_bridge):
+    d, calls = daemon_bridge
+    request = _guarded_dispatch_request(d, "Target.attachToTarget", {"targetId": "MINE"})
+    request["session_id"] = None
+    request["tab_guard_session_id"] = None
+    request["tab_guard_document_generation"] = None
+    request["tab_guard_url"] = "https://owned.example/"
+    request["tab_guard"]["sessions"] = []
+    d._session_targets.clear()
+    d._guarded_sessions.clear()
+    d._document_state.clear()
+
+    detached = []
+    fail_detach = True
+
+    async def attach_response(method, params=None, session_id=None):
+        calls.append((method, params, session_id))
+        if method == "Target.getTargetInfo":
+            return {"targetInfo": {"type": "page", "targetId": "MINE",
+                                   "url": "https://owned.example/", "title": "Owned"}}
+        if method == "Target.attachToTarget":
+            return {"sessionId": "SESSION-NEEDS-CLEANUP"}
+        if method == "Target.detachFromTarget":
+            detached.append(params["sessionId"])
+            if fail_detach:
+                raise RuntimeError("detach unavailable")
+            return {}
+        raise AssertionError(f"unexpected CDP method: {method}")
+
+    d.cdp.send_raw = attach_response
+    for i in range(257):
+        d._record_browser_lifecycle_event(
+            "Target.detachedFromTarget", {"sessionId": f"SESSION-{i}"}
+        )
+
+    response = asyncio.run(d.handle(request))
+    assert response["tab_guard"] == "refused"
+    assert d._overflow_cleanup_sessions == {"SESSION-NEEDS-CLEANUP": None}
+    assert "SESSION-NEEDS-CLEANUP" not in d._session_targets
+
+    attach_count = sum(call[0] == "Target.attachToTarget" for call in calls)
+    for _ in range(300):
+        response = asyncio.run(d.handle(request))
+        assert response == {
+            "tab_guard": "refused",
+            "error": "pending overflow session cleanup; refusing attach registration",
+        }
+        assert len(d._overflow_cleanup_sessions) == 1
+    assert sum(call[0] == "Target.attachToTarget" for call in calls) == attach_count
+
+    fail_detach = False
+    reset = asyncio.run(d.handle({
+        "meta": "tab_guard_reset", "tab_guard_run": RUN_ID,
+        "tab_guard_epoch": d._authorization_epoch,
+    }))
+    assert reset["tab_guard"] == "ok"
+    assert detached.count("SESSION-NEEDS-CLEANUP") == 302
+    assert d._overflow_cleanup_sessions == {}
+
+
 @pytest.mark.parametrize("method", [
     "Target.closeTarget", "Target.activateTarget", "Target.attachToTarget",
 ])

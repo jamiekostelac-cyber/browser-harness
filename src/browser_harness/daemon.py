@@ -35,6 +35,7 @@ SOCK = ipc.sock_addr(NAME)
 LOG = str(ipc.log_path(NAME))
 PID = str(ipc.pid_path(NAME))
 BUF = 500
+MAX_OVERFLOW_CLEANUP_RETRIES = 256
 _MAC_PROFILES = (
     "Library/Application Support/Google/Chrome",
     "Library/Application Support/Google/Chrome Canary",
@@ -510,6 +511,9 @@ class Daemon:
         # Ordered map gives duplicate suppression plus bounded oldest-first pruning.
         self._pending_detached_sessions = {}
         self._pending_detached_sessions_overflowed = False
+        # Failed cleanup must remain retryable. Keep this separate from event
+        # history, and stop creating sessions when the bounded record is full.
+        self._overflow_cleanup_sessions = {}
         self._marker_tasks = set()
         self.events = deque(maxlen=BUF)
         self._event_provenance = deque(maxlen=BUF)
@@ -1217,6 +1221,7 @@ class Daemon:
                     or expected_epoch != self._authorization_epoch):
                 return {"tab_guard": "refused", "tab_guard_run": self._guarded_run_id,
                         "tab_guard_epoch": self._authorization_epoch}
+            await self._retry_overflow_cleanup_sessions()
             revoked_sessions = set(self._guarded_sessions)
             revoked_targets = set(self._guarded_targets)
             # Enforcement stays latched for this daemon's lifetime. A caller
@@ -1277,6 +1282,16 @@ class Daemon:
             await asyncio.gather(*marker_tasks, return_exceptions=True)
             self._marker_tasks.difference_update(marker_tasks)
         return {"tab_guard": "ok", "tab_guard_run": run_id}
+
+    async def _retry_overflow_cleanup_sessions(self):
+        """Retry detaching refused sessions, retaining failures for later cleanup."""
+        for sid in list(self._overflow_cleanup_sessions):
+            try:
+                await self.cdp.send_raw("Target.detachFromTarget", {"sessionId": sid})
+            except Exception as exc:
+                log(f"tab guard failed to retry overflow session cleanup {sid}: {exc}")
+            else:
+                self._overflow_cleanup_sessions.pop(sid, None)
 
     async def _guarded_read(self, req):
         """Validate and snapshot before yielding; never expose other sessions."""
@@ -1609,6 +1624,7 @@ class Daemon:
                 # strict caller will leave its endpoint and PID file intact.
                 self._shutting_down = False
                 return {"error": "stale-session recovery did not stop"}
+            await self._retry_overflow_cleanup_sessions()
             try:
                 stop_remote(strict=True)
             except Exception as e:
@@ -1637,6 +1653,19 @@ class Daemon:
                         return _guard_refusal("tab guard authorization is stale or invalid")
                 if guard_identity is not None and not self._dispatch_identity_state_current(guard_identity):
                     return _guard_refusal("tab guard authorization is stale or invalid")
+            if (method == "Target.attachToTarget" and guard_identity is not None
+                    and self._overflow_cleanup_sessions):
+                await self._retry_overflow_cleanup_sessions()
+                if self._overflow_cleanup_sessions:
+                    return _guard_refusal(
+                        "pending overflow session cleanup; refusing attach registration"
+                    )
+            if (method == "Target.attachToTarget" and guard_identity is not None
+                    and self._pending_detached_sessions_overflowed
+                    and len(self._overflow_cleanup_sessions) >= MAX_OVERFLOW_CLEANUP_RETRIES):
+                return _guard_refusal(
+                    "pending detach history overflow; cleanup capacity exhausted"
+                )
             result = await self.cdp.send_raw(method, params, session_id=sid)
             if guard_identity is not None and not await self._dispatch_identity_current(guard_identity):
                 return _guard_refusal("tab guard authorization was revoked during dispatch")
@@ -1654,6 +1683,8 @@ class Daemon:
                                 "Target.detachFromTarget", {"sessionId": attached_session}
                             )
                         except Exception as exc:
+                            if len(self._overflow_cleanup_sessions) < MAX_OVERFLOW_CLEANUP_RETRIES:
+                                self._overflow_cleanup_sessions[attached_session] = None
                             log(
                                 "tab guard failed to detach overflow-refused session "
                                 f"{attached_session}: {exc}"
