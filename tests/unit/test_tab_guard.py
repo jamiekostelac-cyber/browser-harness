@@ -81,6 +81,25 @@ def test_refuses_navigating_a_tab_the_run_did_not_open(guard, capsys):
     assert "[tab-guard] REFUSED Page.navigate FOREIGN https://example.com/" in capsys.readouterr().err
 
 
+def test_send_normalizes_and_labels_daemon_guard_refusal(monkeypatch, tmp_path):
+    class Connection:
+        def settimeout(self, _timeout):
+            pass
+        def close(self):
+            pass
+
+    monkeypatch.setenv("BH_TAB_GUARD_LOG", str(tmp_path / "guard.log"))
+    monkeypatch.setattr(helpers.ipc, "connect", lambda *a, **k: (Connection(), "token"))
+    monkeypatch.setattr(helpers.ipc, "request", lambda *a, **k: {
+        "tab_guard": "refused", "error": "tab guard authorization is stale or invalid",
+    })
+    with pytest.raises(helpers.TabGuardRefused) as exc:
+        helpers._send({"method": "Runtime.evaluate"})
+    assert exc.value.source == "daemon"
+    assert "REFUSED (daemon) Runtime.evaluate" in str(exc.value)
+    assert "REFUSED (daemon) Runtime.evaluate" in (tmp_path / "guard.log").read_text()
+
+
 def test_refuses_closing_and_activating_someone_elses_tab(guard):
     for method in ("Target.closeTarget", "Target.activateTarget", "Target.attachToTarget"):
         with pytest.raises(helpers.TabGuardRefused):
@@ -464,6 +483,29 @@ def test_create_target_is_pinned_to_a_run_owned_browser_context(guard, monkeypat
     assert create["params"]["browserContextId"] == "CONTEXT-MINE"
 
 
+def test_first_create_target_does_not_resolve_the_foreign_current_session(guard, monkeypatch):
+    requests = []
+
+    def send(req, **kwargs):
+        requests.append(req)
+        if req.get("meta") == "guard_epoch":
+            return {"tab_guard": "ok", "tab_guard_epoch": 0}
+        if req.get("meta") == "guard_context":
+            pytest.fail("global createTarget bootstrap must not inspect the current tab")
+        if req.get("method") == "Target.createBrowserContext":
+            return {"result": {"browserContextId": "CONTEXT-MINE"}}
+        if req.get("method") == "Target.createTarget":
+            return {"result": {"targetId": "MINE"}}
+        raise AssertionError(req)
+
+    monkeypatch.setattr(helpers, "_send", send)
+    assert helpers.cdp("Target.createTarget", url="about:blank")["targetId"] == "MINE"
+    assert helpers._owned_ids() == {"MINE"}
+    assert helpers._owned_contexts() == {"CONTEXT-MINE"}
+    assert all(req.get("tab_guard_session_id") is None for req in requests
+               if req.get("method") in {"Target.createBrowserContext", "Target.createTarget"})
+
+
 @pytest.mark.parametrize("context_id", ["FOREIGN-CONTEXT", None])
 def test_create_target_rejects_a_foreign_or_default_context_before_dispatch(
     owning, monkeypatch, context_id
@@ -834,6 +876,11 @@ def daemon_bridge(owning, monkeypatch):
     d.cdp = CDP()
     def send(req, **kwargs):
         result = asyncio.run(d.handle(req))
+        if result.get("tab_guard") == "refused":
+            raise helpers.TabGuardRefused(
+                f"[tab-guard] REFUSED (daemon): {result.get('error', 'guarded request refused')}",
+                source="daemon",
+            )
         if "error" in result:
             raise RuntimeError(result["error"])
         return result
@@ -1091,9 +1138,8 @@ def test_same_document_navigation_to_unauthorized_url_fails_closed(daemon_bridge
     assert state["url"] == "chrome://settings"
     assert state["document_url"] == "chrome://settings"
     assert state["allowed"] is False
-    assert asyncio.run(d.handle(request)) == {
-        "error": "tab guard authorization is stale or invalid",
-    }
+    response = asyncio.run(d.handle(request))
+    assert response == {"tab_guard": "refused", "error": "tab guard authorization is stale or invalid"}
     assert not any(call[0] == "Runtime.evaluate" for call in calls)
 
 
@@ -1284,11 +1330,16 @@ def test_unclassified_stream_and_console_events_require_provenance(daemon_bridge
     record("Runtime.executionContextCreated", {
         "context": {
             "id": 7,
+            "uniqueId": "unique-context-7",
             "origin": "https://owned.example",
             "auxData": {"frameId": "FRAME-MINE"},
         },
     })
     record("Runtime.consoleAPICalled", {"executionContextId": 7, "args": [{"value": "owned-console"}]})
+    assert ("SESSION-MINE", "MINE", "7") in d._execution_contexts
+    assert ("SESSION-MINE", "MINE", "unique-context-7") not in d._execution_contexts
+    record("Runtime.executionContextDestroyed", {"executionContextId": 7})
+    assert ("SESSION-MINE", "MINE", "7") not in d._execution_contexts
     record("Page.frameNavigated", {
         "frame": {"id": "FRAME-NEXT", "loaderId": "LOADER-NEXT",
                    "url": "https://next.example/"},
@@ -1392,7 +1443,7 @@ def test_dispatch_rejects_stale_url_snapshot_after_same_document_navigation(daem
 
     response = asyncio.run(d.handle(request))
 
-    assert response == {"error": "tab guard authorization is stale or invalid"}
+    assert response == {"tab_guard": "refused", "error": "tab guard authorization is stale or invalid"}
     assert not any(call[0] == method for call in calls)
 
 
@@ -1416,7 +1467,7 @@ def test_daemon_last_state_check_rejects_navigation_race_before_transport(daemon
 
     d._validate_dispatch_identity = validate_then_navigate
     response = asyncio.run(d.handle(request))
-    assert response == {"error": "tab guard authorization is stale or invalid"}
+    assert response == {"tab_guard": "refused", "error": "tab guard authorization is stale or invalid"}
     assert not any(call[0] == ("Target.sendMessageToTarget" if nested else "Runtime.evaluate")
                    for call in calls)
 
@@ -1440,7 +1491,7 @@ def test_daemon_last_state_check_rejects_reset_race_before_transport(daemon_brid
 
     d._validate_dispatch_identity = validate_then_revoke
     response = asyncio.run(d.handle(request))
-    assert response == {"error": "tab guard authorization is stale or invalid"}
+    assert response == {"tab_guard": "refused", "error": "tab guard authorization is stale or invalid"}
     assert not any(call[0] == ("Target.sendMessageToTarget" if nested else "Runtime.evaluate")
                    for call in calls)
 
@@ -1449,7 +1500,7 @@ def test_daemon_rejects_foreign_detach_session_before_transport(daemon_bridge):
     d, calls = daemon_bridge
     request = _guarded_dispatch_request(d, "Target.detachFromTarget", {"sessionId": "FOREIGN-SESSION"})
     response = asyncio.run(d.handle(request))
-    assert response == {"error": "tab guard authorization is stale or invalid"}
+    assert response == {"tab_guard": "refused", "error": "tab guard authorization is stale or invalid"}
     assert not any(call[0] == "Target.detachFromTarget" for call in calls)
 
 
@@ -1466,7 +1517,7 @@ def test_daemon_scope_policy_rejects_context_wide_dispatch_before_transport(daem
         request = _guarded_dispatch_request(d, "Storage.getCookies", {})
         forbidden = "Storage.getCookies"
     response = asyncio.run(d.handle(request))
-    assert response == {"error": "tab guard authorization is stale or invalid"}
+    assert response == {"tab_guard": "refused", "error": "tab guard authorization is stale or invalid"}
     assert not any(call[0] == forbidden for call in calls)
 
 
@@ -1476,7 +1527,7 @@ def test_active_guard_rejects_dispatch_with_identity_omitted(daemon_bridge):
         "method": "Runtime.evaluate", "params": {"expression": "1"},
         "session_id": "SESSION-MINE",
     }))
-    assert response == {"error": "tab guard authorization is stale or invalid"}
+    assert response == {"tab_guard": "refused", "error": "tab guard authorization is stale or invalid"}
     assert not any(call[0] == "Runtime.evaluate" for call in calls)
 
 
@@ -1522,7 +1573,7 @@ def test_guard_reset_suppresses_inflight_dispatch_result(daemon_bridge):
 
     reset, result = asyncio.run(run())
     assert reset["tab_guard"] == "ok"
-    assert result == {"error": "tab guard authorization was revoked during dispatch"}
+    assert result == {"tab_guard": "refused", "error": "tab guard authorization was revoked during dispatch"}
     assert "private result" not in json.dumps(result)
 
 
@@ -1570,7 +1621,7 @@ def test_dispatch_result_is_suppressed_if_authorization_changes_during_final_met
         return await pending
 
     result = asyncio.run(run())
-    assert result == {"error": "tab guard authorization was revoked during dispatch"}
+    assert result == {"tab_guard": "refused", "error": "tab guard authorization was revoked during dispatch"}
     assert "private-after-await" not in json.dumps(result)
 
 
@@ -1720,7 +1771,7 @@ def test_set_session_latches_policy_before_target_lookup_and_keeps_it_after_rese
     metadata, unguarded_cdp, reset, result = asyncio.run(run())
 
     assert metadata == {"tab_guard": "refused"}
-    assert unguarded_cdp == {"error": "tab guard authorization is stale or invalid"}
+    assert unguarded_cdp == {"tab_guard": "refused", "error": "tab guard authorization is stale or invalid"}
     assert reset["tab_guard"] == "ok"
     assert result["tab_guard"] == "refused"
     assert d._guard_policy_active is True
@@ -1752,7 +1803,7 @@ def test_guarded_bootstrap_latches_policy_before_transport_yields(daemon_bridge)
 
     assert concurrent_results == [
         {"tab_guard": "refused"},
-        {"error": "tab guard authorization is stale or invalid"},
+        {"tab_guard": "refused", "error": "tab guard authorization is stale or invalid"},
     ]
     assert result == {"result": {"browserContextId": "CTX"}}
     reset = asyncio.run(d.handle({"meta": "tab_guard_reset", "tab_guard_run": RUN_ID,
@@ -1787,7 +1838,7 @@ def test_guard_enabled_daemon_rejects_guardless_dispatch_and_metadata_before_boo
     dispatch, metadata = asyncio.run(run())
 
     assert d._guard_policy_active is True
-    assert dispatch == {"error": "tab guard authorization is stale or invalid"}
+    assert dispatch == {"tab_guard": "refused", "error": "tab guard authorization is stale or invalid"}
     assert metadata == {"tab_guard": "refused"}
     assert calls == []
 
@@ -1829,7 +1880,7 @@ def test_unguarded_inflight_dispatch_result_is_suppressed_after_guarded_bootstra
 
     result = asyncio.run(run())
 
-    assert result == {"error": "tab guard authorization was revoked during dispatch"}
+    assert result == {"tab_guard": "refused", "error": "tab guard authorization was revoked during dispatch"}
     assert "private foreign result" not in json.dumps(result)
 
 
@@ -2039,11 +2090,43 @@ def test_reset_leaves_guard_enforcement_latched_for_omitted_fields(daemon_bridge
         {"meta": "current_tab"},
         {"meta": "connection_status"},
         {"meta": "drain_events"},
-        {"meta": "shutdown"},
     ):
         response = asyncio.run(d.handle(request))
-        assert response.get("tab_guard") == "refused" or "stale" in response.get("error", "")
+        assert response.get("tab_guard") == "refused"
     assert not any(call[0] == "Runtime.evaluate" for call in calls)
+
+
+def test_shutdown_remains_available_after_guard_latches(daemon_bridge, monkeypatch):
+    d, calls = daemon_bridge
+    d.stop = asyncio.Event()
+    reset = asyncio.run(d.handle({
+        "meta": "tab_guard_reset", "tab_guard_run": RUN_ID,
+        "tab_guard_epoch": d._authorization_epoch,
+    }))
+    monkeypatch.setattr(daemon, "stop_remote", lambda strict=False: True)
+    result = asyncio.run(d.handle({"meta": "shutdown"}))
+    assert reset["tab_guard"] == "ok"
+    assert result == {"ok": True}
+    assert d.stop.is_set()
+    assert not any(call[0] == "Runtime.evaluate" for call in calls)
+
+
+def test_pending_detached_sessions_are_bounded_revoked_and_reset_pruned(daemon_bridge):
+    d, _ = daemon_bridge
+    for i in range(300):
+        d._record_browser_lifecycle_event("Target.detachedFromTarget", {"sessionId": f"S{i}"})
+    assert len(d._pending_detached_sessions) == 256
+    assert "S0" not in d._pending_detached_sessions
+    assert "S299" in d._pending_detached_sessions
+    d._revoke_event_ownership({"S299"})
+    assert "S299" not in d._pending_detached_sessions
+    d._pending_detached_sessions["pending"] = None
+    response = asyncio.run(d.handle({
+        "meta": "tab_guard_reset", "tab_guard_run": RUN_ID,
+        "tab_guard_epoch": d._authorization_epoch,
+    }))
+    assert response["tab_guard"] == "ok"
+    assert d._pending_detached_sessions == {}
 
 
 def test_delayed_old_run_reset_cannot_revoke_newer_run(daemon_bridge):
@@ -2089,7 +2172,7 @@ def test_target_scoped_sessionless_dispatch_rejects_stale_document_snapshot(
         d._document_state["SESSION-MINE"]["allowed"] = False
     before = len(calls)
     response = asyncio.run(d.handle(request))
-    assert response == {"error": "tab guard authorization is stale or invalid"}
+    assert response == {"tab_guard": "refused", "error": "tab guard authorization is stale or invalid"}
     assert not any(call[0] == method for call in calls[before:])
 
 
@@ -2113,7 +2196,7 @@ def test_target_scoped_dispatch_revalidates_document_after_target_lookup(daemon_
     d._validate_dispatch_identity = validate_then_navigate
     before = len(calls)
     response = asyncio.run(d.handle(request))
-    assert response == {"error": "tab guard authorization is stale or invalid"}
+    assert response == {"tab_guard": "refused", "error": "tab guard authorization is stale or invalid"}
     assert not any(call[0] == method for call in calls[before:])
 
 
@@ -2166,7 +2249,7 @@ def test_detach_before_attach_response_rejects_late_session_registration(daemon_
 
     response = asyncio.run(d.handle(request))
 
-    assert response == {"error": "Target.attachToTarget session was detached before registration"}
+    assert response == {"tab_guard": "refused", "error": "Target.attachToTarget session was detached before registration"}
     assert "SESSION-LATE" not in d._session_targets
     assert "SESSION-LATE" not in d._guarded_sessions
     assert "SESSION-LATE" not in d._document_state
@@ -2189,7 +2272,7 @@ def test_target_scoped_handler_refuses_foreign_or_stale_document(daemon_bridge, 
         d._document_state["SESSION-MINE"]["document_url"] = "https://next.example/"
     before = len(calls)
     response = asyncio.run(d.handle(request))
-    assert response == {"error": "tab guard authorization is stale or invalid"}
+    assert response == {"tab_guard": "refused", "error": "tab guard authorization is stale or invalid"}
     assert not any(call[0] == method for call in calls[before:])
 
 

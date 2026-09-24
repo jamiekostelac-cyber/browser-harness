@@ -175,6 +175,11 @@ _GUARDED_TARGET_METHODS = frozenset({
 })
 
 
+def _guard_refusal(reason, **details):
+    """Machine-readable daemon refusal; helpers expose this as TabGuardRefused."""
+    return {"tab_guard": "refused", "error": reason, **details}
+
+
 def tab_marker_enabled():
     """Whether the cosmetic controlled-tab title marker should be added."""
     return os.environ.get("BH_TAB_MARKER", "").strip().lower() not in {"0", "false", "no", "off"}
@@ -502,7 +507,8 @@ class Daemon:
         self._legacy_commands = {}
         self._legacy_wire_id = 0
         self._revoked_sessions = set()
-        self._pending_detached_sessions = set()
+        # Ordered map gives duplicate suppression plus bounded oldest-first pruning.
+        self._pending_detached_sessions = {}
         self._marker_tasks = set()
         self.events = deque(maxlen=BUF)
         self._event_provenance = deque(maxlen=BUF)
@@ -901,6 +907,8 @@ class Daemon:
         for sid, target in self._session_targets.items():
             if target in targets:
                 sessions.add(sid)
+        for sid in sessions:
+            self._pending_detached_sessions.pop(sid, None)
         if not self._guard_policy_active:
             return
 
@@ -968,7 +976,10 @@ class Daemon:
                 if sid in self._session_targets or sid in self._guarded_sessions:
                     self._revoke_event_ownership({sid})
                 else:
-                    self._pending_detached_sessions.add(sid)
+                    self._pending_detached_sessions.pop(sid, None)
+                    self._pending_detached_sessions[sid] = None
+                    if len(self._pending_detached_sessions) > 256:
+                        self._pending_detached_sessions.pop(next(iter(self._pending_detached_sessions)))
         elif method == "Target.targetDestroyed":
             target = params.get("targetId")
             if isinstance(target, str) and target in self._guarded_targets:
@@ -1092,9 +1103,7 @@ class Daemon:
                     return
             elif inner_method == "Runtime.executionContextCreated":
                 context = inner_params.get("context") if isinstance(inner_params, dict) else None
-                context_id = context.get("uniqueId") if isinstance(context, dict) else None
-                if not context_id:
-                    context_id = context.get("id") if isinstance(context, dict) else None
+                context_id = context.get("id") if isinstance(context, dict) else None
                 aux_data = context.get("auxData") if isinstance(context, dict) else None
                 context_frame_id = aux_data.get("frameId") if isinstance(aux_data, dict) else None
                 if (
@@ -1214,6 +1223,7 @@ class Daemon:
             self._guarded_sessions.clear()
             self._guarded_targets.clear()
             self._guarded_contexts.clear()
+            self._pending_detached_sessions.clear()
             self._session_targets = {
                 sid: target for sid, target in self._session_targets.items()
                 if sid not in revoked_sessions and target not in revoked_targets
@@ -1341,7 +1351,7 @@ class Daemon:
         response = await self._handle(req)
         if (not policy_was_active and self._guard_policy_active
                 and "tab_guard_run" not in req):
-            return {"error": "tab guard authorization was revoked during dispatch"}
+            return _guard_refusal("tab guard authorization was revoked during dispatch")
         return response
 
     async def _handle(self, req):
@@ -1419,7 +1429,7 @@ class Daemon:
         if meta == "tab_guard_reset":
             return await self._tab_guard_reset(req)
         if (self._guard_policy_active and meta is not None
-                and meta not in {"ping", "guard_epoch", "guard_context"}
+                and meta not in {"ping", "guard_epoch", "guard_context", "shutdown"}
                 and not isinstance(req.get("tab_guard"), dict)):
             return {"tab_guard": "refused"}
         protected_metadata = {
@@ -1614,16 +1624,16 @@ class Daemon:
             if self._guard_policy_active or "tab_guard_run" in req:
                 guard_identity = await self._validate_dispatch_identity(req, sid, method, params)
                 if guard_identity is None:
-                    return {"error": "tab guard authorization is stale or invalid"}
+                    return _guard_refusal("tab guard authorization is stale or invalid")
                 if method == "Target.sendMessageToTarget":
                     params = self._remember_legacy_command(guard_identity, params)
                     if params is None:
-                        return {"error": "tab guard authorization is stale or invalid"}
+                        return _guard_refusal("tab guard authorization is stale or invalid")
                 if guard_identity is not None and not self._dispatch_identity_state_current(guard_identity):
-                    return {"error": "tab guard authorization is stale or invalid"}
+                    return _guard_refusal("tab guard authorization is stale or invalid")
             result = await self.cdp.send_raw(method, params, session_id=sid)
             if guard_identity is not None and not await self._dispatch_identity_current(guard_identity):
-                return {"error": "tab guard authorization was revoked during dispatch"}
+                return _guard_refusal("tab guard authorization was revoked during dispatch")
             if method == "Target.createBrowserContext" and guard_identity is not None:
                 context_id = result.get("browserContextId")
                 if context_id:
@@ -1633,9 +1643,11 @@ class Daemon:
                 target_id = params.get("targetId")
                 if attached_session and target_id:
                     if attached_session in self._pending_detached_sessions:
-                        self._pending_detached_sessions.discard(attached_session)
+                        self._pending_detached_sessions.pop(attached_session, None)
                         self._revoked_sessions.add(attached_session)
-                        return {"error": "Target.attachToTarget session was detached before registration"}
+                        return _guard_refusal(
+                            "Target.attachToTarget session was detached before registration"
+                        )
                     self._revoked_sessions.discard(attached_session)
                     self._session_targets[attached_session] = target_id
                     if guard_identity is not None:

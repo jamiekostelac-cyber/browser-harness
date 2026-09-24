@@ -66,6 +66,17 @@ def _send(req, response_timeout=DEFAULT_IPC_RESPONSE_TIMEOUT_SECONDS):
             ) from e
     finally:
         c.close()
+    if r.get("tab_guard") == "refused":
+        detail = r.get("error") or "daemon refused stale or invalid guard authorization"
+        line = f"[tab-guard] REFUSED (daemon) {req.get('method') or req.get('meta') or 'request'}"
+        log_path = os.environ.get("BH_TAB_GUARD_LOG")
+        if log_path:
+            try:
+                with open(log_path, "a") as f:
+                    f.write(f"{line}: {detail}\n")
+            except Exception:
+                pass
+        raise TabGuardRefused(f"{line}: {detail}", source="daemon")
     if "error" in r: raise RuntimeError(r["error"])
     return r
 
@@ -98,7 +109,11 @@ def _send(req, response_timeout=DEFAULT_IPC_RESPONSE_TIMEOUT_SECONDS):
 # the thing being prevented.
 
 class TabGuardRefused(RuntimeError):
-    """A guarded run tried to act on a tab it did not open."""
+    """A guarded operation was refused locally or by daemon authorization."""
+
+    def __init__(self, message, *, source="helper"):
+        super().__init__(message)
+        self.source = source
 
 
 # Global, and safe under the guard: enumeration and creation.
@@ -531,6 +546,16 @@ def _guard_dispatch_fields(method, params, session_id):
         if not isinstance(epoch, int) or epoch < 0:
             _refuse(method, requested_target or f"session:{requested_session}",
                     params.get("url", ""), "daemon guard epoch is unavailable")
+        if method in {"Target.createBrowserContext", "Target.createTarget", "Target.getTargets"}:
+            return {
+                "tab_guard": _owned_state(),
+                "tab_guard_run": _run_id(),
+                "tab_guard_epoch": epoch,
+                "tab_guard_target_id": None,
+                "tab_guard_session_id": None,
+                "tab_guard_document_generation": None,
+                "tab_guard_url": None,
+            }
         context_request = {"meta": "guard_context", "tab_guard_run": _run_id(),
                            "tab_guard_epoch": epoch}
         if requested_session:
@@ -538,6 +563,8 @@ def _guard_dispatch_fields(method, params, session_id):
         elif requested_target:
             context_request["target_id"] = requested_target
         context = _send(context_request)
+    except TabGuardRefused:
+        raise
     except (OSError, RuntimeError, TimeoutError):
         _refuse(method, requested_target or f"session:{requested_session}",
                 params.get("url", ""), "guard authorization could not be read")
