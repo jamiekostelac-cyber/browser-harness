@@ -493,7 +493,10 @@ def _write_private_json(path: Path, data: dict, *, fd: int | None = None) -> Non
             f.flush()
     except BaseException:
         try:
-            path.unlink(missing_ok=True)
+            opened = os.fstat(fd)
+            current = path.lstat()
+            if (opened.st_dev, opened.st_ino) == (current.st_dev, current.st_ino):
+                path.unlink(missing_ok=True)
         except OSError:
             pass
         raise

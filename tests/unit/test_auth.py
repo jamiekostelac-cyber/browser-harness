@@ -91,6 +91,25 @@ def test_write_private_json_keeps_creation_handle_through_hardening(monkeypatch,
     assert json.loads(path.read_text(encoding="utf-8")) == {"api_key": "secret"}
 
 
+def test_write_private_json_does_not_unlink_replacement_after_identity_change(
+    monkeypatch, tmp_path
+):
+    final_path = tmp_path / "auth.json"
+    path, creation_fd = auth._new_auth_temp(final_path)
+    replacement = tmp_path / "replacement"
+    replacement.write_text("replacement", encoding="utf-8")
+
+    def swap_during_hardening(_path, *, directory=False):
+        replacement.replace(path)
+
+    monkeypatch.setattr(auth, "_chmod_private", swap_during_hardening)
+
+    with pytest.raises(PermissionError, match="changed during ACL hardening"):
+        auth._write_private_json(path, {"api_key": "secret"}, fd=creation_fd)
+
+    assert path.read_text(encoding="utf-8") == "replacement"
+
+
 def test_save_auth_record_rejects_existing_symlink_before_parent_hardening(monkeypatch, tmp_path):
     target = tmp_path / "auth.json"
     secret_target = tmp_path / "outside.json"

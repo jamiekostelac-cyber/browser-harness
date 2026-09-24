@@ -225,7 +225,9 @@ def _reject_reparse_path(path: Path) -> None:
 
 def reject_reparse_path(path: Path) -> None:
     """Public guard for callers that read or replace credential paths."""
-    _reject_reparse_path(path)
+    absolute = path.absolute()
+    for item in reversed((absolute, *absolute.parents)):
+        _reject_reparse_path(item)
 
 
 def _read_sddl(path: Path) -> str:
@@ -275,6 +277,7 @@ def _validate_acl_tree(
     expected_identities: dict[Path, tuple[int, int, int, int] | None] | None = None,
     validate_dacl: bool = True,
     read_descriptors: bool = True,
+    dacl_validity: dict[Path, bool] | None = None,
 ) -> dict[Path, tuple[int, int, int, int] | None]:
     """Validate all objects and, on readback, ensure the tree still names them."""
     objects = [path]
@@ -316,10 +319,17 @@ def _validate_acl_tree(
         after = _object_identity(item)
         if before != after:
             raise PermissionError(f"filesystem objects changed while hardening {path}")
+        _validate_acl_owner(snapshot, approved_sid=approved_sid)
         if validate_dacl:
-            _parse_acl_snapshot(snapshot, approved_sid=approved_sid)
-        else:
-            _validate_acl_owner(snapshot, approved_sid=approved_sid)
+            try:
+                _parse_acl_snapshot(snapshot, approved_sid=approved_sid)
+            except PermissionError:
+                if dacl_validity is None:
+                    raise
+                dacl_validity[item] = False
+            else:
+                if dacl_validity is not None:
+                    dacl_validity[item] = True
     if read_descriptors:
         # Re-enumerate after every descriptor read so a sibling replaced while
         # another object's descriptor was being queried cannot pass validation.
@@ -339,6 +349,7 @@ def _restore_acl(
     *,
     directory: bool,
     expected_identities: dict[Path, tuple[int, int, int, int] | None],
+    approved_sid: str,
 ) -> None:
     _assert_acl_tree_identity(path, directory=directory, expected_identities=expected_identities)
     restore_root = path.parent if path.parent != Path("") else Path(".")
@@ -346,6 +357,13 @@ def _restore_acl(
     _assert_acl_tree_identity(path, directory=directory, expected_identities=expected_identities)
     if _read_acl_snapshot(path, directory=directory) != backup_path.read_bytes():
         raise PermissionError(f"could not verify restored permissions for {path}")
+    _validate_acl_tree(
+        path,
+        directory=directory,
+        approved_sid=approved_sid,
+        expected_identities=expected_identities,
+        validate_dacl=False,
+    )
     _assert_acl_tree_identity(path, directory=directory, expected_identities=expected_identities)
 
 
@@ -377,6 +395,22 @@ def _mutate_acl_tree(
     _assert_acl_tree_identity(path, directory=directory, expected_identities=expected_identities)
 
 
+def _windows_acl_tree_is_hardened(path: Path, *, directory: bool, resolve_sid=None) -> bool:
+    approved_sid = _windows_principal(resolve_sid).lstrip("*").upper()
+    identities = _validate_acl_tree(
+        path, directory=directory, approved_sid=approved_sid, validate_dacl=False
+    )
+    dacl_validity: dict[Path, bool] = {}
+    _validate_acl_tree(
+        path,
+        directory=directory,
+        approved_sid=approved_sid,
+        expected_identities=identities,
+        dacl_validity=dacl_validity,
+    )
+    return bool(dacl_validity) and all(dacl_validity.values())
+
+
 def _harden_windows_acl(path: Path, *, directory: bool, resolve_sid=None) -> None:
     _reject_reparse_path(path)
     principal = _windows_principal(resolve_sid)
@@ -387,7 +421,6 @@ def _harden_windows_acl(path: Path, *, directory: bool, resolve_sid=None) -> Non
         approved_sid=next(iter(approved)),
         validate_dacl=False,
     )
-
     recursive = ("/T",) if directory else ()
     inheritance = "(OI)(CI)" if directory else ""
     grant = f"{principal}:{inheritance}F"
@@ -450,6 +483,7 @@ def _harden_windows_acl(path: Path, *, directory: bool, resolve_sid=None) -> Non
                 backup_path,
                 directory=directory,
                 expected_identities=original_identities,
+                approved_sid=next(iter(approved)),
             )
             raise
     finally:
@@ -457,6 +491,7 @@ def _harden_windows_acl(path: Path, *, directory: bool, resolve_sid=None) -> Non
 
 
 def harden_private_path(path: Path, *, directory: bool = False, resolve_sid=None) -> None:
+    reject_reparse_path(path)
     if sys.platform == "win32":
         _reject_reparse_path(path)
         _harden_windows_acl(path, directory=directory, resolve_sid=resolve_sid)
@@ -465,10 +500,13 @@ def harden_private_path(path: Path, *, directory: bool = False, resolve_sid=None
 
 
 def ensure_private_dir(path: Path) -> Path:
-    _reject_reparse_path(path)
+    reject_reparse_path(path)
     existed = path.exists()
     path.mkdir(parents=True, exist_ok=True)
-    if sys.platform == "win32" or not existed:
+    if sys.platform == "win32":
+        if not existed or not _windows_acl_tree_is_hardened(path, directory=True):
+            harden_private_path(path, directory=True)
+    elif not existed:
         harden_private_path(path, directory=True)
     return path
 

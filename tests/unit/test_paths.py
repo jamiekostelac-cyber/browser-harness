@@ -50,7 +50,7 @@ def test_ensure_private_dir_replaces_windows_acl_recursively(monkeypatch, tmp_pa
     assert all(call[1] == {"capture_output": True, "text": True, "check": False} for call in calls)
 
 
-def test_ensure_private_dir_rehardens_existing_windows_tree(monkeypatch, tmp_path):
+def test_ensure_private_dir_does_not_reharden_valid_windows_tree(monkeypatch, tmp_path):
     _set_windows_identity(monkeypatch)
     target = tmp_path / "private"
     target.mkdir()
@@ -60,16 +60,37 @@ def test_ensure_private_dir_rehardens_existing_windows_tree(monkeypatch, tmp_pat
 
     paths.ensure_private_dir(target)
 
-    argv = [call[0] for call in calls]
-    assert len(argv[0]) == 5
-    backup = argv[0][3]
-    assert argv[:3] == [
-        ["icacls", str(target), "/save", backup, "/T"],
-        ["icacls", str(target), "/inheritance:r", "/T"],
-        ["icacls", str(target), "/grant:r", f"*{APPROVED_SID}:(OI)(CI)F", "/T"],
-    ]
-    assert argv[3][:3] == ["icacls", str(target), "/save"]
-    assert argv[3][-1] == "/T"
+    assert calls == []
+
+
+def test_ensure_private_dir_rehardens_existing_unprotected_windows_tree(monkeypatch, tmp_path):
+    _set_windows_identity(monkeypatch)
+    target = tmp_path / "private"
+    target.mkdir()
+    calls = []
+    state = {"hardened": False}
+
+    def read_sddl(_path):
+        dacl = f"D:P(A;;FA;;;{APPROVED_SID})" if state["hardened"] else "D:(A;;FA;;;S-1-1-0)"
+        return f"O:{APPROVED_SID}G:{APPROVED_SID}{dacl}"
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        if "/save" in args:
+            Path(args[args.index("/save") + 1]).write_bytes(
+                b"D:(A;;FA;;;S-1-1-0)"
+            )
+        if "/grant:r" in args:
+            state["hardened"] = True
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(paths, "_read_sddl", read_sddl)
+    monkeypatch.setattr(paths.subprocess, "run", fake_run)
+
+    paths.ensure_private_dir(target)
+
+    assert any("/inheritance:r" in call for call in calls)
+    assert any("/grant:r" in call for call in calls)
 
 
 def test_harden_private_path_replaces_file_acl_on_windows(monkeypatch, tmp_path):
@@ -232,11 +253,19 @@ def test_harden_private_path_rolls_back_when_acl_readback_has_foreign_principal(
     target = tmp_path / "auth.json"
     target.touch()
     calls = []
-    snapshots = iter([
-        f"O:{APPROVED_SID}G:{APPROVED_SID}D:P(A;;FA;;;{APPROVED_SID})",
-        f"O:{APPROVED_SID}G:{APPROVED_SID}D:P(A;;FA;;;{APPROVED_SID})(A;;FA;;;{FOREIGN_SID})",
-    ])
-    monkeypatch.setattr(paths, "_read_sddl", lambda path: next(snapshots))
+    reads = 0
+
+    def read_sddl(_path):
+        nonlocal reads
+        reads += 1
+        suffix = (
+            f"(A;;FA;;;{APPROVED_SID})(A;;FA;;;{FOREIGN_SID})"
+            if reads == 2
+            else f"(A;;FA;;;{APPROVED_SID})"
+        )
+        return f"O:{APPROVED_SID}G:{APPROVED_SID}D:P{suffix}"
+
+    monkeypatch.setattr(paths, "_read_sddl", read_sddl)
 
     def fake_run(args, **kwargs):
         calls.append(args)
@@ -379,12 +408,66 @@ def test_acl_parser_requires_protected_dacl_trusted_owner_and_no_deny():
 def test_hardening_rejects_reparse_points_before_acl_commands(monkeypatch, tmp_path):
     _set_windows_identity(monkeypatch)
     target = tmp_path / "link"
-    target.symlink_to(tmp_path, target_is_directory=True)
+    original_lstat = Path.lstat
+    monkeypatch.setattr(
+        Path,
+        "lstat",
+        lambda self: SimpleNamespace(st_mode=0o100600, st_file_attributes=0x400)
+        if self == target
+        else original_lstat(self),
+    )
     calls = []
     monkeypatch.setattr(paths.subprocess, "run", lambda *args, **kwargs: calls.append(args))
     with pytest.raises(PermissionError, match="reparse point"):
         paths.harden_private_path(target)
     assert calls == []
+
+
+def test_ensure_private_dir_rejects_reparse_ancestor_before_mkdir(monkeypatch, tmp_path):
+    ancestor = tmp_path / "junction"
+    target = ancestor / "private"
+    original_lstat = Path.lstat
+
+    def mock_lstat(item):
+        if item == ancestor:
+            actual = original_lstat(tmp_path)
+            return SimpleNamespace(st_mode=actual.st_mode, st_file_attributes=0x400)
+        return original_lstat(item)
+
+    monkeypatch.setattr(Path, "lstat", mock_lstat)
+    with pytest.raises(PermissionError, match="reparse point"):
+        paths.ensure_private_dir(target)
+    assert not target.exists()
+
+
+def test_restore_acl_rejects_foreign_owner_after_dacl_restore(monkeypatch, tmp_path):
+    _set_windows_identity(monkeypatch)
+    target = tmp_path / "auth.json"
+    target.touch()
+    calls = []
+    restored = False
+
+    def read_sddl(_path):
+        owner = FOREIGN_SID if restored else APPROVED_SID
+        return f"O:{owner}G:{APPROVED_SID}D:P(A;;FA;;;{APPROVED_SID})"
+
+    def fake_run(args, **kwargs):
+        nonlocal restored
+        calls.append(args)
+        if "/save" in args:
+            Path(args[args.index("/save") + 1]).write_bytes(
+                f"D:(A;;FA;;;{APPROVED_SID})".encode()
+            )
+        if "/grant:r" in args:
+            return SimpleNamespace(returncode=5, stdout="", stderr="mutation failed")
+        if "/restore" in args:
+            restored = True
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(paths, "_read_sddl", read_sddl)
+    monkeypatch.setattr(paths.subprocess, "run", fake_run)
+    with pytest.raises(PermissionError, match="owner is not the effective user SID"):
+        paths.harden_private_path(target)
 
 
 @pytest.mark.parametrize("child_sddl, message", [
@@ -512,7 +595,7 @@ def test_recursive_hardening_revalidates_every_child_after_mutation(
     with pytest.raises(PermissionError, match=message):
         paths.harden_private_path(target, directory=True)
 
-    assert reads.count(child) == 2
+    assert reads.count(child) == 3
     assert any("/restore" in call for call in calls)
 
 
