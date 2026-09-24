@@ -2,6 +2,7 @@
 DevToolsActivePort lives. get_ws_url() must not crash on that: it falls back to a
 dedicated automation Chrome, and fails with actionable guidance when it can't.
 No real browser is launched."""
+import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -734,6 +735,22 @@ def test_macos_trust_accepts_discovered_browser_identities(
     monkeypatch.setattr(daemon.subprocess, "check_output", codesign)
     executable = f"/Applications/{image}.app/Contents/MacOS/{image}"
     assert daemon._trusted_browser_executable(executable)
+
+
+def test_executable_trust_cache_invalidates_on_in_place_rewrite(tmp_path, monkeypatch):
+    executable = tmp_path / "chrome"
+    executable.write_bytes(b"AAAA")
+    trust_check = MagicMock(side_effect=[True, False])
+    monkeypatch.setattr(daemon, "_trusted_browser_executable", trust_check)
+    cache = {}
+
+    assert daemon._trusted_browser_executable_cached(str(executable), cache)
+    original = executable.stat()
+    executable.write_bytes(b"BBBB")
+    os.utime(executable, ns=(original.st_atime_ns, original.st_mtime_ns))
+
+    assert not daemon._trusted_browser_executable_cached(str(executable), cache)
+    assert trust_check.call_count == 2
 
 
 def test_explicit_cdp_url_discovers_and_validates_isolated_profile(

@@ -448,7 +448,7 @@ def _trusted_browser_executable_cached(executable, cache):
     except OSError:
         return False
     key = str(path)
-    identity = (stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_size)
+    identity = (stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size)
     cached = cache.get(key)
     if cached is None or cached[0] != identity:
         cached = (identity, _trusted_browser_executable(key))
