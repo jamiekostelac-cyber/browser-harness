@@ -53,7 +53,16 @@ def test_origin_port_discovery_keeps_permission_gate(monkeypatch, origin_profile
             daemon.get_ws_url()
     else:
         assert daemon.get_ws_url() == "ws://127.0.0.1:9222/devtools/browser/origin"
-        owns_endpoint.assert_called_once()
+        owns_endpoint.assert_called_once_with(
+            origin_profile,
+            "9222",
+            "ws://127.0.0.1:9222/devtools/browser/origin",
+            (0, 1, 0, 50, b"9222\n/devtools/browser/origin\n", "9222",
+             "/devtools/browser/origin"),
+            None,
+            expected_host="127.0.0.1",
+            trusted_executable_cache=None,
+        )
 
 
 def test_origin_relaunch_uses_origin_not_regular_brave(monkeypatch, origin_profile):

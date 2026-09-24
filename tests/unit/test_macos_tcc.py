@@ -745,16 +745,27 @@ def test_explicit_cdp_url_discovers_and_validates_isolated_profile(
         "49231\n/devtools/browser/isolated-owner\n"
     )
     (profile / "SingletonLock").symlink_to("host-777")
+    executable = tmp_path / "chrome"
+    executable.write_text("test executable")
     monkeypatch.setattr(daemon, "PROFILES", [])
     monkeypatch.setattr(daemon, "AUTOMATION_PROFILE", tmp_path / "other-profile")
     monkeypatch.setattr(daemon, "_listener_pids", lambda _port: {777})
     monkeypatch.setattr(daemon, "_process_args", lambda _pid: [
-        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        str(executable),
         f"--user-data-dir={profile}", "--remote-debugging-port=49231",
     ])
-    monkeypatch.setattr(daemon, "_trusted_browser_executable", lambda _exe: True)
-    snapshots = daemon._http_endpoint_snapshots("http://127.0.0.1:49231")
+    trust_check = MagicMock(return_value=True)
+    monkeypatch.setattr(daemon, "_trusted_browser_executable", trust_check)
+    trust_cache = {}
+    snapshots = daemon._http_endpoint_snapshots(
+        "http://127.0.0.1:49231", trust_cache
+    )
+    repeated_snapshots = daemon._http_endpoint_snapshots(
+        "http://127.0.0.1:49231", trust_cache
+    )
     assert [base for base, _snapshot in snapshots] == [profile.resolve()]
+    assert repeated_snapshots == snapshots
+    trust_check.assert_called_once_with(str(executable.resolve()))
     assert daemon._http_endpoint_owned(
         "http://127.0.0.1:49231",
         "ws://127.0.0.1:49231/devtools/browser/isolated-owner",
@@ -765,6 +776,10 @@ def test_explicit_cdp_url_discovers_and_validates_isolated_profile(
         "ws://127.0.0.1:49231/devtools/browser/foreign-owner",
         snapshots,
     )
+
+
+def test_explicit_cdp_profile_argument_rejects_relative_path():
+    assert daemon._profile_argument_value(["--user-data-dir=relative/profile"]) is None
 
 
 def test_macos_executable_trust_requires_valid_expected_signer(monkeypatch):

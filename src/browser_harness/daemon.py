@@ -440,6 +440,22 @@ def _trusted_browser_executable(executable):
     return False
 
 
+def _trusted_browser_executable_cached(executable, cache):
+    """Reuse signature checks only while the executable file identity is unchanged."""
+    try:
+        path = Path(executable).resolve()
+        stat = path.stat()
+    except OSError:
+        return False
+    key = str(path)
+    identity = (stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_size)
+    cached = cache.get(key)
+    if cached is None or cached[0] != identity:
+        cached = (identity, _trusted_browser_executable(key))
+        cache[key] = cached
+    return cached[1]
+
+
 def _profile_argument_matches(args, base):
     """Accept exactly one canonical, effective Chromium profile switch."""
     expected = str(Path(base).resolve())
@@ -519,7 +535,7 @@ def _listener_pids(port):
     return set()
 
 
-def _profile_browser_pid(base, expected_pid=None):
+def _profile_browser_pid(base, expected_pid=None, trusted_executable_cache=None):
     """Return the verified Chromium PID for this profile, otherwise None."""
     if platform.system() == "Windows":
         pid = expected_pid
@@ -536,7 +552,9 @@ def _profile_browser_pid(base, expected_pid=None):
     args = _process_args(pid)
     if not args:
         return None
-    if not _trusted_browser_executable(args[0]):
+    trusted = (_trusted_browser_executable(args[0]) if trusted_executable_cache is None
+               else _trusted_browser_executable_cached(args[0], trusted_executable_cache))
+    if not trusted:
         return None
     profile_matches = _profile_argument_matches(args[1:], base)
     if not profile_matches and not _default_profile_matches(args[0], args[1:], base):
@@ -567,7 +585,8 @@ def _default_profile_matches(executable, args, base):
 
 
 def _endpoint_owned_by_profile(
-    base, port, ws_url, snapshot=None, expected_pid=None, expected_host="127.0.0.1"
+    base, port, ws_url, snapshot=None, expected_pid=None, expected_host="127.0.0.1",
+    trusted_executable_cache=None,
 ):
     """Bind endpoint response, active-port file, browser PID, and listener PID."""
     before = snapshot or _devtools_active_port_snapshot(base)
@@ -579,11 +598,11 @@ def _endpoint_owned_by_profile(
     pid = next(iter(listeners))
     if expected_pid is not None and pid != expected_pid:
         return False
-    if _profile_browser_pid(base, pid) != pid:
+    if _profile_browser_pid(base, pid, trusted_executable_cache) != pid:
         return False
     current = _devtools_active_port_snapshot(base)
     return (_listener_pids(port) == {pid}
-            and _profile_browser_pid(base, pid) == pid
+            and _profile_browser_pid(base, pid, trusted_executable_cache) == pid
             and before == current and _ws_matches_devtools_active_port(
         base, str(port), ws_url, expected_host
     ))
@@ -638,7 +657,13 @@ async def _silent(coro):
         pass
 
 
-def _ws_from_devtools_active_port(http_url: str, profile=None, snapshot=None, expected_pid=None) -> str | None:
+def _ws_from_devtools_active_port(
+    http_url: str,
+    profile=None,
+    snapshot=None,
+    expected_pid=None,
+    trusted_executable_cache=None,
+) -> str | None:
     """Recover a 404 DevTools endpoint only when its profile process owns the endpoint."""
     p = urlparse(http_url)
     want_port = str(p.port) if p.port else ""
@@ -671,7 +696,13 @@ def _ws_from_devtools_active_port(http_url: str, profile=None, snapshot=None, ex
             port == want_port
             and ws_path.startswith("/devtools/browser/")
             and _endpoint_owned_by_profile(
-                base, port, ws, snapshot, expected_pid, expected_host=host.strip("[]")
+                base,
+                port,
+                ws,
+                snapshot,
+                expected_pid,
+                expected_host=host.strip("[]"),
+                trusted_executable_cache=trusted_executable_cache,
             )
         ):
             return ws
@@ -709,7 +740,7 @@ def _ws_matches_devtools_active_port(
         return False
 
 
-def _http_endpoint_snapshots(http_url):
+def _http_endpoint_snapshots(http_url, trusted_executable_cache=None):
     """Capture candidate local profile endpoint identities before an HTTP probe."""
     try:
         parsed = urlparse(http_url)
@@ -729,7 +760,10 @@ def _http_endpoint_snapshots(http_url):
         # verifying its browser executable and unambiguous profile argument.
         for pid in _listener_pids(parsed.port):
             args = _process_args(pid)
-            if not args or not _trusted_browser_executable(args[0]):
+            if not args:
+                continue
+            cache = trusted_executable_cache if trusted_executable_cache is not None else {}
+            if not _trusted_browser_executable_cached(args[0], cache):
                 continue
             profile_arg = _profile_argument_value(args[1:])
             if profile_arg:
@@ -755,7 +789,12 @@ def _profile_argument_value(args):
             if not arg.startswith("--user-data-dir=") or not arg.partition("=")[2]:
                 return None
             values.append(arg.partition("=")[2])
-    return str(Path(values[0]).expanduser().resolve()) if len(values) == 1 else None
+    if len(values) != 1:
+        return None
+    profile = Path(values[0]).expanduser()
+    if not profile.is_absolute():
+        return None
+    return str(profile.resolve())
 
 
 def _websocket_url(payload):
@@ -766,14 +805,19 @@ def _websocket_url(payload):
     return ws if isinstance(ws, str) else None
 
 
-def _http_endpoint_owned(http_url, ws_url, snapshots):
+def _http_endpoint_owned(http_url, ws_url, snapshots, trusted_executable_cache=None):
     """Accept a local HTTP endpoint only when its pre-probe identity still owns it."""
     try:
         parsed = urlparse(http_url)
         host = parsed.hostname or ""
         for base, snapshot in snapshots:
             if _endpoint_owned_by_profile(
-                base, str(parsed.port), ws_url, snapshot, expected_host=host
+                base,
+                str(parsed.port),
+                ws_url,
+                snapshot,
+                expected_host=host,
+                trusted_executable_cache=trusted_executable_cache,
             ):
                 return True
     except (TypeError, ValueError):
@@ -900,13 +944,25 @@ def get_ws_url():
         deadline = time.time() + 30
         last_err = None
         base_url = url.rstrip("/")
+        # A running process cannot change its loaded executable identity during
+        # this bounded probe. Cache signature checks by resolved path while
+        # still re-reading the live listener argv and endpoint file each retry.
+        trusted_executable_cache = {}
+        snapshots = []
+        next_snapshot_refresh = 0.0
         while time.time() < deadline:
-            snapshots = _http_endpoint_snapshots(url)
+            now = time.time()
+            if now >= next_snapshot_refresh:
+                snapshots = _http_endpoint_snapshots(url, trusted_executable_cache)
+                next_snapshot_refresh = now + 5
             try:
                 ws = _websocket_url(json.loads(urllib.request.urlopen(f"{base_url}/json/version", timeout=5).read()))
-                if ws and _http_endpoint_owned(url, ws, snapshots):
+                if ws and _http_endpoint_owned(
+                    url, ws, snapshots, trusted_executable_cache
+                ):
                     return ws
                 last_err = RuntimeError("endpoint ownership could not be verified")
+                time.sleep(1)
             except urllib.error.HTTPError as e:
                 last_err = e
                 if e.code == 403:
@@ -914,7 +970,10 @@ def get_ws_url():
                 if e.code == 404:
                     for base, snapshot in snapshots:
                         if ws := _ws_from_devtools_active_port(
-                            url, profile=base, snapshot=snapshot
+                            url,
+                            profile=base,
+                            snapshot=snapshot,
+                            trusted_executable_cache=trusted_executable_cache,
                         ):
                             return ws
                 time.sleep(1)
