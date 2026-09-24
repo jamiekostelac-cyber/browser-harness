@@ -2314,6 +2314,170 @@ def test_pending_detach_overflow_detaches_repeated_refused_sessions_without_grow
     assert d._revoked_sessions == revoked_before
 
 
+def test_overflow_attach_skips_detach_for_session_already_in_detach_history(daemon_bridge):
+    d, calls = daemon_bridge
+    request = _guarded_dispatch_request(d, "Target.attachToTarget", {"targetId": "MINE"})
+    request["session_id"] = None
+    request["tab_guard_session_id"] = None
+    request["tab_guard_document_generation"] = None
+    request["tab_guard_url"] = "https://owned.example/"
+    request["tab_guard"]["sessions"] = []
+    d._session_targets.clear()
+    d._guarded_sessions.clear()
+    d._document_state.clear()
+
+    async def attach_response(method, params=None, session_id=None):
+        calls.append((method, params, session_id))
+        if method == "Target.getTargetInfo":
+            return {"targetInfo": {"type": "page", "targetId": "MINE",
+                                   "url": "https://owned.example/", "title": "Owned"}}
+        if method == "Target.attachToTarget":
+            return {"sessionId": "SESSION-256"}
+        if method == "Target.detachFromTarget":
+            raise AssertionError("a session already known detached must not be detached again")
+        raise AssertionError(f"unexpected CDP method: {method}")
+
+    d.cdp.send_raw = attach_response
+    for i in range(257):
+        d._record_browser_lifecycle_event("Target.detachedFromTarget", {"sessionId": f"SESSION-{i}"})
+
+    response = asyncio.run(d.handle(request))
+
+    assert response == {
+        "tab_guard": "refused",
+        "error": "Target.attachToTarget session was detached before registration",
+    }
+    assert "SESSION-256" in d._revoked_sessions
+    assert "SESSION-256" not in d._session_targets
+    assert not any(call[0] == "Target.detachFromTarget" for call in calls)
+
+
+def test_concurrent_overflow_attaches_cannot_overbook_cleanup_capacity(daemon_bridge):
+    d, calls = daemon_bridge
+    request = _guarded_dispatch_request(d, "Target.attachToTarget", {"targetId": "MINE"})
+    request["session_id"] = None
+    request["tab_guard_session_id"] = None
+    request["tab_guard_document_generation"] = None
+    request["tab_guard_url"] = "https://owned.example/"
+    request["tab_guard"]["sessions"] = []
+    d._session_targets.clear()
+    d._guarded_sessions.clear()
+    d._document_state.clear()
+    attached = 0
+
+    async def attach_response(method, params=None, session_id=None):
+        nonlocal attached
+        calls.append((method, params, session_id))
+        if method == "Target.getTargetInfo":
+            return {"targetInfo": {"type": "page", "targetId": "MINE",
+                                   "url": "https://owned.example/", "title": "Owned"}}
+        if method == "Target.attachToTarget":
+            attached += 1
+            await asyncio.sleep(0)
+            return {"sessionId": f"SESSION-OVERFLOW-{attached}"}
+        if method == "Target.detachFromTarget":
+            await asyncio.sleep(0)
+            raise RuntimeError("detach unavailable")
+        raise AssertionError(f"unexpected CDP method: {method}")
+
+    d.cdp.send_raw = attach_response
+    for i in range(257):
+        d._record_browser_lifecycle_event("Target.detachedFromTarget", {"sessionId": f"OLD-{i}"})
+
+    async def run_concurrent_requests():
+        return await asyncio.gather(*(d.handle(request) for _ in range(100)))
+
+    responses = asyncio.run(run_concurrent_requests())
+
+    assert all(response["tab_guard"] == "refused" for response in responses)
+    assert attached == 1
+    assert d._overflow_cleanup_sessions == {"SESSION-OVERFLOW-1": None}
+
+
+def test_reset_does_not_hold_session_state_lock_while_retrying_cdp_cleanup(daemon_bridge):
+    d, _ = daemon_bridge
+    d._overflow_cleanup_sessions["SESSION-SLOW-CLEANUP"] = None
+    cleanup_started = asyncio.Event()
+    finish_cleanup = asyncio.Event()
+
+    async def slow_cleanup(method, params=None, session_id=None):
+        assert method == "Target.detachFromTarget"
+        cleanup_started.set()
+        await finish_cleanup.wait()
+        return {}
+
+    d.cdp.send_raw = slow_cleanup
+
+    async def run_reset_and_probe_lock():
+        reset = asyncio.create_task(d.handle({
+            "meta": "tab_guard_reset",
+            "tab_guard_run": RUN_ID,
+            "tab_guard_epoch": d._authorization_epoch,
+        }))
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+        await asyncio.wait_for(d._session_state_lock.acquire(), timeout=0.1)
+        d._session_state_lock.release()
+        finish_cleanup.set()
+        return await reset
+
+    response = asyncio.run(run_reset_and_probe_lock())
+
+    assert response["tab_guard"] == "ok"
+    assert d._overflow_cleanup_sessions == {}
+
+
+def test_midflight_detach_overflow_keeps_every_failed_attach_retryable(daemon_bridge):
+    d, calls = daemon_bridge
+    request = _guarded_dispatch_request(d, "Target.attachToTarget", {"targetId": "MINE"})
+    request["session_id"] = None
+    request["tab_guard_session_id"] = None
+    request["tab_guard_document_generation"] = None
+    request["tab_guard_url"] = "https://owned.example/"
+    request["tab_guard"]["sessions"] = []
+    d._session_targets.clear()
+    d._guarded_sessions.clear()
+    d._document_state.clear()
+    entered = 0
+    all_attaches_entered = asyncio.Event()
+    release_attaches = asyncio.Event()
+
+    async def attach_response(method, params=None, session_id=None):
+        nonlocal entered
+        calls.append((method, params, session_id))
+        if method == "Target.getTargetInfo":
+            return {"targetInfo": {"type": "page", "targetId": "MINE",
+                                   "url": "https://owned.example/", "title": "Owned"}}
+        if method == "Target.attachToTarget":
+            entered += 1
+            session_number = entered
+            if session_number == 256:
+                all_attaches_entered.set()
+            await release_attaches.wait()
+            return {"sessionId": f"SESSION-INFLIGHT-{session_number}"}
+        if method == "Target.detachFromTarget":
+            raise RuntimeError("detach unavailable")
+        raise AssertionError(f"unexpected CDP method: {method}")
+
+    d.cdp.send_raw = attach_response
+    async def run_overflow_during_dispatch():
+        requests = [asyncio.create_task(d.handle(request)) for _ in range(257)]
+        await asyncio.wait_for(all_attaches_entered.wait(), timeout=2)
+        for i in range(257):
+            d._record_browser_lifecycle_event(
+                "Target.detachedFromTarget", {"sessionId": f"NEW-{i}"}
+            )
+        release_attaches.set()
+        return await asyncio.gather(*requests)
+
+    responses = asyncio.run(run_overflow_during_dispatch())
+
+    assert all(response["tab_guard"] == "refused" for response in responses)
+    assert entered == 256
+    assert len(d._overflow_cleanup_sessions) == 256
+    assert all(f"SESSION-INFLIGHT-{i}" in d._overflow_cleanup_sessions
+               for i in range(1, 257))
+
+
 def test_failed_overflow_detach_is_retained_bounded_and_retried_on_reset(daemon_bridge):
     d, calls = daemon_bridge
     request = _guarded_dispatch_request(d, "Target.attachToTarget", {"targetId": "MINE"})

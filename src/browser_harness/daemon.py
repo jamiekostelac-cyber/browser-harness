@@ -492,6 +492,8 @@ class Daemon:
         self.dedicated_target_id = None
         self._dedicated_target_lock = asyncio.Lock()
         self._session_state_lock = asyncio.Lock()
+        self._overflow_attach_lock = asyncio.Lock()
+        self._guarded_attach_slots = asyncio.Semaphore(MAX_OVERFLOW_CLEANUP_RETRIES)
         self._active_recoveries = 0
         self._recovery_tasks = set()
         self._recoveries_idle = asyncio.Event()
@@ -1221,7 +1223,14 @@ class Daemon:
                     or expected_epoch != self._authorization_epoch):
                 return {"tab_guard": "refused", "tab_guard_run": self._guarded_run_id,
                         "tab_guard_epoch": self._authorization_epoch}
-            await self._retry_overflow_cleanup_sessions()
+        # This cleanup awaits CDP. Keep it outside the authorization lock so a
+        # slow transport cannot hold up session registration or recovery.
+        await self._retry_overflow_cleanup_sessions()
+        async with self._session_state_lock:
+            if (run_id != self._guarded_run_id
+                    or expected_epoch != self._authorization_epoch):
+                return {"tab_guard": "refused", "tab_guard_run": self._guarded_run_id,
+                        "tab_guard_epoch": self._authorization_epoch}
             revoked_sessions = set(self._guarded_sessions)
             revoked_targets = set(self._guarded_targets)
             # Enforcement stays latched for this daemon's lifetime. A caller
@@ -1653,21 +1662,53 @@ class Daemon:
                         return _guard_refusal("tab guard authorization is stale or invalid")
                 if guard_identity is not None and not self._dispatch_identity_state_current(guard_identity):
                     return _guard_refusal("tab guard authorization is stale or invalid")
+            overflow_attach_lock_held = False
+            guarded_attach_slot_held = False
+            if method == "Target.attachToTarget" and guard_identity is not None:
+                # Bound in-flight guarded attaches so a history overflow that
+                # occurs during dispatch still has one cleanup slot per reply.
+                await self._guarded_attach_slots.acquire()
+                guarded_attach_slot_held = True
+                if not await self._dispatch_identity_current(guard_identity):
+                    self._guarded_attach_slots.release()
+                    guarded_attach_slot_held = False
+                    return _guard_refusal("tab guard authorization is stale or invalid")
             if (method == "Target.attachToTarget" and guard_identity is not None
-                    and self._overflow_cleanup_sessions):
+                    and (self._overflow_cleanup_sessions
+                         or self._pending_detached_sessions_overflowed)):
+                # Serialize overflow-time attach preflight through cleanup so
+                # concurrent requests cannot all pass an empty-capacity check.
+                await self._overflow_attach_lock.acquire()
+                overflow_attach_lock_held = True
                 await self._retry_overflow_cleanup_sessions()
                 if self._overflow_cleanup_sessions:
+                    self._overflow_attach_lock.release()
+                    overflow_attach_lock_held = False
+                    self._guarded_attach_slots.release()
+                    guarded_attach_slot_held = False
                     return _guard_refusal(
                         "pending overflow session cleanup; refusing attach registration"
                     )
             if (method == "Target.attachToTarget" and guard_identity is not None
                     and self._pending_detached_sessions_overflowed
                     and len(self._overflow_cleanup_sessions) >= MAX_OVERFLOW_CLEANUP_RETRIES):
+                if overflow_attach_lock_held:
+                    self._overflow_attach_lock.release()
+                    overflow_attach_lock_held = False
+                if guarded_attach_slot_held:
+                    self._guarded_attach_slots.release()
+                    guarded_attach_slot_held = False
                 return _guard_refusal(
                     "pending detach history overflow; cleanup capacity exhausted"
                 )
             result = await self.cdp.send_raw(method, params, session_id=sid)
             if guard_identity is not None and not await self._dispatch_identity_current(guard_identity):
+                if overflow_attach_lock_held:
+                    self._overflow_attach_lock.release()
+                    overflow_attach_lock_held = False
+                if guarded_attach_slot_held:
+                    self._guarded_attach_slots.release()
+                    guarded_attach_slot_held = False
                 return _guard_refusal("tab guard authorization was revoked during dispatch")
             if method == "Target.createBrowserContext" and guard_identity is not None:
                 context_id = result.get("browserContextId")
@@ -1678,6 +1719,18 @@ class Daemon:
                 target_id = params.get("targetId")
                 if attached_session and target_id:
                     if self._pending_detached_sessions_overflowed:
+                        if attached_session in self._pending_detached_sessions:
+                            self._pending_detached_sessions.pop(attached_session, None)
+                            self._revoked_sessions.add(attached_session)
+                            if overflow_attach_lock_held:
+                                self._overflow_attach_lock.release()
+                                overflow_attach_lock_held = False
+                            if guarded_attach_slot_held:
+                                self._guarded_attach_slots.release()
+                                guarded_attach_slot_held = False
+                            return _guard_refusal(
+                                "Target.attachToTarget session was detached before registration"
+                            )
                         try:
                             await self.cdp.send_raw(
                                 "Target.detachFromTarget", {"sessionId": attached_session}
@@ -1689,12 +1742,24 @@ class Daemon:
                                 "tab guard failed to detach overflow-refused session "
                                 f"{attached_session}: {exc}"
                             )
+                        if overflow_attach_lock_held:
+                            self._overflow_attach_lock.release()
+                            overflow_attach_lock_held = False
+                        if guarded_attach_slot_held:
+                            self._guarded_attach_slots.release()
+                            guarded_attach_slot_held = False
                         return _guard_refusal(
                             "pending detach history overflow; refusing attach registration"
                         )
                     if attached_session in self._pending_detached_sessions:
                         self._pending_detached_sessions.pop(attached_session, None)
                         self._revoked_sessions.add(attached_session)
+                        if overflow_attach_lock_held:
+                            self._overflow_attach_lock.release()
+                            overflow_attach_lock_held = False
+                        if guarded_attach_slot_held:
+                            self._guarded_attach_slots.release()
+                            guarded_attach_slot_held = False
                         return _guard_refusal(
                             "Target.attachToTarget session was detached before registration"
                         )
@@ -1731,8 +1796,18 @@ class Daemon:
                 created_target = result.get("targetId")
                 if created_target:
                     self._guarded_targets.add(created_target)
+            if overflow_attach_lock_held:
+                self._overflow_attach_lock.release()
+                overflow_attach_lock_held = False
+            if guarded_attach_slot_held:
+                self._guarded_attach_slots.release()
+                guarded_attach_slot_held = False
             return {"result": result}
         except Exception as e:
+            if locals().get("overflow_attach_lock_held", False):
+                self._overflow_attach_lock.release()
+            if locals().get("guarded_attach_slot_held", False):
+                self._guarded_attach_slots.release()
             if method == "Target.sendMessageToTarget" and guard_identity is not None:
                 try:
                     nested = json.loads(params.get("message", ""))
