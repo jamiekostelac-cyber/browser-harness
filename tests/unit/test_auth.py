@@ -61,7 +61,10 @@ def test_write_private_json_hardens_before_writing_and_fails_closed(monkeypatch,
     with pytest.raises(PermissionError, match="ACL hardening failed"):
         auth._write_private_json(path, {"api_key": key})
 
-    assert not path.exists()
+    # Cleanup fails closed by clearing through the open handle. The path is
+    # retained because portable pathname unlink cannot prove its identity.
+    assert path.exists()
+    assert path.read_bytes() == b""
 
 
 def test_write_private_json_keeps_creation_handle_through_hardening(monkeypatch, tmp_path):
@@ -108,6 +111,26 @@ def test_write_private_json_does_not_unlink_replacement_after_identity_change(
         auth._write_private_json(path, {"api_key": "secret"}, fd=creation_fd)
 
     assert path.read_text(encoding="utf-8") == "replacement"
+
+
+def test_write_private_json_failure_never_unlinks_by_path(monkeypatch, tmp_path):
+    final_path = tmp_path / "auth.json"
+    path, creation_fd = auth._new_auth_temp(final_path)
+
+    def fail_hardening(_path, *, directory=False):
+        raise PermissionError("ACL hardening failed")
+
+    def forbidden_unlink(*_args, **_kwargs):
+        pytest.fail("auth temp cleanup must not unlink a path by name")
+
+    monkeypatch.setattr(auth, "_chmod_private", fail_hardening)
+    monkeypatch.setattr(Path, "unlink", forbidden_unlink)
+
+    with pytest.raises(PermissionError, match="ACL hardening failed"):
+        auth._write_private_json(path, {"api_key": "secret"}, fd=creation_fd)
+
+    assert path.exists()
+    assert path.read_bytes() == b""
 
 
 def test_save_auth_record_rejects_existing_symlink_before_parent_hardening(monkeypatch, tmp_path):

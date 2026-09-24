@@ -492,11 +492,12 @@ def _write_private_json(path: Path, data: dict, *, fd: int | None = None) -> Non
             f.write(raw)
             f.flush()
     except BaseException:
+        # Path-based unlink cannot be made conditional on the opened file's
+        # identity. A replacement can appear after lstat() and before unlink().
+        # Clear the file through the handle we created instead; leave the
+        # private temp entry behind rather than risk deleting another entry.
         try:
-            opened = os.fstat(fd)
-            current = path.lstat()
-            if (opened.st_dev, opened.st_ino) == (current.st_dev, current.st_ino):
-                path.unlink(missing_ok=True)
+            os.ftruncate(fd, 0)
         except OSError:
             pass
         raise
