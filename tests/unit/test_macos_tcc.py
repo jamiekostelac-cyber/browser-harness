@@ -38,6 +38,7 @@ def blocked_profile(monkeypatch):
 
     monkeypatch.setattr(daemon.urllib.request, "urlopen", refused)
     monkeypatch.setattr(daemon.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(daemon, "_json_version_ws", lambda _port: None)
 
 
 def test_blocked_profile_falls_back_to_automation_chrome(blocked_profile, monkeypatch):
@@ -266,11 +267,19 @@ def test_automation_reuse_rejects_foreign_endpoint_identity(
 def test_automation_launch_rejects_unrelated_listener(monkeypatch, tmp_path):
     profile = tmp_path / "automation-profile"
     profile.mkdir()
+    (profile / "DevToolsActivePort").write_text(
+        "49231\n/devtools/browser/stale-snapshot\n"
+    )
     monkeypatch.setattr(daemon, "AUTOMATION_PROFILE", profile)
     monkeypatch.setattr(daemon, "_port_in_use", lambda _port: True)
     monkeypatch.setattr(daemon, "_free_port", lambda: 49231)
     monkeypatch.setattr(daemon, "_automation_chrome_binary", lambda: "/mock/chrome")
     monkeypatch.setattr(daemon, "_profile_process_owns", lambda *_args: True)
+    monkeypatch.setattr(daemon, "_devtools_active_port_snapshot",
+                        lambda _profile: (1, 2, 3, 45,
+                                          b"49231\n/devtools/browser/stale-snapshot\n",
+                                          "49231", "/devtools/browser/stale-snapshot"))
+    monkeypatch.setattr(daemon, "_endpoint_owned_by_profile", lambda *_a, **_k: False)
     monkeypatch.setattr(
         daemon, "_json_version_ws", lambda _port: "ws://127.0.0.1:49231/devtools/browser/other"
     )
@@ -289,6 +298,56 @@ def test_automation_launch_rejects_unrelated_listener(monkeypatch, tmp_path):
     monkeypatch.setattr(daemon.subprocess, "Popen", lambda *_args, **_kwargs: RunningChild())
 
     assert daemon.launch_automation_chrome() is None
+
+
+@pytest.mark.parametrize("payload", [[], "not-json-object", {"webSocketDebuggerUrl": 1}, {}])
+def test_json_version_rejects_non_object_or_invalid_websocket_field(
+    monkeypatch, payload
+):
+    response = MagicMock()
+    response.read.return_value = daemon.json.dumps(payload).encode()
+    response.__enter__.return_value = response
+    monkeypatch.setattr(daemon.urllib.request, "urlopen", lambda *_a, **_k: response)
+    assert daemon._json_version_ws(49231) is None
+
+
+@pytest.mark.parametrize(
+    ("profile_name", "executable_name"),
+    [("Chrome", "Google Chrome"), ("Chrome Beta", "Google Chrome Beta"),
+     ("Chrome Dev", "Google Chrome Dev"), ("Chrome Canary", "Google Chrome Canary")],
+)
+def test_default_chrome_profiles_allow_omitted_profile_switch(
+    monkeypatch, tmp_path, profile_name, executable_name
+):
+    root = tmp_path / "Library/Application Support/Google" / profile_name
+    root.mkdir(parents=True)
+    monkeypatch.setattr(daemon.Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(daemon.platform, "system", lambda: "Darwin")
+    executable = f"/Applications/{executable_name}.app/Contents/MacOS/{executable_name}"
+    monkeypatch.setattr(daemon, "_trusted_browser_executable", lambda _exe: True)
+    monkeypatch.setattr(daemon, "_process_args", lambda _pid: [executable])
+    (root / "SingletonLock").symlink_to("host-77")
+    assert daemon._profile_browser_pid(root) == 77
+
+
+def test_default_profile_does_not_accept_another_browser_or_profile_switch(
+    monkeypatch, tmp_path
+):
+    profile = tmp_path / "Library/Application Support/Google/Chrome"
+    profile.mkdir(parents=True)
+    (profile / "SingletonLock").symlink_to("host-77")
+    monkeypatch.setattr(daemon.Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(daemon.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(daemon, "_trusted_browser_executable", lambda _exe: True)
+    monkeypatch.setattr(daemon, "_process_args", lambda _pid: [
+        "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"
+    ])
+    assert daemon._profile_browser_pid(profile) is None
+    monkeypatch.setattr(daemon, "_process_args", lambda _pid: [
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        f"--user-data-dir={tmp_path / 'other'}",
+    ])
+    assert daemon._profile_browser_pid(profile) is None
 
 
 def test_automation_launch_stops_polling_when_child_exits(monkeypatch, tmp_path):
@@ -632,6 +691,69 @@ def test_linux_resolved_chrome_image_requires_google_chrome_package(monkeypatch)
     monkeypatch.setattr(daemon.subprocess, "check_output", package_owner)
     assert daemon._trusted_browser_executable("/opt/google/chrome/chrome")
     assert not daemon._trusted_browser_executable("/opt/google/chrome/powershell")
+
+
+def test_linux_packaged_brave_alias_is_recognized(monkeypatch):
+    monkeypatch.setattr(daemon.platform, "system", lambda: "Linux")
+
+    def package_owner(command, **_kwargs):
+        if command[0] == "dpkg-query" and command[-1] == "/usr/bin/brave":
+            return "brave-browser: /usr/bin/brave"
+        raise daemon.subprocess.CalledProcessError(1, command)
+
+    monkeypatch.setattr(daemon.subprocess, "check_output", package_owner)
+    assert daemon._trusted_browser_executable("/usr/bin/brave")
+
+
+@pytest.mark.parametrize(
+    ("identifier", "team", "image"),
+    [
+        ("ai.perplexity.comet", "7S8W4W365S", "Comet"),
+        ("ai.perplexity.comet-beta", "7S8W4W365S", "Comet Beta"),
+        ("ai.perplexity.comet-canary", "7S8W4W365S", "Comet Canary"),
+        ("company.thebrowser.Browser", "S6N382Y83G", "Arc"),
+        ("company.thebrowser.dia", "S6N382Y83G", "Dia"),
+        ("com.google.Chrome.beta", "EQHXZ8M8AV", "Google Chrome Beta"),
+        ("com.google.Chrome.dev", "EQHXZ8M8AV", "Google Chrome Dev"),
+        ("com.microsoft.edgemac.canary", "UBF8T346G9", "Microsoft Edge Canary"),
+        ("com.brave.Browser.beta", "K8S9R7G5K2", "Brave Browser"),
+        ("com.brave.Browser.nightly", "K8S9R7G5K2", "Brave Browser"),
+    ],
+)
+def test_macos_trust_accepts_discovered_browser_identities(
+    monkeypatch, identifier, team, image
+):
+    monkeypatch.setattr(daemon.platform, "system", lambda: "Darwin")
+
+    def codesign(command, **_kwargs):
+        if "--verify" in command:
+            return SimpleNamespace(returncode=0)
+        return f"Identifier={identifier}\nTeamIdentifier={team}\n"
+
+    monkeypatch.setattr(daemon.subprocess, "run", codesign)
+    monkeypatch.setattr(daemon.subprocess, "check_output", codesign)
+    executable = f"/Applications/{image}.app/Contents/MacOS/{image}"
+    assert daemon._trusted_browser_executable(executable)
+
+
+def test_explicit_cdp_url_discovers_and_validates_isolated_profile(
+    monkeypatch, tmp_path
+):
+    profile = tmp_path / "isolated" / "chrome-data"
+    profile.mkdir(parents=True)
+    (profile / "DevToolsActivePort").write_text(
+        "49231\n/devtools/browser/isolated-owner\n"
+    )
+    monkeypatch.setattr(daemon, "PROFILES", [])
+    monkeypatch.setattr(daemon, "AUTOMATION_PROFILE", tmp_path / "other-profile")
+    monkeypatch.setattr(daemon, "_listener_pids", lambda _port: {777})
+    monkeypatch.setattr(daemon, "_process_args", lambda _pid: [
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        f"--user-data-dir={profile}", "--remote-debugging-port=49231",
+    ])
+    monkeypatch.setattr(daemon, "_trusted_browser_executable", lambda _exe: True)
+    snapshots = daemon._http_endpoint_snapshots("http://127.0.0.1:49231")
+    assert [base for base, _snapshot in snapshots] == [profile.resolve()]
 
 
 def test_macos_executable_trust_requires_valid_expected_signer(monkeypatch):

@@ -50,8 +50,12 @@ PID = str(ipc.pid_path(NAME))
 BUF = 500
 _MAC_PROFILES = (
     "Library/Application Support/Google/Chrome",
+    "Library/Application Support/Google/Chrome Beta",
+    "Library/Application Support/Google/Chrome Dev",
     "Library/Application Support/Google/Chrome Canary",
     "Library/Application Support/Comet",
+    "Library/Application Support/Comet Beta",
+    "Library/Application Support/Comet Canary",
     "Library/Application Support/Arc/User Data",
     "Library/Application Support/Dia/User Data",
     "Library/Application Support/Microsoft Edge",
@@ -59,6 +63,8 @@ _MAC_PROFILES = (
     "Library/Application Support/Microsoft Edge Dev",
     "Library/Application Support/Microsoft Edge Canary",
     "Library/Application Support/BraveSoftware/Brave-Browser",
+    "Library/Application Support/BraveSoftware/Brave-Browser-Beta",
+    "Library/Application Support/BraveSoftware/Brave-Browser-Nightly",
     "Library/Application Support/BraveSoftware/Brave-Origin",
 )
 _LINUX_PROFILES = (
@@ -331,10 +337,18 @@ def _trusted_browser_executable(executable):
             "com.google.Chrome.beta": "EQHXZ8M8AV",
             "com.google.Chrome.canary": "EQHXZ8M8AV",
             "com.google.Chrome.dev": "EQHXZ8M8AV",
+            "ai.perplexity.comet": "7S8W4W365S",
+            "ai.perplexity.comet-beta": "7S8W4W365S",
+            "ai.perplexity.comet-canary": "7S8W4W365S",
+            "company.thebrowser.Browser": "S6N382Y83G",
+            "company.thebrowser.dia": "S6N382Y83G",
             "com.microsoft.edgemac": "UBF8T346G9",
             "com.microsoft.edgemac.beta": "UBF8T346G9",
             "com.microsoft.edgemac.dev": "UBF8T346G9",
+            "com.microsoft.edgemac.canary": "UBF8T346G9",
             "com.brave.Browser": "K8S9R7G5K2",
+            "com.brave.Browser.beta": "K8S9R7G5K2",
+            "com.brave.Browser.nightly": "K8S9R7G5K2",
         }
         try:
             subprocess.run(["/usr/bin/codesign", "--verify", "--deep", "--strict", str(path)],
@@ -347,13 +361,21 @@ def _trusted_browser_executable(executable):
             identifier = fields.get("Identifier")
             image_names = {
                 "com.google.Chrome": {"google chrome"},
-                "com.google.Chrome.beta": {"google chrome"},
-                "com.google.Chrome.canary": {"google chrome"},
-                "com.google.Chrome.dev": {"google chrome"},
+                "com.google.Chrome.beta": {"google chrome beta"},
+                "com.google.Chrome.canary": {"google chrome canary"},
+                "com.google.Chrome.dev": {"google chrome dev"},
                 "com.microsoft.edgemac": {"microsoft edge"},
-                "com.microsoft.edgemac.beta": {"microsoft edge"},
-                "com.microsoft.edgemac.dev": {"microsoft edge"},
+                "com.microsoft.edgemac.beta": {"microsoft edge beta"},
+                "com.microsoft.edgemac.dev": {"microsoft edge dev"},
+                "com.microsoft.edgemac.canary": {"microsoft edge canary"},
                 "com.brave.Browser": {"brave browser"},
+                "com.brave.Browser.beta": {"brave browser"},
+                "com.brave.Browser.nightly": {"brave browser"},
+                "ai.perplexity.comet": {"comet"},
+                "ai.perplexity.comet-beta": {"comet beta"},
+                "ai.perplexity.comet-canary": {"comet canary"},
+                "company.thebrowser.Browser": {"arc"},
+                "company.thebrowser.dia": {"dia"},
             }
             return (trusted_signers.get(identifier) == fields.get("TeamIdentifier")
                     and path.name.casefold() in image_names.get(identifier, set()))
@@ -397,7 +419,7 @@ def _trusted_browser_executable(executable):
         browser_images = {
             "google-chrome": {"chrome", "google-chrome", "google-chrome-stable"},
             "chromium": {"chromium", "chromium-browser"},
-            "brave-browser": {"brave-browser"},
+            "brave-browser": {"brave-browser", "brave"},
             "microsoft-edge": {"microsoft-edge", "msedge"},
         }
         image = path.name.casefold()
@@ -516,9 +538,32 @@ def _profile_browser_pid(base, expected_pid=None):
         return None
     if not _trusted_browser_executable(args[0]):
         return None
-    if not _profile_argument_matches(args[1:], base):
+    profile_matches = _profile_argument_matches(args[1:], base)
+    if not profile_matches and not _default_profile_matches(args[0], args[1:], base):
         return None
     return pid
+
+
+def _default_profile_matches(executable, args, base):
+    """Allow Chromium's omitted profile switch only for its known default data dir."""
+    if any(not isinstance(arg, str) or arg != arg.strip() for arg in args):
+        return False
+    if any(arg.lstrip("-/").split("=", 1)[0].casefold() == "user-data-dir" for arg in args):
+        return False
+    executable_name = Path(executable).name.casefold()
+    defaults = {
+        "Chrome": "google chrome",
+        "Chrome Beta": "google chrome beta",
+        "Chrome Dev": "google chrome dev",
+        "Chrome Canary": "google chrome canary",
+    }
+    expected_image = defaults.get(Path(base).name)
+    expected_profile = Path.home() / "Library/Application Support/Google" / Path(base).name
+    return bool(
+        expected_image
+        and executable_name == expected_image
+        and Path(base).resolve() == expected_profile.resolve()
+    )
 
 
 def _endpoint_owned_by_profile(
@@ -678,11 +723,47 @@ def _http_endpoint_snapshots(http_url):
             loopback = host.lower() == "localhost"
         if not loopback:
             return []
-        return [(base, snapshot) for base in [*PROFILES, AUTOMATION_PROFILE]
+        candidates = [*PROFILES, AUTOMATION_PROFILE]
+        # BU_CDP_URL may target an isolated profile outside the discovery list.
+        # Derive it only from the process listening on this endpoint, after
+        # verifying its browser executable and unambiguous profile argument.
+        for pid in _listener_pids(parsed.port):
+            args = _process_args(pid)
+            if not args or not _trusted_browser_executable(args[0]):
+                continue
+            profile_arg = _profile_argument_value(args[1:])
+            if profile_arg:
+                candidates.append(Path(profile_arg))
+        unique = dict.fromkeys(Path(base).resolve() for base in candidates)
+        return [(base, snapshot) for base in unique
                 if (snapshot := _devtools_active_port_snapshot(base))
                 and snapshot[5] == str(parsed.port)]
     except (TypeError, ValueError):
         return []
+
+
+def _profile_argument_value(args):
+    """Return one canonical --user-data-dir value; reject ambiguous argv."""
+    values = []
+    for arg in args:
+        if not isinstance(arg, str) or arg != arg.strip():
+            return None
+        if arg == "--":
+            break
+        name = arg.lstrip("-/").split("=", 1)[0].casefold()
+        if name == "user-data-dir":
+            if not arg.startswith("--user-data-dir=") or not arg.partition("=")[2]:
+                return None
+            values.append(arg.partition("=")[2])
+    return str(Path(values[0]).expanduser().resolve()) if len(values) == 1 else None
+
+
+def _websocket_url(payload):
+    """Read a WebSocket endpoint only from a JSON object with a string field."""
+    if not isinstance(payload, dict):
+        return None
+    ws = payload.get("webSocketDebuggerUrl")
+    return ws if isinstance(ws, str) else None
 
 
 def _http_endpoint_owned(http_url, ws_url, snapshots):
@@ -720,7 +801,7 @@ AUTOMATION_PORT = 9223
 def _json_version_ws(port):
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=1) as r:
-            return json.loads(r.read())["webSocketDebuggerUrl"]
+            return _websocket_url(json.loads(r.read()))
     except urllib.error.HTTPError as e:
         if e.code == 403:
             raise RuntimeError("permission-blocked: Chrome is reachable, but the per-session Allow remote debugging popup has not been accepted")
@@ -822,8 +903,8 @@ def get_ws_url():
         while time.time() < deadline:
             snapshots = _http_endpoint_snapshots(url)
             try:
-                ws = json.loads(urllib.request.urlopen(f"{base_url}/json/version", timeout=5).read())["webSocketDebuggerUrl"]
-                if isinstance(ws, str) and _http_endpoint_owned(url, ws, snapshots):
+                ws = _websocket_url(json.loads(urllib.request.urlopen(f"{base_url}/json/version", timeout=5).read()))
+                if ws and _http_endpoint_owned(url, ws, snapshots):
                     return ws
                 last_err = RuntimeError("endpoint ownership could not be verified")
             except urllib.error.HTTPError as e:
@@ -876,12 +957,12 @@ def get_ws_url():
             # with a different --user-data-dir on the same port, that file is left behind
             # with a stale browser UUID and the WS upgrade returns 404.
             try:
-                ws = json.loads(
+                ws = _websocket_url(json.loads(
                     urllib.request.urlopen(
                         f"http://127.0.0.1:{port}/json/version", timeout=1
                     ).read()
-                )["webSocketDebuggerUrl"]
-                if isinstance(ws, str) and _endpoint_owned_by_profile(base, port, ws, snapshot):
+                ))
+                if ws and _endpoint_owned_by_profile(base, port, ws, snapshot):
                     return ws
             except urllib.error.HTTPError as e:
                 if e.code == 403:
@@ -916,8 +997,8 @@ def get_ws_url():
                      and snapshot[5] == str(probe_port)]
         try:
             with urllib.request.urlopen(f"http://127.0.0.1:{probe_port}/json/version", timeout=1) as r:
-                ws = json.loads(r.read())["webSocketDebuggerUrl"]
-                owned = isinstance(ws, str) and any(
+                ws = _websocket_url(json.loads(r.read()))
+                owned = bool(ws) and any(
                     _endpoint_owned_by_profile(base, str(probe_port), ws, snapshot)
                     for base, snapshot in snapshots
                 )

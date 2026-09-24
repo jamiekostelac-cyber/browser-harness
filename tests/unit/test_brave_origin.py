@@ -1,6 +1,7 @@
 """Rudi's macOS-only discovery failure; no real browser is launched."""
 import os
 from types import SimpleNamespace
+from unittest.mock import Mock
 from urllib.error import HTTPError
 
 import pytest
@@ -35,9 +36,8 @@ def test_origin_port_discovery_keeps_permission_gate(monkeypatch, origin_profile
     monkeypatch.delenv("BU_CDP_URL", raising=False)
     monkeypatch.setattr(daemon, "REMOTE_ID", None)
     monkeypatch.setattr(daemon, "_profile_process_owns", lambda base: base == origin_profile)
-    monkeypatch.setattr(
-        daemon, "_endpoint_owned_by_profile", lambda *_args, **_kwargs: True
-    )
+    owns_endpoint = Mock(return_value=True)
+    monkeypatch.setattr(daemon, "_endpoint_owned_by_profile", owns_endpoint)
     monkeypatch.setattr(
         daemon, "_devtools_active_port_snapshot",
         lambda _base: (0, 1, 0, 50, b"9222\n/devtools/browser/origin\n", "9222", "/devtools/browser/origin"),
@@ -53,6 +53,7 @@ def test_origin_port_discovery_keeps_permission_gate(monkeypatch, origin_profile
             daemon.get_ws_url()
     else:
         assert daemon.get_ws_url() == "ws://127.0.0.1:9222/devtools/browser/origin"
+        owns_endpoint.assert_called_once()
 
 
 def test_origin_relaunch_uses_origin_not_regular_brave(monkeypatch, origin_profile):
