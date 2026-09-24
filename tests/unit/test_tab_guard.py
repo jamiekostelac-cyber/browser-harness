@@ -2116,6 +2116,7 @@ def test_pending_detached_sessions_are_bounded_revoked_and_reset_pruned(daemon_b
     for i in range(300):
         d._record_browser_lifecycle_event("Target.detachedFromTarget", {"sessionId": f"S{i}"})
     assert len(d._pending_detached_sessions) == 256
+    assert d._pending_detached_sessions_overflowed is True
     assert "S0" not in d._pending_detached_sessions
     assert "S299" in d._pending_detached_sessions
     d._revoke_event_ownership({"S299"})
@@ -2127,6 +2128,7 @@ def test_pending_detached_sessions_are_bounded_revoked_and_reset_pruned(daemon_b
     }))
     assert response["tab_guard"] == "ok"
     assert d._pending_detached_sessions == {}
+    assert d._pending_detached_sessions_overflowed is False
 
 
 def test_delayed_old_run_reset_cannot_revoke_newer_run(daemon_bridge):
@@ -2254,6 +2256,48 @@ def test_detach_before_attach_response_rejects_late_session_registration(daemon_
     assert "SESSION-LATE" not in d._guarded_sessions
     assert "SESSION-LATE" not in d._document_state
     assert "SESSION-LATE" in d._revoked_sessions
+
+
+def test_pending_detach_overflow_rejects_evicted_session_attach(daemon_bridge):
+    d, calls = daemon_bridge
+    request = _guarded_dispatch_request(d, "Target.attachToTarget", {"targetId": "MINE"})
+    request["session_id"] = None
+    request["tab_guard_session_id"] = None
+    request["tab_guard_document_generation"] = None
+    request["tab_guard_url"] = "https://owned.example/"
+    request["tab_guard"]["sessions"] = []
+    d._session_targets.clear()
+    d._guarded_sessions.clear()
+    d._document_state.clear()
+
+    async def attach_response(method, params=None, session_id=None):
+        calls.append((method, params, session_id))
+        if method == "Target.getTargetInfo":
+            return {"targetInfo": {"type": "page", "targetId": "MINE",
+                                   "url": "https://owned.example/", "title": "Owned"}}
+        return {"sessionId": "SESSION-EVICTED"}
+
+    d.cdp.send_raw = attach_response
+    for i in range(257):
+        d._record_browser_lifecycle_event(
+            "Target.detachedFromTarget",
+            {"sessionId": "SESSION-EVICTED" if i == 0 else f"SESSION-{i}"},
+        )
+
+    assert len(d._pending_detached_sessions) == 256
+    assert "SESSION-EVICTED" not in d._pending_detached_sessions
+    assert d._pending_detached_sessions_overflowed is True
+
+    response = asyncio.run(d.handle(request))
+
+    assert response == {
+        "tab_guard": "refused",
+        "error": "pending detach history overflow; refusing attach registration",
+    }
+    assert "SESSION-EVICTED" not in d._session_targets
+    assert "SESSION-EVICTED" not in d._guarded_sessions
+    assert "SESSION-EVICTED" not in d._document_state
+    assert "SESSION-EVICTED" in d._revoked_sessions
 
 
 @pytest.mark.parametrize("method", [

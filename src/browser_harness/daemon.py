@@ -509,6 +509,7 @@ class Daemon:
         self._revoked_sessions = set()
         # Ordered map gives duplicate suppression plus bounded oldest-first pruning.
         self._pending_detached_sessions = {}
+        self._pending_detached_sessions_overflowed = False
         self._marker_tasks = set()
         self.events = deque(maxlen=BUF)
         self._event_provenance = deque(maxlen=BUF)
@@ -976,10 +977,14 @@ class Daemon:
                 if sid in self._session_targets or sid in self._guarded_sessions:
                     self._revoke_event_ownership({sid})
                 else:
+                    if (sid not in self._pending_detached_sessions
+                            and len(self._pending_detached_sessions) >= 256):
+                        self._pending_detached_sessions_overflowed = True
+                        self._pending_detached_sessions.pop(
+                            next(iter(self._pending_detached_sessions))
+                        )
                     self._pending_detached_sessions.pop(sid, None)
                     self._pending_detached_sessions[sid] = None
-                    if len(self._pending_detached_sessions) > 256:
-                        self._pending_detached_sessions.pop(next(iter(self._pending_detached_sessions)))
         elif method == "Target.targetDestroyed":
             target = params.get("targetId")
             if isinstance(target, str) and target in self._guarded_targets:
@@ -1224,6 +1229,7 @@ class Daemon:
             self._guarded_targets.clear()
             self._guarded_contexts.clear()
             self._pending_detached_sessions.clear()
+            self._pending_detached_sessions_overflowed = False
             self._session_targets = {
                 sid: target for sid, target in self._session_targets.items()
                 if sid not in revoked_sessions and target not in revoked_targets
@@ -1642,6 +1648,11 @@ class Daemon:
                 attached_session = result.get("sessionId")
                 target_id = params.get("targetId")
                 if attached_session and target_id:
+                    if self._pending_detached_sessions_overflowed:
+                        self._revoked_sessions.add(attached_session)
+                        return _guard_refusal(
+                            "pending detach history overflow; refusing attach registration"
+                        )
                     if attached_session in self._pending_detached_sessions:
                         self._pending_detached_sessions.pop(attached_session, None)
                         self._revoked_sessions.add(attached_session)
