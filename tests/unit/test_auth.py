@@ -47,6 +47,37 @@ def test_save_auth_record_does_not_harden_relative_parent(monkeypatch, tmp_path)
     assert (Path("."), True) not in calls
 
 
+def test_default_auth_save_does_not_harden_config_directory_twice(monkeypatch, tmp_path):
+    config = tmp_path / "config"
+    config.mkdir()
+    calls = []
+    monkeypatch.delenv("BH_AUTH_PATH", raising=False)
+    monkeypatch.setattr(auth.paths, "config_dir", lambda: config)
+    monkeypatch.setattr(
+        auth, "_chmod_private", lambda path, directory=False: calls.append((path, directory))
+    )
+
+    auth.save_auth_record(auth.AuthRecord(api_key="x" * 24))
+
+    assert not any(path == config and directory for path, directory in calls)
+    assert any(path.name.startswith("auth.json.") and path.name.endswith(".tmp")
+               for path, _directory in calls)
+
+
+def test_auth_path_override_hardens_its_parent(monkeypatch, tmp_path):
+    override = tmp_path / "custom" / "auth.json"
+    override.parent.mkdir()
+    calls = []
+    monkeypatch.setenv("BH_AUTH_PATH", str(override))
+    monkeypatch.setattr(
+        auth, "_chmod_private", lambda path, directory=False: calls.append((path, directory))
+    )
+
+    auth.save_auth_record(auth.AuthRecord(api_key="x" * 24))
+
+    assert (override.parent, True) in calls
+
+
 def test_write_private_json_hardens_before_writing_and_fails_closed(monkeypatch, tmp_path):
     path = tmp_path / "auth.json.tmp"
     key = "secret-api-key-that-must-not-be-written"
