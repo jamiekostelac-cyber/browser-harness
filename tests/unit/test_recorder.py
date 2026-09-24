@@ -135,12 +135,16 @@ def test_recent_event_keeps_auto_recording_fresh_after_old_frame(tmp_path, monke
     monkeypatch.setattr(recorder.time, "time", lambda: 1000)
     monkeypatch.setattr(recorder, "_auto_idle_gap", lambda: 180)
 
+    frame_scan_calls = []
+
     def _unexpected_frame_scan(self, pattern):
+        frame_scan_calls.append((self, pattern))
         raise AssertionError("fresh events must avoid scanning frame files")
 
     monkeypatch.setattr(recorder.Path, "glob", _unexpected_frame_scan)
 
     assert recorder._auto_is_stale(directory) is False
+    assert frame_scan_calls == []
 
 
 def test_recent_frame_keeps_auto_recording_fresh_after_stale_events(tmp_path, monkeypatch):
