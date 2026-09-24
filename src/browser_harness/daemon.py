@@ -1649,7 +1649,15 @@ class Daemon:
                 target_id = params.get("targetId")
                 if attached_session and target_id:
                     if self._pending_detached_sessions_overflowed:
-                        self._revoked_sessions.add(attached_session)
+                        try:
+                            await self.cdp.send_raw(
+                                "Target.detachFromTarget", {"sessionId": attached_session}
+                            )
+                        except Exception as exc:
+                            log(
+                                "tab guard failed to detach overflow-refused session "
+                                f"{attached_session}: {exc}"
+                            )
                         return _guard_refusal(
                             "pending detach history overflow; refusing attach registration"
                         )

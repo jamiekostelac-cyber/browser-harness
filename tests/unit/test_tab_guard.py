@@ -2258,7 +2258,7 @@ def test_detach_before_attach_response_rejects_late_session_registration(daemon_
     assert "SESSION-LATE" in d._revoked_sessions
 
 
-def test_pending_detach_overflow_rejects_evicted_session_attach(daemon_bridge):
+def test_pending_detach_overflow_detaches_repeated_refused_sessions_without_growth(daemon_bridge):
     d, calls = daemon_bridge
     request = _guarded_dispatch_request(d, "Target.attachToTarget", {"targetId": "MINE"})
     request["session_id"] = None
@@ -2270,34 +2270,48 @@ def test_pending_detach_overflow_rejects_evicted_session_attach(daemon_bridge):
     d._guarded_sessions.clear()
     d._document_state.clear()
 
+    attached = 0
+    detached = []
+
     async def attach_response(method, params=None, session_id=None):
+        nonlocal attached
         calls.append((method, params, session_id))
         if method == "Target.getTargetInfo":
             return {"targetInfo": {"type": "page", "targetId": "MINE",
                                    "url": "https://owned.example/", "title": "Owned"}}
-        return {"sessionId": "SESSION-EVICTED"}
+        if method == "Target.attachToTarget":
+            attached += 1
+            return {"sessionId": f"SESSION-EVICTED-{attached}"}
+        if method == "Target.detachFromTarget":
+            detached.append(params["sessionId"])
+            return {}
+        raise AssertionError(f"unexpected CDP method: {method}")
 
     d.cdp.send_raw = attach_response
     for i in range(257):
         d._record_browser_lifecycle_event(
             "Target.detachedFromTarget",
-            {"sessionId": "SESSION-EVICTED" if i == 0 else f"SESSION-{i}"},
+            {"sessionId": f"SESSION-{i}"},
         )
 
     assert len(d._pending_detached_sessions) == 256
-    assert "SESSION-EVICTED" not in d._pending_detached_sessions
+    assert "SESSION-0" not in d._pending_detached_sessions
     assert d._pending_detached_sessions_overflowed is True
 
-    response = asyncio.run(d.handle(request))
+    revoked_before = set(d._revoked_sessions)
+    for i in range(300):
+        response = asyncio.run(d.handle(request))
+        assert response == {
+            "tab_guard": "refused",
+            "error": "pending detach history overflow; refusing attach registration",
+        }
+        session = f"SESSION-EVICTED-{i + 1}"
+        assert session not in d._session_targets
+        assert session not in d._guarded_sessions
+        assert session not in d._document_state
 
-    assert response == {
-        "tab_guard": "refused",
-        "error": "pending detach history overflow; refusing attach registration",
-    }
-    assert "SESSION-EVICTED" not in d._session_targets
-    assert "SESSION-EVICTED" not in d._guarded_sessions
-    assert "SESSION-EVICTED" not in d._document_state
-    assert "SESSION-EVICTED" in d._revoked_sessions
+    assert detached == [f"SESSION-EVICTED-{i}" for i in range(1, 301)]
+    assert d._revoked_sessions == revoked_before
 
 
 @pytest.mark.parametrize("method", [
