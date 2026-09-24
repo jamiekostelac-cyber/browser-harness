@@ -2394,6 +2394,51 @@ def test_concurrent_overflow_attaches_cannot_overbook_cleanup_capacity(daemon_br
     assert d._overflow_cleanup_sessions == {"SESSION-OVERFLOW-1": None}
 
 
+def test_cancelled_overflow_attach_releases_cleanup_lock_and_slot(daemon_bridge):
+    d, _ = daemon_bridge
+    request = _guarded_dispatch_request(d, "Target.attachToTarget", {"targetId": "MINE"})
+    request["session_id"] = None
+    request["tab_guard_session_id"] = None
+    request["tab_guard_document_generation"] = None
+    request["tab_guard_url"] = "https://owned.example/"
+    request["tab_guard"]["sessions"] = []
+    d._session_targets.clear()
+    d._guarded_sessions.clear()
+    d._document_state.clear()
+    entered_attach = asyncio.Event()
+    wait_for_cancel = asyncio.Event()
+
+    async def pending_attach(method, params=None, session_id=None):
+        if method == "Target.getTargetInfo":
+            return {"targetInfo": {"type": "page", "targetId": "MINE",
+                                   "url": "https://owned.example/", "title": "Owned"}}
+        if method == "Target.attachToTarget":
+            entered_attach.set()
+            await wait_for_cancel.wait()
+            return {"sessionId": "SESSION-CANCELLED"}
+        raise AssertionError(f"unexpected CDP method: {method}")
+
+    d.cdp.send_raw = pending_attach
+    for i in range(257):
+        d._record_browser_lifecycle_event("Target.detachedFromTarget", {"sessionId": f"OLD-{i}"})
+
+    async def cancel_during_attach():
+        task = asyncio.create_task(d.handle(request))
+        await asyncio.wait_for(entered_attach.wait(), timeout=2)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        else:
+            raise AssertionError("cancelled attach unexpectedly completed")
+
+    asyncio.run(cancel_during_attach())
+
+    assert not d._overflow_attach_lock.locked()
+    assert d._guarded_attach_slots._value == 256
+
+
 def test_reset_does_not_hold_session_state_lock_while_retrying_cdp_cleanup(daemon_bridge):
     d, _ = daemon_bridge
     d._overflow_cleanup_sessions["SESSION-SLOW-CLEANUP"] = None

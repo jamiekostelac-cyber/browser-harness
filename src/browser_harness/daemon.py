@@ -1803,6 +1803,12 @@ class Daemon:
                 self._guarded_attach_slots.release()
                 guarded_attach_slot_held = False
             return {"result": result}
+        except asyncio.CancelledError:
+            if locals().get("overflow_attach_lock_held", False):
+                self._overflow_attach_lock.release()
+            if locals().get("guarded_attach_slot_held", False):
+                self._guarded_attach_slots.release()
+            raise
         except Exception as e:
             if locals().get("overflow_attach_lock_held", False):
                 self._overflow_attach_lock.release()
