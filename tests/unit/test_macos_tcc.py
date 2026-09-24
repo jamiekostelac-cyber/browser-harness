@@ -755,12 +755,15 @@ def test_explicit_cdp_url_discovers_and_validates_isolated_profile(
     monkeypatch.setattr(daemon, "_trusted_browser_executable", lambda _exe: True)
     snapshots = daemon._http_endpoint_snapshots("http://127.0.0.1:49231")
     assert [base for base, _snapshot in snapshots] == [profile.resolve()]
-    base, snapshot = snapshots[0]
-    assert daemon._endpoint_owned_by_profile(
-        base, "49231", "ws://127.0.0.1:49231/devtools/browser/isolated-owner", snapshot
+    assert daemon._http_endpoint_owned(
+        "http://127.0.0.1:49231",
+        "ws://127.0.0.1:49231/devtools/browser/isolated-owner",
+        snapshots,
     )
-    assert not daemon._endpoint_owned_by_profile(
-        base, "49231", "ws://127.0.0.1:49231/devtools/browser/foreign-owner", snapshot
+    assert not daemon._http_endpoint_owned(
+        "http://127.0.0.1:49231",
+        "ws://127.0.0.1:49231/devtools/browser/foreign-owner",
+        snapshots,
     )
 
 
