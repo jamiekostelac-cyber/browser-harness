@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import sys
+from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,29 @@ SPEC = importlib.util.spec_from_file_location("titan_browser_installer", INSTALL
 installer = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(installer)
+LAUNCHER_LOADER = SourceFileLoader("titan_browser_launcher", str(LAUNCHER_PATH))
+LAUNCHER_SPEC = importlib.util.spec_from_loader(LAUNCHER_LOADER.name, LAUNCHER_LOADER)
+launcher_module = importlib.util.module_from_spec(LAUNCHER_SPEC)
+assert LAUNCHER_SPEC.loader is not None
+LAUNCHER_SPEC.loader.exec_module(launcher_module)
+
+
+def _create_doctor_venv(share: Path, *, include_pinned_websockets: bool) -> Path:
+    executable = launcher_module._doctor_python_path(share)
+    executable.parent.mkdir(parents=True, exist_ok=True)
+    version_check = (
+        "if sys.argv[1:3] == ['-I', '-c'] and 'import websockets' in sys.argv[3]:\n"
+        f" print({('15.0.1' if include_pinned_websockets else '14.2')!r}); raise SystemExit(0)\n"
+    )
+    executable.write_text(
+        "#!" + sys.executable + "\n"
+        "import os,sys\n"
+        + version_check
+        + "os.execv(sys.executable,[sys.executable,*sys.argv[1:]])\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o700)
+    return executable
 
 
 def test_launcher_runs_from_unrelated_cwd_and_strips_shared_browser_environment(tmp_path):
@@ -94,6 +118,7 @@ def test_launcher_doctor_rejects_non_loopback_without_network(tmp_path):
         f"from pathlib import Path; Path({str(shadow_marker)!r}).write_text('shadowed')\n",
     )
     (shadow_package / "titan_doctor.py").write_text("raise SystemExit(0)\n")
+    doctor_python = _create_doctor_venv(share, include_pinned_websockets=True)
     environment = os.environ.copy()
     environment.pop("PYTHONPATH", None)
     result = subprocess.run(
@@ -107,6 +132,39 @@ def test_launcher_doctor_rejects_non_loopback_without_network(tmp_path):
     assert result.returncode == 1
     assert json.loads(result.stdout)["status"] == "INVALID_ENDPOINT"
     assert not shadow_marker.exists()
+    assert doctor_python.is_file()
+
+
+def test_launcher_doctor_fails_closed_when_pinned_dependency_is_missing(tmp_path):
+    share = tmp_path / ".local" / "share" / "titan-browser"
+    doctor_package = share / "src" / "browser_harness"
+    doctor_package.mkdir(parents=True)
+    shutil.copy2(ROOT / "src/browser_harness/__init__.py", doctor_package / "__init__.py")
+    shutil.copy2(ROOT / "src/browser_harness/titan_doctor.py", doctor_package / "titan_doctor.py")
+    launcher = tmp_path / ".local" / "bin" / "titan-browser"
+    launcher.parent.mkdir(parents=True)
+    shutil.copy2(LAUNCHER_PATH, launcher)
+    doctor_python = _create_doctor_venv(share, include_pinned_websockets=False)
+    environment = os.environ.copy()
+
+    result = subprocess.run(
+        [sys.executable, str(launcher), "doctor", "--endpoint", "http://example.invalid:9333", "--json"],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "doctor_dependencies_missing" in result.stderr
+    assert doctor_python.is_file()
+
+
+def test_doctor_python_path_uses_platform_specific_venv_layout(tmp_path):
+    assert launcher_module._doctor_python_path(tmp_path, platform="linux") == tmp_path / "doctor-venv/bin/python"
+    assert launcher_module._doctor_python_path(tmp_path, platform="darwin") == tmp_path / "doctor-venv/bin/python"
+    assert launcher_module._doctor_python_path(tmp_path, platform="win32") == tmp_path / "doctor-venv/Scripts/python.exe"
 
 
 def _build_plan(home: Path):
@@ -127,6 +185,15 @@ def test_installer_dry_run_is_read_only_and_includes_hash_receipt_and_rollback(t
     assert all(len(record["source_sha256"]) == 64 for record in plan["files"])
     assert len(plan["receipt_preview"]["files"]) == len(plan["files"])
     assert len(plan["rollback_plan"]) == len(plan["files"])
+    targets = installer.installation_targets(
+        home=home, codex_home=home / ".codex", platform=sys.platform,
+    )
+    doctor_requirements = next(item for item in targets if item[0] == "doctor_requirements")
+    assert doctor_requirements[2] == b"websockets==15.0.1\n"
+    assert doctor_requirements[3] == "scripts/titan-doctor-requirements.txt"
+    doctor_record = next(record for record in plan["files"] if record["role"] == "doctor_requirements")
+    assert doctor_record["target"] == str(home / ".local/share/titan-browser/doctor-requirements.txt")
+    assert doctor_record["source_sha256"] == installer._sha256(b"websockets==15.0.1\n")
     assert not home.exists()
 
 

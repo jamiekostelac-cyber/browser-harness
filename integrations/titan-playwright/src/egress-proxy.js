@@ -69,6 +69,7 @@ function readConnectPrelude(client, initial) {
     let timer;
     const finish = (error, result) => {
       clearTimeout(timer);
+      client.pause();
       client.off("data", onData);
       client.off("close", onClose);
       if (error) reject(error);

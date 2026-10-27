@@ -40,7 +40,8 @@ export function successReport(jobId: string, steps: StepResult[]) {
 
 export function failureReport(
   jobId: string,
-  error: "timeout" | "step_failed" | "browser_unavailable" | "context_failed" | "setup_failed" | "invalid_job",
+  error: "timeout" | "step_failed" | "browser_unavailable" | "context_failed" | "setup_failed"
+    | "network_destination_blocked" | "password_field_blocked" | "cleanup_failed" | "invalid_job",
   stepIndex: number | null,
   artifacts: { trace: string | null; video: string | null; directory?: string } | null,
 ) {

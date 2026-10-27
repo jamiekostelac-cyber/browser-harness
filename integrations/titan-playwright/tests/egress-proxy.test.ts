@@ -195,6 +195,77 @@ test("HTTPS CONNECT is restricted to the exact approved host and port", async ()
   }
 });
 
+test("CONNECT preserves ClientHello bytes received while DNS is pending", async () => {
+  const expected = Buffer.from([0x16, 0x03, 0x01, 0x00, 0x0a, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a]);
+  let releaseLookup!: (records: Array<{ address: string }>) => void;
+  let lookupStartedResolve!: () => void;
+  let payloadResolve!: () => void;
+  const pendingLookup = new Promise<Array<{ address: string }>>((resolve) => { releaseLookup = resolve; });
+  const lookupStarted = new Promise<void>((resolve) => { lookupStartedResolve = resolve; });
+  const payloadReceived = new Promise<void>((resolve) => { payloadResolve = resolve; });
+  let delivered = Buffer.alloc(0);
+  const target = net.createServer((socket) => {
+    socket.on("data", (chunk) => {
+      delivered = Buffer.concat([delivered, chunk]);
+      if (delivered.length >= expected.length) payloadResolve();
+    });
+  });
+  const localPort = await listen(target);
+  const proxy = await createEgressProxy({
+    allowedOrigins: ["https://public.example"],
+    lookupAddresses: async () => { lookupStartedResolve(); return pendingLookup; },
+    connect: () => net.createConnection({ host: "127.0.0.1", port: localPort }),
+  });
+  let clientSocket: net.Socket | undefined;
+  try {
+    const proxyAddress = new URL(proxy.url);
+    clientSocket = await new Promise<net.Socket>((resolve, reject) => {
+      const request = httpRequest({
+        hostname: proxyAddress.hostname,
+        port: Number(proxyAddress.port),
+        method: "CONNECT",
+        path: "public.example:443",
+      });
+      request.on("connect", (response, socket) => {
+        if (response.statusCode !== 200) {
+          socket.destroy();
+          reject(new Error(`unexpected CONNECT status ${response.statusCode}`));
+          return;
+        }
+        resolve(socket);
+      });
+      request.on("error", reject);
+      request.end();
+    });
+
+    clientSocket.write(expected.subarray(0, 3));
+    await lookupStarted;
+    await new Promise<void>((resolve, reject) => {
+      clientSocket?.write(expected.subarray(3), (error) => error ? reject(error) : resolve());
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    releaseLookup([{ address: "8.8.8.8" }]);
+    let payloadTimer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        payloadReceived,
+        new Promise<never>((_resolve, reject) => {
+          payloadTimer = setTimeout(() => reject(new Error("ClientHello was not forwarded")), 1_000);
+        }),
+      ]);
+    } finally {
+      if (payloadTimer) clearTimeout(payloadTimer);
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 25));
+    expect(delivered).toEqual(expected);
+  } finally {
+    clientSocket?.destroy();
+    const closing = once(target, "close");
+    target.close();
+    await Promise.all([closing, proxy.close()]);
+  }
+});
+
 test("CONNECT rejects HTTPS on an HTTP allowlist and malformed cleartext on HTTPS", async () => {
   const attempts: Array<{ allowed: string; authority: string; payload: Buffer }> = [
     {

@@ -40,6 +40,32 @@ def _node() -> str:
     return executable
 
 
+def _doctor_python_path(install_root: Path, platform: str | None = None) -> Path:
+    current_platform = sys.platform if platform is None else platform
+    suffix = Path("Scripts") / "python.exe" if current_platform == "win32" else Path("bin") / "python"
+    return install_root / "doctor-venv" / suffix
+
+
+def _doctor_python(install_root: Path, environment: dict[str, str]) -> Path | None:
+    executable = _doctor_python_path(install_root)
+    if not executable.is_file():
+        return None
+    try:
+        dependency_check = subprocess.run(
+            [str(executable), "-I", "-c", "import websockets,sys;sys.stdout.write(websockets.__version__)"],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if dependency_check.returncode or dependency_check.stdout.strip() != "15.0.1":
+        return None
+    return executable
+
+
 def _check_runner(node: str, package_dir: Path, environment: dict[str, str]) -> str | None:
     try:
         package = json.loads((package_dir / "package.json").read_text(encoding="utf-8"))
@@ -93,8 +119,15 @@ def main(argv: list[str] | None = None) -> int:
             "module=runpy.run_path(sys.argv.pop(1)); "
             "raise SystemExit(module['run_titan_doctor_cli'](sys.argv[1:]))"
         )
+        doctor_python = _doctor_python(REPO_ROOT, environment)
+        if doctor_python is None:
+            sys.stderr.write(
+                "titan-browser: doctor_dependencies_missing; provision the dedicated doctor venv "
+                "from doctor-requirements.txt as described in install.md\n"
+            )
+            return 2
         return subprocess.run(
-            [sys.executable, "-I", "-c", invocation, doctor, *rest],
+            [str(doctor_python), "-I", "-c", invocation, doctor, *rest],
             env=environment,
             check=False,
         ).returncode

@@ -28,6 +28,26 @@ The installer does not download Node, npm dependencies, or a browser. It writes 
 
 If a process stops during an apply, the next dry-run reports `recovery_required`. Do not apply a new plan until you run `--rollback` against that receipt and resolve any reported conflicts. Then generate and review a fresh plan. Rollback restores the prior receipt metadata exactly, or removes the receipt if the interrupted operation was the first install.
 
+## Provision the doctor runtime once
+
+The installer places `doctor-requirements.txt` in the install root and includes its hash in the reviewed manifest. It does not create a Python environment or install packages. `titan-browser doctor` uses only the dedicated `doctor-venv` below that root. It checks for `websockets==15.0.1` and fails closed if it is missing or mismatched. It never falls back to ambient Python or installs dependencies at runtime.
+
+On macOS and Linux, use the install root shown in the plan (normally `~/.local/share/titan-browser`):
+
+```bash
+TITAN_BROWSER_HOME="$HOME/.local/share/titan-browser"
+python3 -m venv "$TITAN_BROWSER_HOME/doctor-venv"
+"$TITAN_BROWSER_HOME/doctor-venv/bin/python" -m pip install --no-input --disable-pip-version-check -r "$TITAN_BROWSER_HOME/doctor-requirements.txt"
+```
+
+On Windows PowerShell, use the install root shown in the plan (normally `$env:LOCALAPPDATA\Titan\share\browser-harness`):
+
+```powershell
+$TitanBrowserHome = "$env:LOCALAPPDATA\Titan\share\browser-harness"
+py -3 -m venv "$TitanBrowserHome\doctor-venv"
+& "$TitanBrowserHome\doctor-venv\Scripts\python.exe" -m pip install --no-input --disable-pip-version-check -r "$TitanBrowserHome\doctor-requirements.txt"
+```
+
 ## Provision the isolated runner once
 
 Read the install plan to find the installed `integrations/titan-playwright/` directory. From that directory, provision the pinned Node dependency and Chromium browser explicitly:

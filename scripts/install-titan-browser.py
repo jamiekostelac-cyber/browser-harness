@@ -151,6 +151,12 @@ def installation_targets(
         (role, share_dir / "integrations" / "titan-playwright" / Path(relative).relative_to("integrations/titan-playwright"), source(relative), relative)
         for role, relative in share_sources
     ]
+    share_targets.append((
+        "doctor_requirements",
+        share_dir / "doctor-requirements.txt",
+        source("scripts/titan-doctor-requirements.txt"),
+        "scripts/titan-doctor-requirements.txt",
+    ))
     python_sources = [
         ("doctor_init", "src/browser_harness/__init__.py"),
         ("doctor_cli", "src/browser_harness/titan_doctor.py"),

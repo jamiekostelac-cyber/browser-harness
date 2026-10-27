@@ -121,7 +121,7 @@ test("redirect to an unapproved localhost port is blocked by the egress proxy", 
       testOnlyAllowLoopback: true,
       testOnlyCaptureProxy: (proxy: { wasBlocked?: () => boolean }) => { observedProxy = proxy; },
     } as never);
-    expect(result.status).toBe("failed");
+    expect(result).toMatchObject({ status: "failed", error: "network_destination_blocked", stepIndex: null });
     expect(destinationHits).toBe(0);
     expect(observedProxy?.wasBlocked?.()).toBe(true);
   } finally {
@@ -481,6 +481,44 @@ test("context startup failures are not reported as browser launch failures", asy
   }, await privateOptions(), testRuntime(runtime) as never);
 
   expect(result).toMatchObject({ status: "failed", error: "context_failed" });
+});
+
+test("password input is blocked with a distinct error and never filled", async () => {
+  let fillCalls = 0;
+  const page = {
+    video: () => null,
+    setDefaultTimeout: () => undefined,
+    setDefaultNavigationTimeout: () => undefined,
+    goto: async () => null,
+    url: () => "http://fixture.test/",
+    getByLabel: () => ({
+      getAttribute: async () => "password",
+      fill: async () => { fillCalls += 1; },
+    }),
+  };
+  const context = {
+    route: async () => undefined,
+    routeWebSocket: async () => undefined,
+    tracing: { start: async () => undefined, stop: async () => undefined },
+    newPage: async () => page,
+    close: async () => undefined,
+  };
+  const runtime = {
+    chromium: {
+      launch: async () => ({ newContext: async () => context, close: async () => undefined }),
+    },
+  };
+  const result = await runJob({
+    version: 1,
+    jobId: "password-field-blocked",
+    startUrl: "http://fixture.test/",
+    allowedOrigins: ["http://fixture.test"],
+    timeoutMs: 1_000,
+    steps: [{ type: "fill", label: "Contact name", value: "ordinary text" }],
+  }, await privateOptions(), testRuntime(runtime) as never);
+
+  expect(result).toMatchObject({ status: "failed", error: "password_field_blocked", stepIndex: 0 });
+  expect(fillCalls).toBe(0);
 });
 
 function cleanupRuntime({ browserClose = async () => undefined } = {}) {

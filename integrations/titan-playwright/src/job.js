@@ -18,15 +18,16 @@ const ROLES = new Set([
 ]);
 const SENSITIVE_LABEL = /password|passcode|secret|credential|token|api[ _-]?key/i;
 const CLEANUP_TIMEOUT_MS = 1_000;
+const BROWSER_CLOSE_TIMEOUT_MS = 5_000;
 const MAX_JOB_READ_CHUNK = 64 * 1024;
 
-async function boundedCleanup(operation) {
+async function boundedCleanup(operation, timeoutMs = CLEANUP_TIMEOUT_MS) {
   const outcome = Promise.resolve().then(operation);
   let timer;
   return Promise.race([
     outcome,
     new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new JobValidationError("cleanup_timeout")), CLEANUP_TIMEOUT_MS);
+      timer = setTimeout(() => reject(new JobValidationError("cleanup_timeout")), timeoutMs);
     }),
   ]).finally(() => clearTimeout(timer));
 }
@@ -265,7 +266,7 @@ export async function runJob(job, options = {}, runtime = null) {
           catch { deadlineCleanupFailed = true; }
           try {
             if (browser) {
-              await boundedCleanup(() => browser.close());
+              await boundedCleanup(() => browser.close(), BROWSER_CLOSE_TIMEOUT_MS);
               deadlineBrowserClosed = true;
             }
           }
@@ -357,7 +358,7 @@ export async function runJob(job, options = {}, runtime = null) {
     await boundedCleanup(() => context.tracing.stop());
     await boundedCleanup(() => context.close());
     context = null;
-    await boundedCleanup(() => browser.close());
+    await boundedCleanup(() => browser.close(), BROWSER_CLOSE_TIMEOUT_MS);
     browser = null;
     if (networkProxy) await boundedCleanup(() => networkProxy.close());
     networkProxy = null;
@@ -428,7 +429,7 @@ export async function runJob(job, options = {}, runtime = null) {
     if (browser) {
       if (!deadlineBrowserClosed) {
         try {
-          await boundedCleanup(() => browser.close());
+          await boundedCleanup(() => browser.close(), BROWSER_CLOSE_TIMEOUT_MS);
           deadlineBrowserClosed = true;
         } catch { cleanupFailed = true; }
       }
@@ -451,7 +452,7 @@ export async function runJob(job, options = {}, runtime = null) {
     catch { cleanupFailed = true; }
     const artifacts = { trace: tracePath, video: videoPath, directory: artifactDir };
     const failureCode = cleanupFailed ? "cleanup_failed"
-      : ["timeout", "browser_unavailable", "context_failed", "setup_failed"].includes(code)
+      : ["timeout", "browser_unavailable", "context_failed", "setup_failed", "network_destination_blocked", "password_field_blocked"].includes(code)
       ? code : "step_failed";
     return failureReport(jobId, failureCode, activeStep, artifacts);
   }

@@ -25,5 +25,6 @@ test("failure reports expose only bounded codes and artifact paths", () => {
     stepIndex: 2,
     artifacts: { trace: "/tmp/trace.zip", video: null },
   });
+  expect(failureReport("job-2", "cleanup_failed", null, null).error).toBe("cleanup_failed");
   expect(successReport("job-1", [{ index: 0, type: "snapshot", result: "ok" }]).status).toBe("ok");
 });
