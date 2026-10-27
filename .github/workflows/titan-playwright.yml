@@ -1,0 +1,46 @@
+name: Titan Playwright Linux
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  titan-playwright-linux:
+    name: titan-playwright-linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22.23.4"
+
+      - name: Install dependencies
+        working-directory: integrations/titan-playwright
+        run: npm ci
+
+      - name: Install Chromium
+        working-directory: integrations/titan-playwright
+        run: npx playwright install --with-deps chromium
+
+      - name: Record revision and runtime versions
+        working-directory: integrations/titan-playwright
+        run: |
+          echo "Commit: $GITHUB_SHA"
+          git rev-parse HEAD
+          node --version
+          npm --version
+          npx playwright --version
+          npx playwright install --list
+
+      - name: Run Playwright tests
+        working-directory: integrations/titan-playwright
+        run: npm test
