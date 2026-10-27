@@ -31,5 +31,13 @@ def test_packaged_skill_frontmatter_is_valid_simple_yaml():
 
     assert metadata == {
         "name": "browser-harness",
-        "description": "Control a real browser via CDP: clicking, typing, navigation, logged-in sessions, JS-rendered or bot-protected pages. Not for plain HTTP fetches of public content - use curl for those.",
+        "description": "Use Titan's isolated headless browser runner for new web automation. Use titan-doctor only to diagnose the local 9333 transport.",
     }
+
+
+def test_packaged_skill_scopes_shared_browser_to_legacy_workflows():
+    text = resources.files("browser_harness").joinpath("SKILL.md").read_text()
+    assert "Each job starts a new headless Playwright process" in text
+    assert "Legacy Shared-Browser Reference" in text
+    assert "Legacy browser-harness daemon and interaction references (not for new jobs)" in text
+    assert "chrome://inspect/#remote-debugging" in text

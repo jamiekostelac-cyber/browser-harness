@@ -72,6 +72,8 @@ def test_no_args_empty_stdin_prints_usage():
 
 def test_cloud_bootstrap_on_headless_server(monkeypatch):
     """No daemon, no local Chrome, API key + BU_AUTOSPAWN set -> auto-provision cloud daemon."""
+    monkeypatch.delenv("BU_CDP_URL", raising=False)
+    monkeypatch.delenv("BU_CDP_WS", raising=False)
     monkeypatch.setenv("BROWSER_USE_API_KEY", "test-key")
     monkeypatch.setenv("BU_AUTOSPAWN", "1")
     with patch.object(sys, "argv", ["browser-harness"]), \
@@ -267,6 +269,20 @@ def test_cli_doctor_fix_snap_invokes_guide():
             run.main()
     assert ei.value.code == 0
     m.assert_called_once()
+
+
+def test_titan_doctor_dispatches_before_any_daemon_or_telemetry(monkeypatch):
+    with patch.object(sys, "argv", ["browser-harness", "titan-doctor", "--json"]), \
+         patch("browser_harness.titan_doctor.run_titan_doctor_cli", return_value=0) as doctor, \
+         patch("browser_harness.run.ensure_daemon") as ensure_daemon, \
+         patch("browser_harness.run.telemetry.capture_cli_event") as telemetry, \
+         pytest.raises(SystemExit) as ei:
+        run.main()
+
+    assert ei.value.code == 0
+    doctor.assert_called_once_with(["--json"])
+    ensure_daemon.assert_not_called()
+    telemetry.assert_not_called()
 
 
 def test_cli_doctor_rejects_unknown_flags():

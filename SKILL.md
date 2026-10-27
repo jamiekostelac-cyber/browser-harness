@@ -1,21 +1,53 @@
 ---
 name: browser-harness
-description: "Control a real browser via CDP: clicking, typing, navigation, logged-in sessions, JS-rendered or bot-protected pages. Not for plain HTTP fetches of public content - use curl for those."
+description: "Use Titan's isolated headless browser runner for new web automation. Use titan-doctor only to diagnose the local 9333 transport."
 ---
 
 # browser-harness
 
-Direct browser control via CDP. For task-specific edits, use `agent-workspace/agent_helpers.py`. For setup, install, or connection problems, read https://github.com/browser-use/browser-harness/blob/main/install.md.
+Use Titan's isolated headless runner for new web automation. For setup or runner problems, read `install.md` and `docs/titan-browser-workflow.md`.
+
+## Default Routing
+
+- New navigation, extraction, and verification jobs use `titan-browser run <job.json>`. Each job starts a new headless Playwright process and isolated context. It never attaches to a visible browser, a user profile, or the shared 9333 endpoint.
+- Use `titan-browser doctor` only when diagnosing the 9333 transport. `READY` confirms transport and one Browser-domain CDP response; authentication is always `AUTH_NOT_CHECKED`.
+- Inspect the effective permission context of the specific runtime or task. Use only that runtime's supported request flow for local access. If it refuses, stop and report the refusal. Do not infer that changing a global setting will update an existing task, and do not use an undocumented broker or alternate browser as a fallback.
+- Browser extension/native-host access and the Codex in-app browser have separate permission boundaries. Diagnose each through its own supported interface. The shell doctor cannot validate them.
+- Preserve the explicitly scoped legacy Ads and GA4 workflows that are approved to use the shared 9333 Chrome endpoint. That exception does not apply to new general-purpose jobs.
 
 ## When Not to Use
 
-A basic fetch of public information needs no browser. If a plain HTTP request can read it — a public page, an API, docs — use `curl` or your fetch tool, and leave the browser alone. Use browser-harness when the task needs interaction (click, type, navigate), the user's logged-in session, JS rendering, or a bot-protected page. If a direct fetch fails or returns a shell page, then escalate to the browser.
+A basic fetch of public information needs no browser. If a plain HTTP request can read it — a public page, an API, docs — use `curl` or your fetch tool, and leave the browser alone. Use the headless runner when the task needs interaction (click, type, navigate), JS rendering, or a bot-protected page. Do not attach a new general-purpose job to the user's logged-in browser.
 
-Domain skills are off by default. Set `BH_DOMAIN_SKILLS=1` to enable them; see the bottom section.
+## Headless Runner
 
-**If `BH_DOMAIN_SKILLS=1` and the task is site-specific, read every file in the matching `$BH_AGENT_WORKSPACE/domain-skills/<site>/` directory before inventing an approach.**
+```bash
+titan-browser run /absolute/path/to/job.json
+```
 
-## Usage
+The job schema and allowed actions are documented in `docs/titan-browser-workflow.md`. The launcher works independently of the caller's current directory, clears shared-browser environment variables, and checks for installed dependencies without downloading them.
+
+## 9333 Diagnostics
+
+Only use this diagnostic when a task specifically needs to establish whether the local 9333 endpoint responds:
+
+```bash
+titan-browser doctor --endpoint http://127.0.0.1:9333 --json
+```
+
+The diagnostic does not launch Chrome, open a UI, list targets, navigate, or test login state. If task-local networking is refused, stop and report the actual permission error; do not change browser settings or ask the user to click a permission dialog as a workaround.
+
+## Legacy Shared-Browser Reference
+
+The following browser-harness CLI and CDP procedures are retained only for explicitly approved legacy Ads and GA4 callers. New general-purpose jobs must use the isolated runner above. Cloud access is not a fallback for refused task permissions.
+
+Do not start cloud or remote daemons for new jobs. Do not copy live profiles or cookies into a new browser. An explicitly supplied, private storage-state file is accepted only by the isolated runner and only under its documented validation rules.
+
+In this legacy section, browser-harness is used only when an approved Ads or GA4 workflow needs an interactive shared browser. Domain skills are off by default. Set `BH_DOMAIN_SKILLS=1` only for an approved legacy caller; see the bottom section.
+
+**If `BH_DOMAIN_SKILLS=1` and an approved legacy task is site-specific, read every file in the matching `$BH_AGENT_WORKSPACE/domain-skills/<site>/` directory before inventing an approach.**
+
+## Legacy browser-harness daemon and interaction references (not for new jobs)
 
 ```bash
 browser-harness <<'PY'
@@ -57,7 +89,7 @@ PY
   a cross-frame JS walker.
 - The normal local flow attaches to the running Chrome/Chromium CDP endpoint. No browser ids or local profile selection.
 
-## Local Chrome
+## Legacy Local Chrome and 9333 (Approved Ads/GA4 Only)
 
 The default daemon can keep many tabs and visit many sites; browser-harness has
 no per-site, screenshot, or result-count limit that requires a new daemon.
@@ -132,9 +164,9 @@ dialog. Their click completes the same handshake, so resume or poll the original
 process for success; do not rerun it or create a replacement daemon. If that
 Chrome build presents no approval dialog, the original command simply connects.
 
-## Remote Browsers
+## Legacy Remote Browsers (Existing Authorized Callers Only)
 
-Use Browser Use cloud for headless servers, parallel sub-agents, or isolated work.
+These cloud-daemon instructions apply only to existing callers already authorized to use Browser Use Cloud. New general-purpose jobs use the local isolated headless runner and do not silently switch to cloud access.
 
 Remote browsers require Browser Use Cloud authentication. Check
 `browser-harness auth status` before depending on them. `browser-harness auth
@@ -180,7 +212,7 @@ Do not start a remote daemon and then keep using the default daemon. Use the sam
 
 Cloud profile cookie sync reference: https://github.com/browser-use/browser-harness/blob/main/interaction-skills/profile-sync.md.
 
-## Page Workflow
+## Legacy CDP Page Workflow (Approved Ads/GA4 Only)
 
 - Prefer to find elements with the accessibility tree, not screenshots: `cdp("Accessibility.getFullAXTree")["nodes"]` has every element's role, name, and `backendDOMNodeId` — filter in Python before printing (it is thousands of nodes). Coordinates: `q = cdp("DOM.getBoxModel", backendNodeId=n)["model"]["content"]; x, y = sum(q[0::2])/4, sum(q[1::2])/4` (viewport px, ready for `click_at_xy`; negative/oversized means scroll first).
 - Clicking: AX node -> box center -> `click_at_xy(x, y)` -> verify with a targeted `js(...)`/`page_info()` check.
@@ -195,7 +227,7 @@ Cloud profile cookie sync reference: https://github.com/browser-use/browser-harn
   The second positional argument is a session ID, not a parameters dictionary.
   When targeting an explicit session, use `session_id="..."` alongside the keywords.
 
-## Recordings and Videos
+## Legacy Shared-Browser Recordings and Videos
 
 Fresh installs do not record. Users can enable local background traces:
 
@@ -224,7 +256,7 @@ captured. Never reenact a completed task. For a video, follow
 If sub-agents are available, they may handle post-production from the exact
 recording path while the main agent returns the task result.
 
-## Interaction Skills
+## Legacy Browser-Harness Interaction Skills
 
 If you get stuck on a browser mechanic, check https://github.com/browser-use/browser-harness/tree/main/interaction-skills.
 
@@ -247,7 +279,7 @@ If you get stuck on a browser mechanic, check https://github.com/browser-use/bro
 - uploads.md
 - viewport.md
 
-## Design Constraints
+## Legacy Daemon Design Constraints (Approved Callers Only)
 
 - Coordinate clicks default. CDP mouse events pass through iframes/shadow/cross-origin at the compositor level.
 - Keep the connection model simple: use the default daemon, `BU_NAME`, `BU_CDP_URL`, `BU_CDP_WS`, or `start_remote_daemon(...)`.
@@ -260,7 +292,7 @@ If you get stuck on a browser mechanic, check https://github.com/browser-use/bro
   that daemon or fails closed; it never auto-starts or discovers another Chrome.
 - Core helpers stay short. Put task-specific helper additions in `$BH_AGENT_WORKSPACE/agent_helpers.py`.
 
-## Gotchas
+## Legacy Daemon Gotchas (Approved Callers Only)
 
 - `chrome://inspect/#remote-debugging` must be enabled for local Chrome control.
 - On macOS, if local Chrome shows an "Allow remote debugging?" popup, call `mac-approve` once with the same `BU_NAME` while the original browser command waits. Do not poll or rerun the browser command; remote and cloud browsers do not use this helper.
@@ -269,7 +301,7 @@ If you get stuck on a browser mechanic, check https://github.com/browser-use/bro
 - `BU_CDP_URL` is an HTTP DevTools endpoint; the daemon resolves it to WebSocket.
 - Ask before leaving cloud browsers running; stop them with `stop_remote_daemon(name)` or `PATCH /browsers/{id} {"action":"stop"}`.
 
-## Domain Skills
+## Legacy Daemon Domain Skills
 
 Only applies when `BH_DOMAIN_SKILLS=1`. Otherwise ignore domain skills.
 
