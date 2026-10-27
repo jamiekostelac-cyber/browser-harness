@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""Stable, CWD-independent launcher for isolated Titan browser jobs."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+_SOURCE_ROOT = SCRIPT_DIR.parent
+if (_SOURCE_ROOT / "integrations" / "titan-playwright" / "src" / "job.js").is_file():
+    REPO_ROOT = _SOURCE_ROOT
+elif sys.platform == "win32":
+    REPO_ROOT = SCRIPT_DIR.parent / "share" / "browser-harness"
+else:
+    REPO_ROOT = SCRIPT_DIR.parent / "share" / "titan-browser"
+JOB_SCRIPT = REPO_ROOT / "integrations" / "titan-playwright" / "src" / "job.js"
+PRIVATE_FILES_SCRIPT = REPO_ROOT / "integrations" / "titan-playwright" / "src" / "private-files.js"
+
+
+def _isolated_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    for name in tuple(environment):
+        if name.startswith(("BU_", "BH_", "BROWSER_HARNESS_")) or name.upper() in {
+            "BROWSER_USE_API_KEY", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+        }:
+            environment.pop(name, None)
+    return environment
+
+
+def _node() -> str:
+    executable = shutil.which("node")
+    if not executable:
+        raise RuntimeError("node_not_found")
+    return executable
+
+
+def _doctor_python_path(install_root: Path, platform: str | None = None) -> Path:
+    current_platform = sys.platform if platform is None else platform
+    suffix = Path("Scripts") / "python.exe" if current_platform == "win32" else Path("bin") / "python"
+    return install_root / "doctor-venv" / suffix
+
+
+def _doctor_python(install_root: Path, environment: dict[str, str]) -> Path | None:
+    executable = _doctor_python_path(install_root)
+    if not executable.is_file():
+        return None
+    try:
+        dependency_check = subprocess.run(
+            [str(executable), "-I", "-c", "import websockets,sys;sys.stdout.write(websockets.__version__)"],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if dependency_check.returncode or dependency_check.stdout.strip() != "15.0.1":
+        return None
+    return executable
+
+
+def _check_runner(node: str, package_dir: Path, environment: dict[str, str]) -> str | None:
+    try:
+        package = json.loads((package_dir / "package.json").read_text(encoding="utf-8"))
+        installed = json.loads((package_dir / "node_modules" / "playwright" / "package.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return "runner_dependencies_missing"
+    if package.get("dependencies", {}).get("playwright") != "1.64.1" or installed.get("version") != "1.64.1":
+        return "runner_dependencies_invalid"
+    version = subprocess.run([node, "--version"], env=environment, capture_output=True, text=True, check=False)
+    match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", version.stdout.strip())
+    if version.returncode or not match or tuple(map(int, match.groups())) < (22, 18, 0):
+        return "node_version_unsupported"
+    browser = subprocess.run(
+        [node, "--input-type=module", "-e", "import {chromium} from 'playwright'; process.stdout.write(chromium.executablePath())"],
+        cwd=package_dir,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if browser.returncode or not browser.stdout.strip() or not Path(browser.stdout.strip()).is_file():
+        return "chromium_not_installed"
+    return None
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    if not args or args[0] not in {"run", "doctor", "cleanup"}:
+        sys.stderr.write("Usage: titan-browser run <job.json> [--storage-state <absolute-file>] | doctor [options] | cleanup\n")
+        return 2
+
+    command, rest = args[0], args[1:]
+    environment = _isolated_environment()
+    try:
+        if command == "run":
+            if sys.platform == "win32":
+                sys.stderr.write("titan-browser: secure_artifacts_unsupported on Windows; use macOS or Linux for isolated jobs\n")
+                return 2
+            node = _node()
+            package_dir = JOB_SCRIPT.parent.parent
+            issue = _check_runner(node, package_dir, environment)
+            if issue:
+                sys.stderr.write(f"titan-browser: {issue}; install pinned dependencies and Chromium in {package_dir}\n")
+                return 2
+            return subprocess.run([node, str(JOB_SCRIPT), *rest], env=environment, check=False).returncode
+        if command == "cleanup":
+            return subprocess.run([_node(), str(PRIVATE_FILES_SCRIPT), "cleanup"], env=environment, check=False).returncode
+        doctor = str(REPO_ROOT / "src" / "browser_harness" / "titan_doctor.py")
+        invocation = (
+            "import runpy,sys; "
+            "module=runpy.run_path(sys.argv.pop(1)); "
+            "raise SystemExit(module['run_titan_doctor_cli'](sys.argv[1:]))"
+        )
+        doctor_python = _doctor_python(REPO_ROOT, environment)
+        if doctor_python is None:
+            sys.stderr.write(
+                "titan-browser: doctor_dependencies_missing; provision the dedicated doctor venv "
+                "from doctor-requirements.txt as described in install.md\n"
+            )
+            return 2
+        return subprocess.run(
+            [str(doctor_python), "-I", "-c", invocation, doctor, *rest],
+            env=environment,
+            check=False,
+        ).returncode
+    except RuntimeError as error:
+        sys.stderr.write(f"titan-browser: {error}\n")
+        return 127
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

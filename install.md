@@ -1,36 +1,111 @@
 ---
 name: browser-install
-description: Install browser-harness and connect it to a browser fast.
+description: Install Titan's isolated headless runner and troubleshoot approved legacy browser-harness callers.
 ---
 
-# browser-harness install
+# Titan browser runner installation
 
-Use once. For browser work, read `SKILL.md`.
+New navigation, extraction, and verification jobs use `titan-browser run`. It starts a new headless Playwright process and fresh context. It never attaches to shared Chrome, 9333, or a user profile. Use `titan-browser doctor` only to diagnose the local 9333 transport. The doctor does not test login state or extension/in-app-browser permissions.
 
-## Fast Path
+## Dry-run install
+
+From the repository checkout, write the dry-run plan to a file, then inspect every destination, SHA-256 value, conflict, receipt, and rollback action:
+
+```bash
+python3 scripts/install-titan-browser.py --home "$HOME" --codex-home "${CODEX_HOME:-$HOME/.codex}" > /tmp/titan-browser-install-plan.json
+python3 -c 'import json; print(json.load(open("/tmp/titan-browser-install-plan.json"))["manifest_sha256"])'
+```
+
+The installer defaults to read-only dry-run. It registers Claude Code at `~/.claude/skills/browser-harness/` and Codex at `${CODEX_HOME:-~/.codex}/skills/browser-harness/`. It places the launcher on Unix-like systems at `~/.local/bin/titan-browser` and installs the pinned runner under `~/.local/share/titan-browser/`. On Windows it uses `%LOCALAPPDATA%\Titan\bin` and `%LOCALAPPDATA%\Titan\share\browser-harness`.
+
+Review the manifest and its hash. Apply requires both exact values and rejects changed sources or destinations:
+
+```bash
+python3 scripts/install-titan-browser.py --home "$HOME" --codex-home "${CODEX_HOME:-$HOME/.codex}" --apply --manifest /tmp/titan-browser-install-plan.json --manifest-sha256 <reviewed-hash>
+```
+
+The installer does not download Node, npm dependencies, or a browser. It writes a private receipt with hashes and backups for managed updates. `--rollback` restores/removes only files whose installed hash still matches the receipt; edited files are reported as conflicts and left alone. On Windows the launcher and doctor can be installed, but `run` fails closed because this version does not verify private artifact-directory ACLs. Isolated jobs are supported on macOS and Linux only.
+
+If a process stops during an apply, the next dry-run reports `recovery_required`. Do not apply a new plan until you run `--rollback` against that receipt and resolve any reported conflicts. Then generate and review a fresh plan. Rollback restores the prior receipt metadata exactly, or removes the receipt if the interrupted operation was the first install.
+
+## Provision the doctor runtime once
+
+The installer places `doctor-requirements.txt` in the install root and includes its hash in the reviewed manifest. It does not create a Python environment or install packages. `titan-browser doctor` uses only the dedicated `doctor-venv` below that root. It checks for `websockets==15.0.1` and fails closed if it is missing or mismatched. It never falls back to ambient Python or installs dependencies at runtime.
+
+On macOS and Linux, use the install root shown in the plan (normally `~/.local/share/titan-browser`):
+
+```bash
+TITAN_BROWSER_HOME="$HOME/.local/share/titan-browser"
+python3 -m venv "$TITAN_BROWSER_HOME/doctor-venv"
+"$TITAN_BROWSER_HOME/doctor-venv/bin/python" -m pip install --no-input --disable-pip-version-check -r "$TITAN_BROWSER_HOME/doctor-requirements.txt"
+```
+
+On Windows PowerShell, use the install root shown in the plan (normally `$env:LOCALAPPDATA\Titan\share\browser-harness`):
+
+```powershell
+$TitanBrowserHome = "$env:LOCALAPPDATA\Titan\share\browser-harness"
+py -3 -m venv "$TitanBrowserHome\doctor-venv"
+& "$TitanBrowserHome\doctor-venv\Scripts\python.exe" -m pip install --no-input --disable-pip-version-check -r "$TitanBrowserHome\doctor-requirements.txt"
+```
+
+## Provision the isolated runner once
+
+Read the install plan to find the installed `integrations/titan-playwright/` directory. From that directory, provision the pinned Node dependency and Chromium browser explicitly:
+
+```bash
+npm ci
+npx playwright install chromium
+```
+
+These commands may download package and browser files. The `titan-browser run` launcher never downloads dependencies or browsers. It checks Node 22.18+, Playwright 1.64.1, and the installed Chromium executable before running.
+
+Run a job from any current directory:
+
+```bash
+titan-browser run /absolute/path/to/job.json
+```
+
+An explicitly supplied `--storage-state` file must be absolute, a regular non-symlink owned by the current user, private to that user, and within the 5 MiB limit. The runner reads it without modifying or deleting it. On platforms where `O_NOFOLLOW` and owner/mode verification are unavailable, secure storage-state import is rejected.
+
+The job schema, retention policy, and troubleshooting steps are in `docs/titan-browser-workflow.md`.
+
+## Permission troubleshooting
+
+Inspect the effective permission context of the current runtime or task. Use only its documented permission request flow. If local access is refused, stop and report the refusal; do not claim that changing a global setting changes an already-running task. The shell doctor cannot diagnose an extension/native host or Codex in-app browser.
+
+For a read-only 9333 transport check:
+
+```bash
+titan-browser doctor --endpoint http://127.0.0.1:9333 --json
+```
+
+`READY` means only that `/json/version` and one `Browser.getVersion` request worked. The doctor always reports `AUTH_NOT_CHECKED`. It never starts Chrome, lists targets, opens UI, navigates, or reads cookies.
+
+Existing approved Ads and GA4 workflows that use shared 9333 remain on their scoped legacy path. Do not extend that path to new general-purpose work. The older `browser-harness` CLI, cloud-daemon commands, and recording controls remain available only to their existing authorized callers.
+
+## Legacy browser-harness CLI installation
+
+Use only for existing authorized legacy Ads and GA4 workflows. New jobs use the isolated Titan runner above.
+
+### Fast Path
 
 ```bash
 uv tool install --python 3.12 --upgrade --force browser-harness
-mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills/browser-harness"
-browser-harness skill > "${CODEX_HOME:-$HOME/.codex}/skills/browser-harness/SKILL.md"
-browser-harness <<'PY'
-print(page_info())
-PY
 ```
 
-If `page_info()` prints, configure recording consent below, then stop.
+This installs the legacy CLI only. It does not install Titan's headless runner. Do not overwrite the Titan skill with `browser-harness skill`; the skill is registered by the Titan installer above.
 
 `--python 3.12` prevents uv from selecting old releases that support older Python versions. `--upgrade --force` replaces any previous `browser-harness` tool install with the latest stable release. It does not uninstall unrelated commands such as `browser-use-Browser` or `browser-use-Terminal`.
 
-For Claude Code or other agents: install `browser-harness`, register a skill named `browser-harness`, use `browser-harness skill` as the body, and use this trigger:
+For an existing authorized legacy Ads or GA4 caller, use this scoped trigger for shared-browser steps:
 
 ```text
-Always use browser-harness for any web interaction: automation, scraping, testing, or site/app work.
+Use browser-harness shared-CDP steps only for the explicitly approved legacy Ads and GA4 workflows. Use `titan-browser run` for new general-purpose navigation, extraction, and verification jobs.
 ```
 
 If an old user-installed `browser` or `browser-use` skill is being picked instead, remove that stale skill directory manually. Do not edit bundled/vendor plugin caches.
 
-## Recording Consent
+### Recording Consent (Legacy Browser-Harness Only)
 
 Run `browser-harness recordings`. If it reports `(default)`, ask the user once:
 
@@ -43,7 +118,7 @@ Default to no. Run `browser-harness recordings enable` only after yes; otherwise
 run `browser-harness recordings disable`. Preserve an existing `(config)` or
 `(BH_RECORD)` preference during upgrades instead of asking again.
 
-## If Chrome Blocks It
+### If Chrome Blocks a Legacy Shared-Browser Connection
 
 In Chrome:
 
@@ -65,7 +140,7 @@ Chrome setup step; it is not exposed to the harness until CDP is available.
 The helper requires Accessibility permission for the app launching the CLI
 (for example Terminal, iTerm, Codex, or an IDE) in System Settings.
 
-## Cloud Browsers
+### Cloud Browsers (Existing Authorized Callers Only)
 
 Cloud is optional. Local Chrome does not need a Browser Use API key.
 
@@ -86,7 +161,7 @@ print(page_info())
 PY
 ```
 
-## If Still Broken
+### Legacy Browser-Harness Diagnostics
 
 ```bash
 browser-harness --doctor

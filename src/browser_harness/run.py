@@ -10,6 +10,13 @@ for _stream in (sys.stdout, sys.stderr):
         try: _stream.reconfigure(encoding="utf-8", errors="replace")
         except Exception: pass
 
+# The console entry point imports this module before calling main(). Dispatch
+# this command before importing admin/helpers, which load task configuration.
+if len(sys.argv) > 1 and sys.argv[1] == "titan-doctor":
+    from .titan_doctor import run_titan_doctor_cli
+
+    raise SystemExit(run_titan_doctor_cli(sys.argv[2:]))
+
 from .admin import (
     _version,
     NAME,
@@ -47,6 +54,7 @@ Helpers are pre-imported. The daemon auto-starts and connects to the running bro
 Commands:
   browser-harness --version        print the installed version
   browser-harness --doctor         diagnose install, daemon, and browser state
+  browser-harness titan-doctor     read-only Titan endpoint transport check
   browser-harness doctor           same as --doctor
   browser-harness doctor --json [--require-existing-daemon]
                                     print machine-readable runtime health
@@ -240,6 +248,11 @@ def _telemetry_browser(task):
 def main():
     global _helper_call_count
     args = sys.argv[1:]
+    # Keep direct calls (including tests and embedding) on the same isolated path.
+    if args and args[0] == "titan-doctor":
+        from .titan_doctor import run_titan_doctor_cli
+
+        raise SystemExit(run_titan_doctor_cli(args[1:]))
     if args and args[0] == "telemetry":
         sys.exit(telemetry.run_telemetry_cli(args[1:]))
     _helper_trace.clear()

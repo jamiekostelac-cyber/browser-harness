@@ -1,0 +1,21 @@
+{
+  "name": "@titan/browser-job",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "bin": {
+    "titan-browser-job": "src/job.js"
+  },
+  "scripts": {
+    "test": "playwright test"
+  },
+  "dependencies": {
+    "playwright": "1.64.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.64.1"
+  }
+}
