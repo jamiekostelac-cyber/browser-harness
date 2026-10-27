@@ -3,17 +3,28 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { createServer, type Server } from "node:http";
 import { createServer as createHttpsServer, type Server as HttpsServer } from "node:https";
+import { createServer as createTlsServer, type Server as TlsServer } from "node:tls";
 import { createHash } from "node:crypto";
+import { createSocket as createUdpSocket } from "node:dgram";
 import { execFile } from "node:child_process";
-import type { Socket } from "node:net";
+import { createServer as createNetServer, type Server as NetServer, type Socket } from "node:net";
 import { once } from "node:events";
 import { promisify } from "node:util";
+import { chromium, type Page } from "playwright";
 import { test, expect } from "@playwright/test";
 import { isPublicIPv4 } from "../src/egress-proxy.js";
-import { readJob, runJob, validateJob, JobValidationError } from "../src/job.js";
+import { CHROMIUM_LAUNCH_ARGS, readJob, runJob, validateJob, JobValidationError } from "../src/job.js";
 
 const testRoots: string[] = [];
 const execFileAsync = promisify(execFile);
+
+async function listenHttp(server: Server) {
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("HTTP fixture failed to bind");
+  return address.port;
+}
 
 async function privateOptions(options: Record<string, unknown> = {}) {
   const artifactRoot = await mkdtemp(path.join(tmpdir(), "titan-browser-test-"));
@@ -23,6 +34,237 @@ async function privateOptions(options: Record<string, unknown> = {}) {
 
 function testRuntime(runtime: Record<string, unknown>) {
   return { ...runtime, testOnlySkipNetworkPolicy: true };
+}
+
+async function startWebRtcFixture() {
+  const server = createServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+    response.end("<!doctype html><html><body><main>WebRTC transport fixture</main></body></html>");
+  });
+  const port = await listenHttp(server);
+  return { server, url: `http://127.0.0.1:${port}/` };
+}
+
+async function startOwnedStunListener() {
+  const socket = createUdpSocket("udp4");
+  let bindingRequests = 0;
+  socket.on("message", (message, remote) => {
+    if (!isStunRequest(message, 0x0001)) return;
+    bindingRequests += 1;
+    const response = Buffer.alloc(32);
+    response.writeUInt16BE(0x0101, 0);
+    response.writeUInt16BE(12, 2);
+    response.writeUInt32BE(0x2112a442, 4);
+    message.copy(response, 8, 8, 20);
+    response.writeUInt16BE(0x0020, 20);
+    response.writeUInt16BE(8, 22);
+    response.writeUInt16BE(1, 24);
+    response.writeUInt16BE(remote.port ^ 0x2112, 26);
+    response.writeUInt32BE(0x7f000001 ^ 0x2112a442, 28);
+    socket.send(response, remote.port, remote.address);
+  });
+  await new Promise<void>((resolve, reject) => {
+    socket.once("error", reject);
+    socket.bind(0, "127.0.0.1", resolve);
+  });
+  const address = socket.address();
+  return {
+    url: `stun:127.0.0.1:${address.port}`,
+    requests: () => bindingRequests,
+    close: () => new Promise<void>((resolve, reject) => socket.close((error) => error ? reject(error) : resolve())),
+  };
+}
+
+async function startOwnedTurnUdpListener() {
+  const socket = createUdpSocket("udp4");
+  let allocateRequests = 0;
+  socket.on("message", (message, remote) => {
+    if (!isStunRequest(message, 0x0003)) return;
+    allocateRequests += 1;
+    const attributes: Buffer[] = [];
+    const addAttribute = (type: number, value: Buffer) => {
+      const paddedLength = Math.ceil(value.length / 4) * 4;
+      const attribute = Buffer.alloc(4 + paddedLength);
+      attribute.writeUInt16BE(type, 0);
+      attribute.writeUInt16BE(value.length, 2);
+      value.copy(attribute, 4);
+      attributes.push(attribute);
+    };
+    addAttribute(0x0009, Buffer.concat([Buffer.from([0, 0, 4, 1]), Buffer.from("Unauthorized")]));
+    addAttribute(0x0014, Buffer.from("fixture"));
+    addAttribute(0x0015, Buffer.from("fixture-nonce"));
+    const body = Buffer.concat(attributes);
+    const response = Buffer.alloc(20 + body.length);
+    response.writeUInt16BE(0x0113, 0);
+    response.writeUInt16BE(body.length, 2);
+    response.writeUInt32BE(0x2112a442, 4);
+    message.copy(response, 8, 8, 20);
+    body.copy(response, 20);
+    socket.send(response, remote.port, remote.address);
+  });
+  await new Promise<void>((resolve, reject) => {
+    socket.once("error", reject);
+    socket.bind(0, "127.0.0.1", resolve);
+  });
+  return {
+    port: socket.address().port,
+    allocateRequests: () => allocateRequests,
+    close: () => new Promise<void>((resolve, reject) => socket.close((error) => error ? reject(error) : resolve())),
+  };
+}
+
+async function startOwnedTurnTcpListener() {
+  let connections = 0;
+  let allocateRequests = 0;
+  const sockets = new Set<Socket>();
+  const server: NetServer = createNetServer((socket) => {
+    connections += 1;
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+    let pending = Buffer.alloc(0);
+    socket.on("data", (chunk) => {
+      pending = Buffer.concat([pending, chunk]);
+      while (pending.length >= 20) {
+        const length = pending.readUInt16BE(2);
+        if (pending.length < 20 + length) return;
+        const request = pending.subarray(0, 20 + length);
+        pending = pending.subarray(20 + length);
+        if (!isStunRequest(request, 0x0003)) continue;
+        allocateRequests += 1;
+        socket.write(turnUnauthorizedResponse(request));
+      }
+    });
+    socket.on("error", () => undefined);
+  });
+  const port = await new Promise<number>((resolve) => server.listen(0, "127.0.0.1", () => {
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("TURN TCP fixture failed to bind");
+    resolve(address.port);
+  }));
+  return {
+    port,
+    connections: () => connections,
+    allocateRequests: () => allocateRequests,
+    closeSockets: () => { for (const socket of sockets) socket.destroy(); },
+    close: async () => {
+      for (const socket of sockets) socket.destroy();
+      const closing = once(server, "close");
+      server.close();
+      await closing;
+    },
+  };
+}
+
+async function startOwnedTurnTlsListener(key: Buffer, cert: Buffer) {
+  let connections = 0;
+  let allocateRequests = 0;
+  const sockets = new Set<Socket>();
+  const server: TlsServer = createTlsServer({ key, cert }, (socket) => {
+    connections += 1;
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+    let pending = Buffer.alloc(0);
+    socket.on("data", (chunk) => {
+      pending = Buffer.concat([pending, chunk]);
+      while (pending.length >= 20) {
+        const length = pending.readUInt16BE(2);
+        if (pending.length < 20 + length) return;
+        const request = pending.subarray(0, 20 + length);
+        pending = pending.subarray(20 + length);
+        if (!isStunRequest(request, 0x0003)) continue;
+        allocateRequests += 1;
+        socket.write(turnUnauthorizedResponse(request));
+      }
+    });
+    socket.on("error", () => undefined);
+  });
+  server.on("tlsClientError", () => undefined);
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("TURN TLS fixture failed to bind");
+  return {
+    port: address.port,
+    connections: () => connections,
+    allocateRequests: () => allocateRequests,
+    closeSockets: () => { for (const socket of sockets) socket.destroy(); },
+    close: async () => {
+      for (const socket of sockets) socket.destroy();
+      const closing = once(server, "close");
+      server.close();
+      await closing;
+    },
+  };
+}
+
+function isStunRequest(message: Buffer, type: number) {
+  return message.length >= 20
+    && message.readUInt16BE(0) === type
+    && message.readUInt32BE(4) === 0x2112a442;
+}
+
+function turnUnauthorizedResponse(message: Buffer) {
+  const attributes: Buffer[] = [];
+  const addAttribute = (type: number, value: Buffer) => {
+    const paddedLength = Math.ceil(value.length / 4) * 4;
+    const attribute = Buffer.alloc(4 + paddedLength);
+    attribute.writeUInt16BE(type, 0);
+    attribute.writeUInt16BE(value.length, 2);
+    value.copy(attribute, 4);
+    attributes.push(attribute);
+  };
+  addAttribute(0x0009, Buffer.concat([Buffer.from([0, 0, 4, 1]), Buffer.from("Unauthorized")]));
+  addAttribute(0x0014, Buffer.from("fixture"));
+  addAttribute(0x0015, Buffer.from("fixture-nonce"));
+  const body = Buffer.concat(attributes);
+  const response = Buffer.alloc(20 + body.length);
+  response.writeUInt16BE(0x0113, 0);
+  response.writeUInt16BE(body.length, 2);
+  response.writeUInt32BE(0x2112a442, 4);
+  message.copy(response, 8, 8, 20);
+  body.copy(response, 20);
+  return response;
+}
+
+async function beginIceInFreshIframe(page: Page, urls: string[]) {
+  return page.evaluate(async (iceUrls) => {
+    const iframe = document.createElement("iframe");
+    iframe.title = "fresh WebRTC realm";
+    const loaded = new Promise<void>((resolve) => iframe.addEventListener("load", () => resolve(), { once: true }));
+    document.body.appendChild(iframe);
+    await loaded;
+    const realm = iframe.contentWindow as (Window & { __titanPeerConnection?: RTCPeerConnection }) | null;
+    if (!realm || typeof realm.RTCPeerConnection !== "function") {
+      throw new Error("RTCPeerConnection unavailable in the new iframe realm");
+    }
+    const peer = new realm.RTCPeerConnection({
+      iceServers: iceUrls.map((url) => ({ urls: url, username: "fixture-user", credential: "fixture-pass" })),
+    });
+    realm.__titanPeerConnection = peer;
+    peer.createDataChannel("transport-probe");
+    await peer.setLocalDescription(await peer.createOffer());
+    return { started: true, state: peer.iceGatheringState };
+  }, urls);
+}
+
+async function closeIceInFreshIframe(page: Page) {
+  return page.evaluate(() => {
+    const iframe = [...document.querySelectorAll("iframe")].find((element) => element.title === "fresh WebRTC realm");
+    const peer = (iframe?.contentWindow as (Window & { __titanPeerConnection?: RTCPeerConnection }) | null)
+      ?.__titanPeerConnection;
+    if (!peer) throw new Error("WebRTC test peer was not retained in the iframe realm");
+    peer.close();
+    return peer.signalingState === "closed";
+  });
+}
+
+async function waitForListener(readCount: () => number, label: string, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (readCount() > 0) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(`${label} did not receive traffic within ${timeoutMs}ms`);
 }
 
 test.afterEach(async () => {
@@ -122,6 +364,7 @@ test("redirect to an unapproved localhost port is blocked by the egress proxy", 
       testOnlyCaptureProxy: (proxy: { wasBlocked?: () => boolean }) => { observedProxy = proxy; },
     } as never);
     expect(result).toMatchObject({ status: "failed", error: "network_destination_blocked", stepIndex: null });
+    expect(result.artifacts?.video).toBeTruthy();
     expect(destinationHits).toBe(0);
     expect(observedProxy?.wasBlocked?.()).toBe(true);
   } finally {
@@ -254,6 +497,113 @@ test("real headless Chromium can use an explicitly allowed secure WebSocket orig
   }
 });
 
+test("baseline headless Chromium reaches STUN UDP and TURN UDP/TCP/TLS listeners", async () => {
+  test.setTimeout(60_000);
+  const fixture = await startWebRtcFixture();
+  const stun = await startOwnedStunListener();
+  const turnUdp = await startOwnedTurnUdpListener();
+  const turnTcp = await startOwnedTurnTcpListener();
+  const certificateRoot = await mkdtemp(path.join(tmpdir(), "titan-browser-turn-cert-"));
+  testRoots.push(certificateRoot);
+  const keyPath = path.join(certificateRoot, "key.pem");
+  const certPath = path.join(certificateRoot, "cert.pem");
+  await execFileAsync("openssl", [
+    "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+    "-keyout", keyPath, "-out", certPath,
+    "-subj", "/CN=127.0.0.1", "-addext", "subjectAltName=IP:127.0.0.1", "-days", "2",
+  ], { timeout: 10_000 });
+  const turnTls = await startOwnedTurnTlsListener(await readFile(keyPath), await readFile(certPath));
+  let baselineBrowser: Awaited<ReturnType<typeof chromium.launch>> | undefined;
+  try {
+    baselineBrowser = await chromium.launch({ headless: true, args: ["--ignore-certificate-errors"] });
+    const baselineContext = await baselineBrowser.newContext();
+    const baselinePage = await baselineContext.newPage();
+    await baselinePage.goto(fixture.url);
+    const started = await beginIceInFreshIframe(baselinePage, [
+      stun.url,
+      `turn:127.0.0.1:${turnUdp.port}?transport=udp`,
+      `turn:127.0.0.1:${turnTcp.port}?transport=tcp`,
+      `turns:127.0.0.1:${turnTls.port}?transport=tcp`,
+    ]);
+    expect(started.started).toBe(true);
+    await Promise.all([
+      waitForListener(stun.requests, "valid STUN Binding request"),
+      waitForListener(turnUdp.allocateRequests, "valid TURN UDP Allocate request", 8_000),
+      waitForListener(turnTcp.connections, "TURN TCP connection", 8_000),
+      waitForListener(turnTls.connections, "TURN TLS connection", 8_000),
+    ]);
+    await baselineContext.close();
+    expect(stun.requests()).toBeGreaterThan(0);
+    expect(turnUdp.allocateRequests()).toBeGreaterThan(0);
+    expect(turnTcp.connections()).toBeGreaterThan(0);
+    expect(turnTls.connections()).toBeGreaterThan(0);
+  } finally {
+    await baselineBrowser?.close();
+    await Promise.all([stun.close(), turnUdp.close(), turnTcp.close(), turnTls.close()]);
+    const closing = once(fixture.server, "close");
+    fixture.server.close();
+    await closing;
+  }
+});
+
+test("runJob proxies the fixture and blocks unapproved WebRTC UDP, TURN TCP, and TURN TLS", async () => {
+  test.setTimeout(60_000);
+  expect(CHROMIUM_LAUNCH_ARGS).toEqual(["--force-webrtc-ip-handling-policy=disable_non_proxied_udp"]);
+  const fixture = await startWebRtcFixture();
+  const stun = await startOwnedStunListener();
+  const turnUdp = await startOwnedTurnUdpListener();
+  const turnTcp = await startOwnedTurnTcpListener();
+  const certificateRoot = await mkdtemp(path.join(tmpdir(), "titan-browser-turn-cert-"));
+  testRoots.push(certificateRoot);
+  const keyPath = path.join(certificateRoot, "key.pem");
+  const certPath = path.join(certificateRoot, "cert.pem");
+  await execFileAsync("openssl", [
+    "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+    "-keyout", keyPath, "-out", certPath,
+    "-subj", "/CN=127.0.0.1", "-addext", "subjectAltName=IP:127.0.0.1", "-days", "2",
+  ], { timeout: 10_000 });
+  const turnTls = await startOwnedTurnTlsListener(await readFile(keyPath), await readFile(certPath));
+  let observedProxy: { wasBlocked?: () => boolean } | undefined;
+  let startedResult: { started: boolean; state: string } | undefined;
+  try {
+    const origin = new URL(fixture.url).origin;
+    const result = await runJob({
+      version: 1,
+      jobId: "webrtc-egress-boundary",
+      startUrl: fixture.url,
+      allowedOrigins: [origin],
+      timeoutMs: 20_000,
+      steps: [{ type: "snapshot", selector: "main" }],
+    }, await privateOptions(), {
+      testOnlyAllowLoopback: true,
+      testOnlyProxyBypass: "",
+      testOnlyAfterNavigation: async (page: Page) => {
+        startedResult = await beginIceInFreshIframe(page, [
+          stun.url,
+          `turn:127.0.0.1:${turnUdp.port}?transport=udp`,
+          `turn:127.0.0.1:${turnTcp.port}?transport=tcp`,
+          `turns:127.0.0.1:${turnTls.port}?transport=tcp`,
+        ]);
+        await new Promise((resolve) => setTimeout(resolve, 4_000));
+      },
+      testOnlyCaptureProxy: (proxy: { wasBlocked?: () => boolean }) => { observedProxy = proxy; },
+    } as never);
+
+    expect(result.status, JSON.stringify(result)).toBe("ok");
+    expect(startedResult?.started).toBe(true);
+    expect(observedProxy?.wasBlocked?.()).toBe(true);
+    expect(stun.requests()).toBe(0);
+    expect(turnUdp.allocateRequests()).toBe(0);
+    expect(turnTcp.connections()).toBe(0);
+    expect(turnTls.connections()).toBe(0);
+  } finally {
+    await Promise.all([stun.close(), turnUdp.close(), turnTcp.close(), turnTls.close()]);
+    const closing = once(fixture.server, "close");
+    fixture.server.close();
+    await closing;
+  }
+});
+
 test("runner launches its own headless process and a new isolated context", async () => {
   const launchOptions: unknown[] = [];
   const contextOptions: unknown[] = [];
@@ -301,6 +651,7 @@ test("runner launches its own headless process and a new isolated context", asyn
   expect(result.status).toBe("ok");
   expect(launchOptions).toEqual([{
     headless: true,
+    args: [...CHROMIUM_LAUNCH_ARGS],
     proxy: { server: expect.stringMatching(/^http:\/\/127\.0\.0\.1:/), bypass: "<-loopback>" },
   }]);
   expect(contextOptions).toHaveLength(1);
@@ -547,6 +898,42 @@ const cleanupJob = {
   timeoutMs: 1_000,
   steps: [{ type: "snapshot", selector: "body" }],
 };
+
+test("owned browser server is killed when graceful shutdown stalls", async () => {
+  let finishGracefulClose!: () => void;
+  let killCalls = 0;
+  let processStopped = false;
+  const server = {
+    wsEndpoint: () => "ws://127.0.0.1:43210/owned",
+    close: () => new Promise<void>((resolve) => { finishGracefulClose = resolve; }),
+    kill: async () => {
+      killCalls += 1;
+      processStopped = true;
+      finishGracefulClose();
+    },
+  };
+  const browser = await cleanupRuntime().chromium.launch();
+  const runtime = testRuntime({
+    chromium: {
+      launchServer: async (options: { headless: boolean; args: string[] }) => {
+        expect(options.headless).toBe(true);
+        expect(options.args).toEqual([...CHROMIUM_LAUNCH_ARGS]);
+        return server;
+      },
+      connect: async (endpoint: string) => {
+        expect(endpoint).toBe(server.wsEndpoint());
+        return browser;
+      },
+    },
+    testOnlyBrowserCloseTimeoutMs: 20,
+  });
+
+  const result = await runJob(cleanupJob, await privateOptions(), runtime as never);
+
+  expect(result.status).toBe("ok");
+  expect(killCalls).toBe(1);
+  expect(processStopped).toBe(true);
+});
 
 test("browser close failure cannot produce success", async () => {
   const result = await runJob(cleanupJob, await privateOptions(), testRuntime(cleanupRuntime({

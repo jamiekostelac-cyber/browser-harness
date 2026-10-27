@@ -37,6 +37,8 @@ Run `titan-browser doctor --endpoint http://127.0.0.1:9333 --json` only when dia
 
 An installed doctor uses only the dedicated `doctor-venv` under the install root and requires `websockets==15.0.1`. Provision it once using the platform-specific commands in `install.md`; the launcher fails before probing 9333 if the pinned dependency is missing or mismatched. It does not use ambient Python or download packages at runtime.
 
+The isolated runner disables non-proxied WebRTC UDP with a fixed Chromium launch argument. Direct WebRTC UDP and TURN destinations outside the job's authorized network policy may be blocked, so calls, media, and data channels that depend on them may not connect. The Chromium flag is a browser control, not an operating-system network sandbox; the runner's egress proxy remains the destination boundary.
+
 `READY` confirms transport and one Browser-domain response only. It says nothing about site login. An HTTP rejection means the endpoint was reached but rejected the version request. A transport error means the probe could not complete. The doctor is not a permission probe for a browser extension/native host or the Codex in-app browser.
 
 Inspect the current runtime's effective permission context and use only its supported request flow. If task-local access is refused, stop and report the actual result. Do not assume a global setting updates a running task, do not invent a broker, and do not fall back to a shared/cloud browser.

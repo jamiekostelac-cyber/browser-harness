@@ -20,6 +20,9 @@ const SENSITIVE_LABEL = /password|passcode|secret|credential|token|api[ _-]?key/
 const CLEANUP_TIMEOUT_MS = 1_000;
 const BROWSER_CLOSE_TIMEOUT_MS = 5_000;
 const MAX_JOB_READ_CHUNK = 64 * 1024;
+export const CHROMIUM_LAUNCH_ARGS = Object.freeze([
+  "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+]);
 
 async function boundedCleanup(operation, timeoutMs = CLEANUP_TIMEOUT_MS) {
   const outcome = Promise.resolve().then(operation);
@@ -30,6 +33,15 @@ async function boundedCleanup(operation, timeoutMs = CLEANUP_TIMEOUT_MS) {
       timer = setTimeout(() => reject(new JobValidationError("cleanup_timeout")), timeoutMs);
     }),
   ]).finally(() => clearTimeout(timer));
+}
+
+async function closeBrowserServer(server, timeoutMs) {
+  try {
+    await boundedCleanup(() => server.close(), timeoutMs);
+  } catch {
+    // BrowserServer.kill() terminates the owned process if graceful shutdown stalls.
+    await boundedCleanup(() => server.kill(), timeoutMs);
+  }
 }
 
 export class JobValidationError extends Error {
@@ -233,6 +245,7 @@ export async function runJob(job, options = {}, runtime = null) {
     throw new JobValidationError(error?.code || "private_storage_unavailable");
   }
   let browser;
+  let browserServer;
   let context;
   let tracePath = null;
   let videoRef = null;
@@ -240,6 +253,7 @@ export async function runJob(job, options = {}, runtime = null) {
   let timer;
   let stage = "startup";
   let launchPromise = null;
+  let launchKind = "browser";
   let contextPromise = null;
   let deadlineExpired = false;
   let deadlineCleanupFailed = false;
@@ -250,6 +264,12 @@ export async function runJob(job, options = {}, runtime = null) {
   let page;
   let networkDestinationBlocked = false;
   const results = [];
+  const browserCloseTimeoutMs = Math.min(
+    BROWSER_CLOSE_TIMEOUT_MS,
+    Number.isInteger(runtime?.testOnlyBrowserCloseTimeoutMs)
+      ? Math.max(1, runtime.testOnlyBrowserCloseTimeoutMs)
+      : BROWSER_CLOSE_TIMEOUT_MS,
+  );
   try {
     const beforeDeadline = (operation) => Promise.race([operation, deadline]);
     const deadline = new Promise((_, reject) => {
@@ -265,8 +285,14 @@ export async function runJob(job, options = {}, runtime = null) {
           }
           catch { deadlineCleanupFailed = true; }
           try {
-            if (browser) {
-              await boundedCleanup(() => browser.close(), BROWSER_CLOSE_TIMEOUT_MS);
+            if (browserServer) {
+              await closeBrowserServer(browserServer, browserCloseTimeoutMs);
+              browserServer = null;
+              browser = null;
+              deadlineBrowserClosed = true;
+            } else if (browser) {
+              await boundedCleanup(() => browser.close(), browserCloseTimeoutMs);
+              browser = null;
               deadlineBrowserClosed = true;
             }
           }
@@ -293,11 +319,27 @@ export async function runJob(job, options = {}, runtime = null) {
       runtime?.testOnlyCaptureProxy?.(networkProxy);
     }
     stage = "launch";
-    launchPromise = browserApi.chromium.launch({
+    const browserProxy = networkProxy ? {
+      server: networkProxy.url,
+      ...(runtime?.testOnlyProxyBypass === undefined
+        ? { bypass: "<-loopback>" }
+        : runtime.testOnlyProxyBypass ? { bypass: runtime.testOnlyProxyBypass } : {}),
+    } : null;
+    const launchOptions = {
       headless: true,
-      ...(networkProxy ? { proxy: { server: networkProxy.url, bypass: "<-loopback>" } } : {}),
-    });
-    browser = await beforeDeadline(launchPromise);
+      args: [...CHROMIUM_LAUNCH_ARGS],
+      ...(browserProxy ? { proxy: browserProxy } : {}),
+    };
+    if (typeof browserApi.chromium.launchServer === "function") {
+      launchKind = "server";
+      launchPromise = browserApi.chromium.launchServer(launchOptions);
+      browserServer = await beforeDeadline(launchPromise);
+      launchPromise = null;
+      browser = await beforeDeadline(browserApi.chromium.connect(browserServer.wsEndpoint()));
+    } else {
+      launchPromise = browserApi.chromium.launch(launchOptions);
+      browser = await beforeDeadline(launchPromise);
+    }
     launchPromise = null;
     stage = "context";
     contextPromise = browser.newContext({
@@ -344,6 +386,10 @@ export async function runJob(job, options = {}, runtime = null) {
         throw new JobValidationError("network_destination_blocked");
       }
       if (deadlineExpired) throw new JobValidationError("timeout");
+      if (runtime?.testOnlyAfterNavigation) {
+        await runtime.testOnlyAfterNavigation(page);
+        if (deadlineExpired) throw new JobValidationError("timeout");
+      }
       for (let index = 0; index < job.steps.length; index += 1) {
         if (deadlineExpired) throw new JobValidationError("timeout");
         activeStep = index;
@@ -358,7 +404,12 @@ export async function runJob(job, options = {}, runtime = null) {
     await boundedCleanup(() => context.tracing.stop());
     await boundedCleanup(() => context.close());
     context = null;
-    await boundedCleanup(() => browser.close(), BROWSER_CLOSE_TIMEOUT_MS);
+    if (browserServer) {
+      await closeBrowserServer(browserServer, browserCloseTimeoutMs);
+      browserServer = null;
+    } else {
+      await boundedCleanup(() => browser.close(), browserCloseTimeoutMs);
+    }
     browser = null;
     if (networkProxy) await boundedCleanup(() => networkProxy.close());
     networkProxy = null;
@@ -398,19 +449,29 @@ export async function runJob(job, options = {}, runtime = null) {
     if (stage === "launch" && launchPromise && deadlineExpired) {
       let graceTimer;
       const lateLaunch = await Promise.race([
-        launchPromise.then((lateBrowser) => ({ browser: lateBrowser }), () => ({ browser: null })),
+        launchPromise.then((value) => ({ value }), () => ({ value: null })),
         new Promise((resolve) => { graceTimer = setTimeout(() => resolve(null), CLEANUP_TIMEOUT_MS); }),
       ]).finally(() => clearTimeout(graceTimer));
-      if (lateLaunch?.browser) {
-        browser = lateLaunch.browser;
+      if (lateLaunch?.value && launchKind === "server") {
+        browserServer = lateLaunch.value;
+        try {
+          await closeBrowserServer(browserServer, browserCloseTimeoutMs);
+          browserServer = null;
+          deadlineBrowserClosed = true;
+        } catch { cleanupFailed = true; }
+      } else if (lateLaunch?.value) {
+        browser = lateLaunch.value;
       } else if (!lateLaunch) {
         cleanupFailed = true;
-        launchPromise.then(
-          (lateBrowser) => { void boundedCleanup(() => lateBrowser.close()).catch(() => undefined); },
-          () => undefined,
-        );
+        launchPromise.then((value) => {
+          const cleanup = launchKind === "server"
+            ? closeBrowserServer(value, browserCloseTimeoutMs)
+            : boundedCleanup(() => value.close(), browserCloseTimeoutMs);
+          void cleanup.catch(() => undefined);
+        }, () => undefined);
       }
     }
+    let videoPath = null;
     if (context) {
       if (!deadlineContextClosed) {
         if (!deadlineExpired) {
@@ -426,10 +487,24 @@ export async function runJob(job, options = {}, runtime = null) {
       }
       context = null;
     }
-    if (browser) {
+    if (videoRef) {
+      videoPath = path.join(artifactDir, "video.webm");
+      try { await boundedCleanup(() => videoRef.saveAs(videoPath)); }
+      catch { videoPath = null; cleanupFailed = true; }
+    }
+    if (browserServer) {
       if (!deadlineBrowserClosed) {
         try {
-          await boundedCleanup(() => browser.close(), BROWSER_CLOSE_TIMEOUT_MS);
+          await closeBrowserServer(browserServer, browserCloseTimeoutMs);
+          deadlineBrowserClosed = true;
+        } catch { cleanupFailed = true; }
+      }
+      browserServer = null;
+      browser = null;
+    } else if (browser) {
+      if (!deadlineBrowserClosed) {
+        try {
+          await boundedCleanup(() => browser.close(), browserCloseTimeoutMs);
           deadlineBrowserClosed = true;
         } catch { cleanupFailed = true; }
       }
@@ -444,10 +519,6 @@ export async function runJob(job, options = {}, runtime = null) {
       deadlineCleanupFailed = false;
     }
     cleanupFailed ||= deadlineCleanupFailed;
-    let videoPath = null;
-    if (videoRef) {
-      try { videoPath = await boundedCleanup(() => videoRef.path()); } catch { cleanupFailed = true; }
-    }
     try { await boundedCleanup(() => markJobComplete(artifactDir, "failed")); }
     catch { cleanupFailed = true; }
     const artifacts = { trace: tracePath, video: videoPath, directory: artifactDir };
