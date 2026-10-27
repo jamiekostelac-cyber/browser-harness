@@ -321,9 +321,7 @@ export async function runJob(job, options = {}, runtime = null) {
     stage = "launch";
     const browserProxy = networkProxy ? {
       server: networkProxy.url,
-      ...(runtime?.testOnlyProxyBypass === undefined
-        ? { bypass: "<-loopback>" }
-        : runtime.testOnlyProxyBypass ? { bypass: runtime.testOnlyProxyBypass } : {}),
+      bypass: "<-loopback>",
     } : null;
     const launchOptions = {
       headless: true,

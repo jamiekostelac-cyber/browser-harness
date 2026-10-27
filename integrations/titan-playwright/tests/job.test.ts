@@ -156,13 +156,12 @@ async function startOwnedTurnTcpListener() {
 }
 
 async function startOwnedTurnTlsListener(key: Buffer, cert: Buffer) {
-  let connections = 0;
+  let rawAccepts = 0;
+  let secureConnections = 0;
   let allocateRequests = 0;
   const sockets = new Set<Socket>();
   const server: TlsServer = createTlsServer({ key, cert }, (socket) => {
-    connections += 1;
-    sockets.add(socket);
-    socket.on("close", () => sockets.delete(socket));
+    secureConnections += 1;
     let pending = Buffer.alloc(0);
     socket.on("data", (chunk) => {
       pending = Buffer.concat([pending, chunk]);
@@ -178,6 +177,11 @@ async function startOwnedTurnTlsListener(key: Buffer, cert: Buffer) {
     });
     socket.on("error", () => undefined);
   });
+  server.on("connection", (socket) => {
+    rawAccepts += 1;
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+  });
   server.on("tlsClientError", () => undefined);
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
@@ -185,7 +189,8 @@ async function startOwnedTurnTlsListener(key: Buffer, cert: Buffer) {
   if (!address || typeof address === "string") throw new Error("TURN TLS fixture failed to bind");
   return {
     port: address.port,
-    connections: () => connections,
+    rawAccepts: () => rawAccepts,
+    secureConnections: () => secureConnections,
     allocateRequests: () => allocateRequests,
     closeSockets: () => { for (const socket of sockets) socket.destroy(); },
     close: async () => {
@@ -530,13 +535,13 @@ test("baseline headless Chromium reaches STUN UDP and TURN UDP/TCP/TLS listeners
       waitForListener(stun.requests, "valid STUN Binding request"),
       waitForListener(turnUdp.allocateRequests, "valid TURN UDP Allocate request", 8_000),
       waitForListener(turnTcp.connections, "TURN TCP connection", 8_000),
-      waitForListener(turnTls.connections, "TURN TLS connection", 8_000),
+      waitForListener(turnTls.secureConnections, "TURN TLS handshake", 8_000),
     ]);
     await baselineContext.close();
     expect(stun.requests()).toBeGreaterThan(0);
     expect(turnUdp.allocateRequests()).toBeGreaterThan(0);
     expect(turnTcp.connections()).toBeGreaterThan(0);
-    expect(turnTls.connections()).toBeGreaterThan(0);
+    expect(turnTls.secureConnections()).toBeGreaterThan(0);
   } finally {
     await baselineBrowser?.close();
     await Promise.all([stun.close(), turnUdp.close(), turnTcp.close(), turnTls.close()]);
@@ -576,7 +581,6 @@ test("runJob proxies the fixture and blocks unapproved WebRTC UDP, TURN TCP, and
       steps: [{ type: "snapshot", selector: "main" }],
     }, await privateOptions(), {
       testOnlyAllowLoopback: true,
-      testOnlyProxyBypass: "",
       testOnlyAfterNavigation: async (page: Page) => {
         startedResult = await beginIceInFreshIframe(page, [
           stun.url,
@@ -595,7 +599,7 @@ test("runJob proxies the fixture and blocks unapproved WebRTC UDP, TURN TCP, and
     expect(stun.requests()).toBe(0);
     expect(turnUdp.allocateRequests()).toBe(0);
     expect(turnTcp.connections()).toBe(0);
-    expect(turnTls.connections()).toBe(0);
+    expect(turnTls.rawAccepts()).toBe(0);
   } finally {
     await Promise.all([stun.close(), turnUdp.close(), turnTcp.close(), turnTls.close()]);
     const closing = once(fixture.server, "close");
